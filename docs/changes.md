@@ -191,6 +191,25 @@ and the source shows instead.
 In **Changes**, a changed file whose type has a preview, and that is not deleted, shows a
 **Preview** button in the header of its diff. It opens the same file screen on Preview.
 
+### Equations
+
+Markdown previews, Chat, History and Full reply render LaTeX math with KaTeX. Write inline math
+as `$E = mc^2$` or `\(E = mc^2\)`. Display equations occupy their own lines:
+
+```text
+$$
+\sum_{i=1}^{n} i = \frac{n(n+1)}{2}
+$$
+```
+
+`\[` and `\]` also delimit a display equation. Fractions, matrices and `aligned` environments
+work within these delimiters. Wide equations scroll sideways within the page, and a display
+equation's Copy button copies its original source, including the delimiters.
+
+Code spans and fenced code blocks stay literal. Write `\$` for a literal dollar sign; ordinary
+prices such as `$5 and $10` stay text. Incomplete delimiters, unsupported TeX and oversized
+expressions remain readable as source. Math uses bundled fonts and needs no LaTeX installation.
+
 ### Paths the agent prints
 
 A file path the agent prints in Chat or in the terminal mirror is a link to that file in Files.

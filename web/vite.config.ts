@@ -368,6 +368,18 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
+    // Fonts stay same-origin files, including the small KaTeX faces: the CSP does not allow data fonts.
+    assetsInlineLimit: (filePath) => /[\\/]KaTeX_[^\\/]+\.(?:woff2?|ttf)$/.test(filePath) ? false : undefined,
+    // A static chunk for KaTeX and its HTML-to-React conversion keeps the app below the PWA's
+    // 2 MiB per-file cache limit without
+    // deferring equation rendering until after the message has already appeared.
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [{ name: "math", test: /[\\/]node_modules[\\/](?:katex|hast-util-from-html|hast-util-to-jsx-runtime)[\\/]/ }],
+        },
+      },
+    },
     // A couple of small chunks beat one big one on a phone over the tailnet.
     chunkSizeWarningLimit: 900,
   },

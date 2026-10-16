@@ -4,11 +4,11 @@
 // is worse than reading it formatted. But the repo's hard rule is that pane/agent text renders as
 // React TEXT NODES, never `innerHTML` — that's the XSS boundary (CLAUDE.md §"Security posture",
 // ARCHITECTURE.md §6). So this produces an AST, and the renderer turns it into React elements. No
-// HTML string is ever constructed, which keeps the boundary provable rather than trusted, and adds
-// no dependency to a phone bundle that currently has seven.
+// HTML string is ever constructed here. Math bodies go separately to the math component, which
+// typesets them with KaTeX and also produces React elements rather than injecting markup.
 //
 // SCOPE. The subset agents actually emit: headings, fenced code, lists, blockquotes, rules,
-// paragraphs, GFM tables; inline bold/italic/code/links. Not HTML passthrough. An image is never
+// paragraphs, GFM tables, math; inline bold/italic/code/links. Not HTML passthrough. An image is never
 // loaded here: it reads as its alt text (a badge is a link whose label is the alt text), unless the
 // caller asks for image spans, and then the SCREEN decides what to load (the Files preview, ADR 0090).
 //
@@ -23,16 +23,19 @@
 //  - `*emphasis*` requires non-space just inside both delimiters, so a shell glob like
 //    "rename *.ts to *.tsx" isn't silently swallowed into an italic run.
 
+import { readDisplayMath, readInlineMath, type MdMath } from "./markdown-math";
+
 /**
  * An inline run within a paragraph/heading/list item.
  *
  * Emphasis and links carry CHILD SPANS, not a flat string, because agents nest them constantly —
  * ``**`c6fe96`**`` (bold wrapping code) is routine in agent prose, and a flat model rendered those
- * backticks literally. `code` is the one leaf: its content is verbatim by definition.
+ * backticks literally. Code and math are leaves: their contents are never parsed as Markdown.
  */
 export type MdSpan =
   | { kind: "text"; text: string }
   | { kind: "code"; text: string }
+  | MdMath
   | { kind: "bold"; spans: MdSpan[] }
   | { kind: "italic"; spans: MdSpan[] }
   /**
@@ -68,6 +71,7 @@ export type MdBlock =
   | { kind: "paragraph"; spans: MdSpan[] }
   /** Fenced code. `text` is verbatim — never inline-parsed. */
   | { kind: "code"; lang: string; text: string }
+  | MdMath
   | { kind: "list"; ordered: boolean; items: MdSpan[][] }
   | { kind: "quote"; spans: MdSpan[] }
   /**
@@ -150,6 +154,8 @@ const INLINE_RE = new RegExp(
     String.raw`\[([^\[\]\n]{1,200})\]`, // 10    [ref], when a definition names it
     "<((?:https?://|mailto:)[^\\s<>]{1,500})>", // 11    <https://x>
     BARE_URL, // 12    a bare URL
+    // Consume a backslash run with its marker so escaped dollars and delimiters have one owner.
+    String.raw`(?<math>(?<!\\)\\+(?:\(|\$)|\$+)`,
   ].join("|"),
   "g",
 );
@@ -185,6 +191,53 @@ const IMAGE_PARTS = new RegExp(String.raw`^!\[([^\[\]\n]{0,500})\]\(\s{0,20}(${U
 
 /** `[Foo  Bar]` and `[foo bar]` name the same definition. */
 const refKey = (label: string) => label.trim().replace(/\s+/g, " ").toLowerCase();
+
+/**
+ * Recognize complete equations before matching surrounding emphasis. Only their asterisks are
+ * hidden in this comparison string, at the same offsets; every emitted value comes from `text`.
+ * The same inline grammar skips code, image alt text and link destinations, and descends into
+ * labels that Markdown will parse. An incomplete equation changes nothing.
+ */
+function protectMathInEmphasis(text: string, depth: number, inLink: boolean, defs?: RefDefs): string {
+  if (depth >= MAX_INLINE_DEPTH || !text.includes("*")) return text;
+  const re = new RegExp(INLINE_RE.source, "g");
+  let last = 0;
+  let masked = "";
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m[3] !== undefined || m[4] !== undefined) {
+      // Walk inside the opener: its apparent closer may be a TeX asterisk.
+      re.lastIndex = m.index + (m[3] !== undefined ? 2 : 1);
+      continue;
+    }
+    let start = m.index;
+    let end = re.lastIndex;
+    let replacement: string | undefined;
+    const marker = m.groups?.math;
+    if (marker !== undefined) {
+      start = end - (marker.endsWith("(") ? 2 : 1);
+      const math = readInlineMath(text, start);
+      if (math === null) continue;
+      end = re.lastIndex = math.end;
+      replacement = math.math.source.replace(/\*/g, "\uFFFC");
+    } else if (m[6] !== undefined || m[8] !== undefined || m[10] !== undefined) {
+      const label = m[6] ?? m[8] ?? m[10]!;
+      const reference = refKey(m[9] === undefined || m[9].trim() === "" ? label : m[9]);
+      if (m[6] !== undefined || (!inLink && defs?.has(reference))) {
+        start++;
+        end = start + label.length;
+        replacement = protectMathInEmphasis(label, depth + 1, true, defs);
+      } else if (!defs?.has(reference)) {
+        re.lastIndex = m.index + 1;
+      }
+    }
+    if (replacement !== undefined && replacement !== text.slice(start, end)) {
+      masked += text.slice(last, start) + replacement;
+      last = end;
+    }
+  }
+  return masked + text.slice(last);
+}
 
 /**
  * Parse one line/paragraph of inline Markdown. Pure, and recursive through emphasis/link bodies.
@@ -234,15 +287,36 @@ export function parseInline(text: string, depth = 0, inLink = false, defs?: RefD
   // A fresh regex per call: INLINE_RE is stateful (`g`), and recursion would otherwise clobber the
   // parent's lastIndex mid-scan.
   const re = new RegExp(INLINE_RE.source, "g");
+  const masked = protectMathInEmphasis(text, depth, inLink, defs);
   let last = 0;
   let m: RegExpExecArray | null;
 
-  while ((m = re.exec(text)) !== null) {
+  while ((m = re.exec(masked)) !== null) {
     push({ kind: "text", text: text.slice(last, m.index) });
     last = m.index + m[0].length;
-    if (m[2] !== undefined) push({ kind: "code", text: m[2] }); // leaf: content is verbatim
-    else if (m[3] !== undefined) push({ kind: "bold", spans: parseInline(m[3], depth + 1, inLink, defs, images) });
-    else if (m[4] !== undefined) push({ kind: "italic", spans: parseInline(m[4], depth + 1, inLink, defs, images) });
+    const marker = m.groups?.math;
+    if (marker !== undefined) {
+      if (marker.startsWith("\\") && marker.endsWith("$") && (marker.length - 1) % 2 === 1) {
+        push({ kind: "text", text: marker.slice(0, -2) + "$" });
+        continue;
+      }
+      const offset = marker.length - (marker.endsWith("(") ? 2 : 1);
+      const math = readInlineMath(text, m.index + offset);
+      if (math === null) push({ kind: "text", text: marker });
+      else {
+        push({ kind: "text", text: marker.slice(0, offset) });
+        push(math.math);
+        last = re.lastIndex = math.end;
+      }
+    } else if (m[2] !== undefined) push({ kind: "code", text: m[2] }); // leaf: content is verbatim
+    else if (m[3] !== undefined || m[4] !== undefined) {
+      const bold = m[3] !== undefined;
+      const size = bold ? 2 : 1;
+      push({
+        kind: bold ? "bold" : "italic",
+        spans: parseInline(text.slice(m.index + size, last - size), depth + 1, inLink, defs, images),
+      });
+    }
     else if (m[5] !== undefined) {
       // An image is its alt text, unless the caller asked for images and the budget lasts. Inside a
       // link's label it stays text, so a badge is still one link and never a picture inside one.
@@ -252,10 +326,10 @@ export function parseInline(text: string, depth = 0, inLink = false, defs?: RefD
         push({ kind: "image", alt: m[5], src });
       } else push({ kind: "text", text: m[5] });
     }
-    else if (m[6] !== undefined && m[7] !== undefined) pushLink(m[6], m[7]);
+    else if (m[6] !== undefined && m[7] !== undefined) pushLink(text.slice(m.index + 1, m.index + 1 + m[6].length), m[7]);
     else if (m[8] !== undefined || m[10] !== undefined) {
       // `[label][ref]`, `[label][]` and `[ref]`: the address is a definition's, found by its key.
-      const label = m[8] ?? m[10]!;
+      const label = text.slice(m.index + 1, m.index + 1 + (m[8] ?? m[10]!).length);
       const key = refKey(m[9] === undefined || m[9].trim() === "" ? label : m[9]);
       const rawHref = defs?.get(key);
       if (rawHref !== undefined && !inLink) pushLink(label, rawHref);
@@ -314,16 +388,22 @@ function readRefDef(line: string): [string, string] | null {
   return [refKey(m[1]!), target.startsWith("<") ? target.slice(1, -1) : target];
 }
 
-/** First pass: every definition outside a fenced block. The first definition of a label wins. */
+/** First pass: definitions outside code and math. The first definition of a label wins. */
 function collectRefDefs(lines: readonly string[]): RefDefs {
   const defs = new Map<string, string>();
   let fenced = false;
-  for (const line of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
     if (FENCE.test(line)) {
       fenced = !fenced;
       continue;
     }
     if (fenced || defs.size >= MAX_REF_DEFS) continue;
+    const math = readDisplayMath(lines, i);
+    if (math !== null) {
+      i = math.end - 1;
+      continue;
+    }
     const def = readRefDef(line);
     if (def !== null && !defs.has(def[0])) defs.set(def[0], def[1]);
   }
@@ -347,8 +427,20 @@ const TABLE_DELIM = /^\s*\|?(?:\s*:?-+:?\s*\|)+(?:\s*:?-+:?)?\s*\|?\s*$/;
 function splitRow(line: string): string[] {
   const cells: string[] = [];
   let cur = "";
+  let codeEnd = 0;
   for (let i = 0; i < line.length; i++) {
     const ch = line[i]!;
+    if (ch === "`" && line[i - 1] !== "`" && i >= codeEnd) {
+      const code = /^(`+)([^`]+?)\1/.exec(line.slice(i));
+      if (code !== null) codeEnd = i + code[0].length;
+    }
+    // Pipes and backslashes inside an equation are TeX, including \| (a norm delimiter).
+    const math = i >= codeEnd && (ch === "$" || ch === "\\") ? readInlineMath(line, i) : null;
+    if (math !== null) {
+      cur += math.math.source;
+      i = math.end - 1;
+      continue;
+    }
     if (ch === "\\" && line[i + 1] === "|") {
       cur += "|";
       i++;
@@ -441,6 +533,13 @@ export function parseMarkdown(source: string, opts: { images?: boolean } = {}): 
       continue;
     }
 
+    const math = readDisplayMath(lines, i);
+    if (math !== null) {
+      blocks.push(math.math);
+      i = math.end;
+      continue;
+    }
+
     // A definition names an address for the links that use it and draws nothing itself.
     if (readRefDef(line) !== null) {
       i++;
@@ -505,7 +604,7 @@ export function parseMarkdown(source: string, opts: { images?: boolean } = {}): 
       const rows: MdSpan[][][] = [];
       // The body runs until a blank line or anything that isn't a pipe row — a table that bumps
       // into a heading or a fence ends there rather than swallowing it.
-      while (i < lines.length && lines[i]!.trim() !== "" && lines[i]!.includes("|")) {
+      while (i < lines.length && lines[i]!.trim() !== "" && lines[i]!.includes("|") && readDisplayMath(lines, i) === null) {
         rows.push(fitRow(lines[i]!, header.length, doc));
         i++;
       }
@@ -527,6 +626,7 @@ export function parseMarkdown(source: string, opts: { images?: boolean } = {}): 
         QUOTE.test(l) ||
         isItem(l) ||
         readRefDef(l) !== null ||
+        readDisplayMath(lines, i) !== null ||
         startsTable(l, lines[i + 1])
       )
         break;
@@ -550,6 +650,7 @@ function spanText(span: MdSpan): string {
   switch (span.kind) {
     case "text":
     case "code":
+    case "math":
       return span.text;
     case "image":
       return span.alt;

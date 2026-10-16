@@ -24,6 +24,7 @@
 // does and keeps emphasis that spans those words inside the run.
 
 import type { MdBlock, MdSpan } from "@/lib/markdown";
+import { MAX_MATH_CHARS, readDisplayMath, readInlineMath } from "@/lib/markdown-math";
 
 /** A segment of a reply: prose as written, or a stretch. */
 export type Segment = Prose | Stretch;
@@ -99,7 +100,8 @@ function isLinkable(stretch: Stretch): boolean {
 function closeAfter(long: string, closer: string, gap: string): string {
   const trimmed = long.trimEnd();
   const last = trimmed.slice(trimmed.lastIndexOf("\n") + 1);
-  const endsInBlock = isRule(last) || /^ {0,3}(?:`{3,}|~{3,})[ \t]*$/.test(last);
+  const endsInBlock = isRule(last) || /^ {0,3}(?:`{3,}|~{3,})[ \t]*$/.test(last)
+    || /^(?:\$\$|\\\])$/.test(last.trim()) || readDisplayMath([last], 0) !== null;
 
   return endsInBlock ? `${trimmed}${gap}${closer}` : `${long} ${closer}`;
 }
@@ -114,6 +116,18 @@ function codeSpanEnd(text: string, i: number): number {
   const run = /^`+/.exec(text.slice(i))?.[0] ?? "`";
   const end = text.indexOf(run, i + run.length);
   return end === -1 ? text.length : end + run.length;
+}
+
+/** A complete equation is opaque to stretch braces, pipes and word colouring. */
+function mathEnd(text: string, at: number): number | undefined {
+  const inline = readInlineMath(text, at);
+  if (inline !== null) return inline.end;
+  if (at > 0 && text[at - 1] !== "\n") return undefined;
+  if (!/^ {0,3}(?:\$\$|\\\[)/.test(text.slice(at, at + 5))) return undefined;
+  // The existing display grammar owns the delimiters; bound this lookahead too, including its
+  // opening and closing lines, so an unfinished equation never scans the rest of a long reply.
+  const display = readDisplayMath(text.slice(at, at + MAX_MATH_CHARS * 2).split("\n"), 0);
+  return display === null ? undefined : at + display.math.source.length;
 }
 
 function parse(text: string): Segment[] {
@@ -149,6 +163,13 @@ function parse(text: string): Segment[] {
       const stop = codeSpanEnd(text, i);
       write(text.slice(i, stop));
       i = stop;
+      continue;
+    }
+
+    const mathStop = mathEnd(text, i);
+    if (mathStop !== undefined) {
+      write(text.slice(i, mathStop));
+      i = mathStop;
       continue;
     }
 
@@ -310,7 +331,7 @@ export function composeStretches(segments: Segment[], open: ReadonlyMap<string, 
 }
 
 /** A word or a run of whitespace of a long form, or a stretch nested in it. */
-type GrowToken = { kind: "word" | "space"; text: string } | { kind: "nested"; stretch: Stretch };
+type GrowToken = { kind: "word" | "space" | "math"; text: string } | { kind: "nested"; stretch: Stretch };
 
 /** A bare word of a long form, and the token it stands in. */
 interface Word {
@@ -349,6 +370,7 @@ function grown(short: string, long: Segment[], draw: (nested: Stretch) => string
   };
   tokens.forEach((token, i) => {
     if (token.kind === "nested") keep(draw(token.stretch));
+    else if (token.kind === "math") keep(token.text);
     else if (token.kind === "space") {
       if (run === "") out += token.text;
       else gap += token.text;
@@ -362,12 +384,30 @@ function grown(short: string, long: Segment[], draw: (nested: Stretch) => string
 function tokenize(long: Segment[]): GrowToken[] {
   return long.flatMap((part): GrowToken[] =>
     part.kind === "prose"
-      ? part.text
-          .split(/(\s+)/)
-          .filter((text) => text !== "")
-          .map((text): GrowToken => ({ kind: /^\s+$/.test(text) ? "space" : "word", text }))
+      ? proseTokens(part.text)
       : [{ kind: "nested", stretch: part }],
   );
+}
+
+/** Equations stay whole; only the prose around them is split into paintable words. */
+function proseTokens(text: string): GrowToken[] {
+  const tokens: GrowToken[] = [];
+  const plain = (part: string) => {
+    for (const word of part.split(/(\s+)/)) {
+      if (word !== "") tokens.push({ kind: /^\s+$/.test(word) ? "space" : "word", text: word });
+    }
+  };
+  let from = 0;
+  for (let at = 0; at < text.length; at++) {
+    const end = mathEnd(text, at);
+    if (end === undefined) continue;
+    plain(text.slice(from, at));
+    tokens.push({ kind: "math", text: text.slice(at, end) });
+    from = end;
+    at = end - 1;
+  }
+  plain(text.slice(from));
+  return tokens;
 }
 
 /**
@@ -524,6 +564,7 @@ function stripSpan(span: MdSpan): MdSpan {
     case "image":
       return { ...span, alt: stripRuns(span.alt) };
     case "stretch-close":
+    case "math":
       return span;
     default:
       return { ...span, spans: stripSpans(span.spans) };
@@ -632,6 +673,7 @@ function liftBlock(block: MdBlock, marks: StretchMarks): MdBlock {
     case "code":
       return { ...block, text: stripRuns(block.text) };
     case "rule":
+    case "math":
       return block;
   }
 }
