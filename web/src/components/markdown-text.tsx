@@ -2,9 +2,11 @@ import { createContext, useContext, useMemo, type ReactNode } from "react";
 
 import { useFileLinks, type FileLinkTarget } from "@/components/file-links";
 import { CopyableBlock } from "@/components/ui/copyable-block";
+import { MathText } from "@/components/ui/math-text";
 import { codeSpanPath, findFilePaths } from "@/lib/file-paths";
 import { headingAnchors, parseMarkdown, spansText, type MdBlock, type MdSpan } from "@/lib/markdown";
 import { splitHighlight } from "@/lib/transcript-search";
+import type { MdMath } from "@/lib/markdown-math";
 
 // Renders the Markdown AST as React elements. Every string from the log reaches the DOM as a TEXT
 // NODE — there is no `dangerouslySetInnerHTML` here and there must never be one. That is the repo's
@@ -17,6 +19,19 @@ import { splitHighlight } from "@/lib/transcript-search";
 // The active find query, threaded via context rather than a prop drilled through every nested span —
 // highlighting is a cross-cutting display concern, and the AST walk is already recursive.
 const QueryContext = createContext("");
+
+/** Find searches the original TeX; paint the equation as a whole without breaking its layout. */
+function MathRun({ math, display = false }: { math: MdMath; display?: boolean }) {
+  const query = useContext(QueryContext).trim().toLowerCase();
+  return (
+    <MathText
+      text={math.text}
+      source={math.source}
+      display={display}
+      highlighted={query !== "" && math.source.toLowerCase().includes(query)}
+    />
+  );
+}
 
 /**
  * Where a link that is NOT a web address leads, as the screen showing the text decides it.
@@ -227,9 +242,11 @@ function LinkSpan({ span }: { span: Extract<MdSpan, { kind: "link" }> }) {
 }
 
 // Emphasis and links hold child spans (agents nest them — ``**`sha`**`` is routine), so this recurses
-// through <Spans>. `code` is the leaf.
+// through <Spans>. Code and math stay opaque to this walk.
 function Span({ span }: { span: MdSpan }) {
   switch (span.kind) {
+    case "math":
+      return <MathRun math={span} />;
     case "bold":
       return (
         <strong className="font-semibold">
@@ -310,6 +327,12 @@ export type MarkdownVariant = "chat" | "document";
 
 function Block({ block, anchor, variant }: { block: MdBlock; anchor: string | null; variant: MarkdownVariant }) {
   switch (block.kind) {
+    case "math":
+      return (
+        <CopyableBlock text={block.source}>
+          <MathRun math={block} display />
+        </CopyableBlock>
+      );
     case "heading": {
       // Levels 4-6 are rare in agent prose and don't earn another size step on a phone.
       if (variant === "document") {

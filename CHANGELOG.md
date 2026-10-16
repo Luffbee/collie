@@ -23,6 +23,10 @@ Running a crew? Update the lead first; members follow on their own. Details:
 
 ## [Unreleased]
 
+### Added
+
+- **Equations render in Chat, History and Markdown file previews.** Inline and display LaTeX use bundled KaTeX fonts, wide equations scroll within the page, and display equations copy their original source. Code stays literal and unsupported math remains readable as source.
+
 ## [1.22.0] - 2026-10-17
 
 ### Added
