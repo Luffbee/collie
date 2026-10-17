@@ -141,6 +141,11 @@
    "version": "unversioned",
    "state": "dialog"
   },
+  "agy--plan-approval-135.txt": {
+   "harness": "agy",
+   "version": "1.3.5",
+   "state": "dialog"
+  },
   "agy--plan-approval.txt": {
    "harness": "agy",
    "version": "unversioned",
@@ -920,6 +925,36 @@
    "harness": "claude",
    "version": "2.1.301",
    "state": "running"
+  },
+  "claude--v2302-working-agents-panel--w119.txt": {
+   "harness": "claude",
+   "version": "2.1.302",
+   "state": "running"
+  },
+  "claude--v2302-working-list-echo--w119.txt": {
+   "harness": "claude",
+   "version": "2.1.302",
+   "state": "running"
+  },
+  "claude--v2302-turn-ended-yn--w119.txt": {
+   "harness": "claude",
+   "version": "2.1.302",
+   "state": "idle"
+  },
+  "claude--v2302-turn-ending-stop-hooks--w119.txt": {
+   "harness": "claude",
+   "version": "2.1.302",
+   "state": "running"
+  },
+  "claude--v2302-slash-model-list--w119.txt": {
+   "harness": "claude",
+   "version": "2.1.302",
+   "state": "popup"
+  },
+  "claude--v2302-slash-model-list-above--w119.txt": {
+   "harness": "claude",
+   "version": "2.1.302",
+   "state": "popup"
   },
   "claude--wizard-multiselect-checked.txt": {
    "harness": "claude",
@@ -3775,6 +3810,8 @@
  "knownMismatches": {
   "$comment": "Fixtures whose label is running but whose Surface reads free, with the reason. fold.test.ts fails on any other running label that reads free, and on an entry here that no longer reads free.",
   "claude--v2301-hold-subagent.txt": "The main turn is over and a background subagent waits on a hook-held permission: the screen shows a free box and a finished row, and only a hook can say the session is busy.",
-  "claude--v2301-spinner-no-timer--w100.txt": "The first second of a turn: the spinner row has no timer yet, and the running sign needs the timer. A send there goes ahead and Claude Code queues it."
+  "claude--v2301-spinner-no-timer--w100.txt": "The first second of a turn: the spinner row has no timer yet, and the running sign needs the timer. A send there goes ahead and Claude Code queues it.",
+  "claude--v2302-turn-ending-stop-hooks--w119.txt": "The last read of a turn on Claude Code 2.1.302: the spinner row carries 'running Stop hooks' before its timer, which the running sign does not take. The turn is ending; a send there goes ahead, and Enter either queues it or starts the next turn.",
+  "claude--v2302-working-list-echo--w119.txt": "Claude Code 2.1.302 draws no spinner while the answer streams: the screen shows a list growing above an empty box, and only the prompt edge can say the turn runs. A send there goes ahead and Claude Code queues it."
  }
 }

@@ -193,6 +193,40 @@ describe("the codex profile (M56 spec 13)", () => {
     expect(nameOf("  [Fable·medium] ~/projects/sample-workspace on main*")).toBeNull();
   });
 
+  it("claude: the agents screen's key-hint row under its own box is another screen's, no conversation footer is (claude-lab--agents-screen)", () => {
+    const screens = parseProfile(rawClaude()).idle.volatile.below.otherScreens!;
+    const nameOf = (text: string): string | null => screens.find((row) => new RegExp(row.pattern, "u").test(text))?.name ?? null;
+    // The hint row as the w82 and w40 captures hold it.
+    expect(nameOf("  enter to return · space to reply · ctrl+x to delete · ? for shortcuts")).toBe("agents screen");
+    expect(nameOf("  enter to return · ? for shortcuts")).toBe("agents screen");
+    expect(nameOf("  ⏸ manual mode on · ← 11 agents")).toBeNull();
+    expect(nameOf("  ⏸ manual mode on · ? for shortcuts · ← for agents")).toBeNull();
+    expect(nameOf("  ? for shortcuts")).toBeNull();
+    expect(nameOf("  ⏵⏵ bypass permissions on (shift+tab to cycle) · 2 background tasks · ↓ to view · ← 11 agents")).toBeNull();
+    // Codex names none: its box is not affected.
+    expect(parseProfile(rawCodex()).idle.volatile.below.otherScreens).toBeUndefined();
+  });
+
+  it("claude: the slash list under the box names its pointed command, in the 2.1.291 and the 2.1.302 layout (field case 2026-10-17)", () => {
+    const list = parseProfile(rawClaude()).idle.volatile.below.commandList!;
+    const pointer = new RegExp(list.pointer, "u");
+    const entry = new RegExp(list.entry, "u");
+    const wrapped = new RegExp(list.wrapped, "u");
+    const commandOf = (re: RegExp, text: string): string | null => re.exec(text)?.groups?.["command"] ?? null;
+    // 2.1.302 at 119 columns: the description in a second column at column 43, on the pointer's own row.
+    expect(commandOf(pointer, `  ❯ /model${" ".repeat(33)}Set the AI model for Claude Code (currently Sonnet 5.5)`)).toBe("/model");
+    expect(commandOf(entry, `    /auto-mode-setup${" ".repeat(23)}Teach auto mode about your environment, plus optional rule tweaks`)).toBe("/auto-mode-setup");
+    expect(wrapped.test(`${" ".repeat(43)}boundaries, exports, and locality of behavior.`)).toBe(true);
+    // 2.1.291 at 82 columns: the pointed description wraps; a name cut at 40 columns starts with "…".
+    expect(commandOf(pointer, "  ❯ /model                          Set the AI model for Claude Code (currently")).toBe("/model");
+    expect(commandOf(entry, "    …o-mode-setup  Teach auto mode")).toBe("…o-mode-setup");
+    // Not a list row: the box's own prompt, a dialog's pointed option, a status row.
+    expect(pointer.test("❯ /model")).toBe(false);
+    expect(pointer.test(" ❯ 1. Yes")).toBe(false);
+    expect(entry.test("  model · ctx 3%")).toBe(false);
+    expect(parseProfile(rawCodex()).idle.volatile.below.commandList).toBeUndefined();
+  });
+
   it("codex: the rows above may lose text, and the hint rows under the box are named (lab, 0.163.0)", () => {
     const codex = parseProfile(rawCodex());
     expect(codex.idle.volatile.above.losesText).toBe(true);
@@ -568,6 +602,14 @@ describe("parseProfile names the failing field", () => {
     ["a footer row name used twice", ["idle", "volatile", "below", "footerRows", 1, "name"], "agents-panel-main", "idle.volatile.below.footerRows[1].name"],
     ["a footer row that is no expression", ["idle", "volatile", "below", "footerRows", 0, "pattern"], "[unclosed", "idle.volatile.below.footerRows[0].pattern"],
     ["a footer row that matches a blank row", ["idle", "volatile", "below", "footerRows", 0, "pattern"], "^\\s*$", "idle.volatile.below.footerRows[0].pattern"],
+    ["other screens that are no list", ["idle", "volatile", "below", "otherScreens"], "enter to return", "idle.volatile.below.otherScreens"],
+    ["an other screen with no name", ["idle", "volatile", "below", "otherScreens", 0, "name"], undefined, "idle.volatile.below.otherScreens[0].name"],
+    ["an other screen row that is no expression", ["idle", "volatile", "below", "otherScreens", 0, "pattern"], "[unclosed", "idle.volatile.below.otherScreens[0].pattern"],
+    ["an other screen row that matches a blank row", ["idle", "volatile", "below", "otherScreens", 0, "pattern"], "^\\s*$", "idle.volatile.below.otherScreens[0].pattern"],
+    ["a command list that is no object", ["idle", "volatile", "below", "commandList"], "❯ /", "idle.volatile.below.commandList"],
+    ["a command list with no pointer pattern", ["idle", "volatile", "below", "commandList", "pointer"], undefined, "idle.volatile.below.commandList.pointer"],
+    ["a command list entry with no command group", ["idle", "volatile", "below", "commandList", "entry"], "^ {2,6}/\\S+$", "idle.volatile.below.commandList.entry"],
+    ["a command list wrapped row that matches a blank row", ["idle", "volatile", "below", "commandList", "wrapped"], "^\\s*$", "idle.volatile.below.commandList.wrapped"],
     ["a hold on an event hooks does not list as an ask", ["hold", "event"], "Stop", "hold.event"],
     ["a hold tool event hooks does not list as an edge", ["hold", "toolEvent"], "PermissionRequest", "hold.toolEvent"],
     ["a hold limit at the hook timeout", ["hold", "limitMs"], 300000, "hold.limitMs"],

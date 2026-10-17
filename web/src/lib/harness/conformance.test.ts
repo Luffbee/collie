@@ -126,6 +126,19 @@ const NEUTRAL = new Set([
   "claude--v2301-working-draft--w100.txt",
   "claude--v2301-working-queued-message--w100.txt",
   "claude--v2301-working-quiet--w100.txt",
+  // Claude Code 2.1.302 turns with a list, a menu and a "(y/n)" line in the answer above the box (the
+  // 2026-10-17 field case): the answer streaming with no spinner, and a running turn over the agents
+  // panel. An ordinary box, no dialog: the list is the agent's text, not a picker.
+  "claude--v2302-working-agents-panel--w119.txt",
+  "claude--v2302-working-list-echo--w119.txt",
+  // Claude Code 2.1.302's slash list drawn OVER the box on a tall pane (lane 8788, 2026-10-17): the box
+  // holds `/model` and its statusline stands under it. The autocomplete reader looks under the box only,
+  // so nothing lifts; the Surface reads the list as the command's own typeahead, not a dialog.
+  "claude--v2302-slash-model-list-above--w119.txt",
+  // The last two reads of a turn whose answer ends in a menu and "Confirm (y/n)" (round 3 of the same
+  // field case): the agent's text above an ordinary box, no dialog.
+  "claude--v2302-turn-ending-stop-hooks--w119.txt",
+  "claude--v2302-turn-ended-yn--w119.txt",
   // Claude Code 2.1.301's agents panel under a free box while a fork runs (the 2026-10-16 incident
   // on lane 8788): an ordinary box with a footer, no dialog.
   "claude--v2301-fork-running-main-idle.txt",

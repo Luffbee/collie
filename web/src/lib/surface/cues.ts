@@ -33,6 +33,7 @@
 // Pure: the same rows always give the same answer.
 
 import { rowText, type Frame, type FrameRow, type IdleProfile } from "./frame";
+import type { CommandListRows } from "./profile";
 import { shortHash } from "./surface";
 
 export type CueKind =
@@ -416,11 +417,136 @@ function cuesIn(texts: readonly string[], cluster: readonly number[], readOverla
 }
 
 /**
+ * The profile's command list, read at a frame: the command its pointer rests on (null with no
+ * pointer), the side of the box it stands on, and its first and last row.
+ */
+export interface CommandListRead {
+  readonly pointed: string | null;
+  readonly side: "above" | "under";
+  readonly first: number;
+  readonly last: number;
+}
+
+interface CompiledCommandList {
+  readonly pointer: RegExp;
+  readonly entry: RegExp;
+  readonly wrapped: RegExp;
+}
+
+const compiledLists = new WeakMap<CommandListRows, CompiledCommandList>();
+
+function listPatterns(list: CommandListRows): CompiledCommandList {
+  const known = compiledLists.get(list);
+  if (known !== undefined) return known;
+  const compiled = { pointer: new RegExp(list.pointer, "u"), entry: new RegExp(list.entry, "u"), wrapped: new RegExp(list.wrapped, "u") };
+  compiledLists.set(list, compiled);
+  return compiled;
+}
+
+/** One row of a command list: the pointed entry with its command, another entry, a wrapped description row, or none of them. */
+type ListRow = { readonly kind: "pointer"; readonly command: string } | { readonly kind: "entry" } | { readonly kind: "wrapped" } | null;
+
+function listRow(text: string, patterns: CompiledCommandList): ListRow {
+  const head = patterns.pointer.exec(text);
+  if (head !== null) {
+    const command = head.groups?.["command"];
+    return command === undefined ? null : { kind: "pointer", command };
+  }
+  if (patterns.entry.test(text)) return { kind: "entry" };
+  if (patterns.wrapped.test(text)) return { kind: "wrapped" };
+  return null;
+}
+
+/**
+ * The list under the bottom edge: the first row there is an entry, every other non-blank row is an
+ * entry or a wrapped description row, at most one carries the pointer. Anything else there (a dialog,
+ * a status row, a second pointer, a gap right under the edge) is no list.
+ */
+function listUnder(texts: readonly string[], frame: Frame, patterns: CompiledCommandList): CommandListRead | null {
+  let pointed: string | null = null;
+  let entries = 0;
+  let last = frame.bottom;
+  for (let i = frame.bottom + 1; i < texts.length; i++) {
+    const text = texts[i]!.trimEnd();
+    if (isBlank(text)) {
+      if (entries === 0) return null;
+      continue;
+    }
+    const row = listRow(text, patterns);
+    if (row === null || (row.kind === "wrapped" && entries === 0)) return null;
+    if (row.kind === "pointer") {
+      if (pointed !== null) return null;
+      pointed = row.command;
+    }
+    if (row.kind !== "wrapped") entries++;
+    last = i;
+  }
+  return entries === 0 ? null : { pointed, side: "under", first: frame.bottom + 1, last };
+}
+
+/**
+ * The list over the top edge (a tall pane draws it there): the run of rows right above the edge, up
+ * to the first blank row or a row that is no entry, pointer or wrapped row. It opens on an entry; a
+ * wrapped row over its first entry belongs to the transcript. At most one entry carries the pointer.
+ */
+function listAbove(texts: readonly string[], frame: Frame, patterns: CompiledCommandList): CommandListRead | null {
+  const rows: { at: number; row: Exclude<ListRow, null> }[] = [];
+  for (let i = frame.top - 1; i >= 0; i--) {
+    const text = texts[i]!.trimEnd();
+    if (isBlank(text)) break;
+    const row = listRow(text, patterns);
+    if (row === null) break;
+    rows.unshift({ at: i, row });
+  }
+  while (rows.length > 0 && rows[0]!.row.kind === "wrapped") rows.shift();
+  if (rows.length === 0) return null;
+  const pointers = rows.flatMap(({ row }) => (row.kind === "pointer" ? [row.command] : []));
+  if (pointers.length > 1) return null;
+  return { pointed: pointers[0] ?? null, side: "above", first: rows[0]!.at, last: frame.top - 1 };
+}
+
+/**
+ * The profile's completion list for a slash command (`idle.volatile.below.commandList`) at a frame:
+ * all that stands under the bottom edge, or the run right over the top edge, where a tall pane draws
+ * it. The command in the left column may have its description in a second column on the same row,
+ * or wrapped onto rows under it. A list under the box with a pointer wins; else the list over it;
+ * else a list under it with no pointer. Null when the profile names no list or neither side holds one.
+ */
+export function commandListAt(texts: readonly string[], frame: Frame, list: CommandListRows | undefined): CommandListRead | null {
+  if (list === undefined) return null;
+  const patterns = listPatterns(list);
+  const under = listUnder(texts, frame, patterns);
+  if (under?.pointed !== null && under !== null) return under;
+  return listAbove(texts, frame, patterns) ?? under;
+}
+
+/**
+ * The typeahead of the command the box holds, or null: the profile's command list on either side of
+ * a found frame, its pointer on an entry whose command is exactly the box's text (`/model` is pointed
+ * at by `❯ /model`, never by `❯ /models`). Enter there picks the command that is already typed, so the
+ * list is no dialog and its rows are read for no cue. A list that points at another command, or at
+ * none, is read as before.
+ */
+export function ownCommandList(texts: readonly string[], frame: Frame | null, idle: IdleProfile | null): CommandListRead | null {
+  if (frame === null || idle === null || frame.placeholder) return null;
+  const list = commandListAt(texts, frame, idle.volatile.below.commandList);
+  return list !== null && list.pointed !== null && list.pointed === frame.interior.text.trim() ? list : null;
+}
+
+/** The rows with a command list's rows read as blank. */
+export function withoutCommandList(rows: readonly FrameRow[], list: CommandListRead | null): readonly FrameRow[] {
+  if (list === null) return rows;
+  return rows.map((row, i) => (i >= list.first && i <= list.last ? { segments: [] } : row));
+}
+
+/**
  * The cues of a screen read under a profile: the frame's own cues, or, when the profile draws its
  * dialogs where the box stands (`idle.dialogsInBox`), the cues of the rows from the box's top edge down,
- * the box rows included.
+ * the box rows included. The typed command's own list on either side of the box ({@link ownCommandList})
+ * is left out of both.
  */
-export function readCuesFor(rows: readonly FrameRow[], frame: Frame | null, idle: IdleProfile | null): CueRead {
+export function readCuesFor(allRows: readonly FrameRow[], frame: Frame | null, idle: IdleProfile | null): CueRead {
+  const rows = withoutCommandList(allRows, frame === null ? null : ownCommandList(allRows.map(rowText), frame, idle));
   const plain = readCues(rows, frame);
   if (idle?.dialogsInBox !== true || frame === null) return plain;
   // From the top edge down: a dialog in the box's place lies there, and the transcript above is no part of it.
