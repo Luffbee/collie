@@ -10,6 +10,8 @@
 //   {"timestamp":"…","type":"event_msg","payload":{"type":"user_message"|"agent_message"|
 //                                                  "agent_reasoning"|"token_count", …}}
 // `{timestamp,type,payload}` are the ONLY top-level keys.
+// Paginated rollouts can inherit earlier log segments; codex-source.ts composes those before
+// either History or the live window feeds rows to this reducer.
 //
 // THE TRAP: ROWS ARE DOUBLE-BOOKED. The same conversation is written twice — once as `response_item`
 // (the API-shaped record) and once as `event_msg` (the UI event stream). Measured on one session: 29
@@ -24,9 +26,6 @@
 // there is no id and the journal correctly reports "no-session". The hook fires only when the first
 // prompt is submitted, so a Codex pane with no turn yet has no session either
 // (`REPORTS_SESSION_ON_FIRST_PROMPT` in `registry.ts`).
-
-import { readdir } from "node:fs/promises";
-import { join } from "node:path";
 
 import type { CacheProbe } from "../cache/engine.ts";
 import type { JsonObject, JsonValue } from "../json.ts";
@@ -44,7 +43,7 @@ import {
   type RowReducer,
 } from "./reduce.ts";
 import { asRecord, asText, probeTail, tokenCount, walkBack } from "./cache-probe.ts";
-import { containedRealpath, exists, loadTail, readSinceFile, rootList, statFile } from "./files.ts";
+import { CodexTranscriptSource } from "./codex-source.ts";
 import { clamp, MAX_RESULT_CHARS, MAX_TEXT_CHARS, oneLine, stripAnsi, summarizeToolInput } from "./text.ts";
 import { classifyToolCall, type ToolCall } from "./tool-call.ts";
 import type {
@@ -52,15 +51,9 @@ import type {
   JournalAdapter,
   TranscriptEntry,
   TranscriptPart,
-  TranscriptSource,
 } from "./types.ts";
 
-/** Codex names sessions with the same canonical uuid shape Claude does. */
-const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-export function isCodexSessionId(value: string): boolean {
-  return SESSION_ID_RE.test(value);
-}
+export { CodexTranscriptSource, isCodexSessionId } from "./codex-source.ts";
 
 /**
  * A stable per-row cursor, synthesised because Codex rows carry NO id of their own — and
@@ -517,102 +510,6 @@ export function createCodexReducer(): RowReducer {
 
   // No queue in this format's log: see `RowReducer.queued`.
   return { push, unknowns: unknown.tally, queued: noQueue };
-}
-
-/**
- * Real filesystem source rooted at Codex's `sessions` directory.
- *
- * Resolution is a targeted walk rather than Claude's flat scan, because the uuid is in the FILENAME
- * under date-partitioned directories (`YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`). We walk newest-date
- * first, so a live session is found after reading a handful of directory entries rather than the
- * whole year. The hit is cached; a cached path is re-verified before use, since a session can be
- * deleted while the bridge is up.
- *
- * No continuation-following, deliberately: Codex reports its session on the `SessionStart` hook (which
- * fires only at the first prompt, see `REPORTS_SESSION_ON_FIRST_PROMPT` in `registry.ts`), so a
- * resumed conversation re-reports its NEW id and the pane record follows it. That's the failure
- * Claude's followContinuation exists to paper over, and Codex's hook simply doesn't have it.
- */
-export class CodexTranscriptSource implements TranscriptSource {
-  private readonly pathCache = new Map<string, string>();
-
-  private readonly roots: string[];
-
-  /** One sessions directory or several (a second `CODEX_HOME`), searched in order. */
-  constructor(roots: string | readonly string[]) {
-    this.roots = rootList(roots);
-  }
-
-  async resolve(ref: AgentSessionRef): Promise<string | null> {
-    if (ref.kind !== "id" || !isCodexSessionId(ref.value)) return null;
-    const sessionId = ref.value;
-    const cached = this.pathCache.get(sessionId);
-    if (cached !== undefined) {
-      if (await exists(cached)) return cached;
-      this.pathCache.delete(sessionId);
-    }
-
-    const suffix = `-${sessionId.toLowerCase()}.jsonl`;
-    for (const root of this.roots) {
-      const hit = await this.findUnder(root, suffix);
-      // A hit that failed containment is `null` too — that root has nothing it may serve for this
-      // uuid either way, and the next root is asked on its own terms (files.ts header).
-      if (hit === null) continue;
-      this.pathCache.set(sessionId, hit);
-      return hit;
-    }
-    return null;
-  }
-
-  /** Newest first at every level: a session being read is almost always today's. */
-  private async findUnder(root: string, suffix: string): Promise<string | null> {
-    for (const year of await descending(root)) {
-      for (const month of await descending(join(root, year))) {
-        for (const day of await descending(join(root, year, month))) {
-          const dir = join(root, year, month, day);
-          let names: string[];
-          try {
-            names = await readdir(dir);
-          } catch {
-            continue;
-          }
-          const hit = names.find(
-            (n) => n.startsWith("rollout-") && n.toLowerCase().endsWith(suffix),
-          );
-          if (hit === undefined) continue;
-          return containedRealpath(join(dir, hit), root);
-        }
-      }
-    }
-    return null;
-  }
-
-  stat = statFile;
-
-  load = loadTail;
-
-  /**
-   * The live read, with one contract on its caller that no other harness imposes.
-   *
-   * A RESET MUST BE PAIRED WITH A FRESH REDUCER HERE. {@link codexCursor} numbers byte-identical
-   * rows by occurrence, and that numbering is a property of the parsed window — which is stated as
-   * an invariant where it is synthesised. A reset moves the window, so the numbering restarts, and a
-   * reducer kept across one would carry `seen` counts for rows the caller has thrown away. Under an
-   * append nothing renumbers, because the window only grows at the end.
-   *
-   * That is not a defect of the cursor, it is what `reset` means: the answer replaces what you hold,
-   * uuids included.
-   */
-  readSince = readSinceFile;
-}
-
-/** Directory entries, newest-name first. Empty when the directory doesn't exist. */
-async function descending(dir: string): Promise<string[]> {
-  try {
-    return (await readdir(dir)).toSorted().toReversed();
-  } catch {
-    return [];
-  }
 }
 
 /** Codex's journal adapter. `agent` matches the Herdr snapshot's `agent` string. */

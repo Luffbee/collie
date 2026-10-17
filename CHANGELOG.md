@@ -27,6 +27,10 @@ Running a crew? Update the lead first; members follow on their own. Details:
 
 - **Equations render in Chat, History and Markdown file previews.** Inline and display LaTeX use bundled KaTeX fonts, wide equations scroll within the page, and display equations copy their original source. Code stays literal and unsupported math remains readable as source.
 
+### Fixed
+
+- **Codex chat follows rewinds and keeps the retained history.** Chat and History follow the active rollout after Esc rewinds a conversation, remove the discarded turns, and combine the retained history with new messages, including after repeated rewinds and with large custom instructions. Restarting Codex does not bring discarded turns back.
+
 ## [1.22.0] - 2026-10-17
 
 ### Added
