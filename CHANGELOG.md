@@ -27,6 +27,10 @@ Running a crew? Update the lead first; members follow on their own. Details:
 
 - **Equations render in Chat, History and Markdown file previews.** Inline and display LaTeX use bundled KaTeX fonts, wide equations scroll within the page, and display equations copy their original source. Code stays literal and unsupported math remains readable as source.
 
+### Fixed
+
+- **Codex forks and repeated rewinds keep their retained history.** Chat and History include context inherited from another conversation and handle large startup instructions within the existing read limits.
+
 ## [1.23.0] - 2026-10-19
 
 ### Added

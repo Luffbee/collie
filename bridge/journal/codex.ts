@@ -60,7 +60,6 @@ import {
   containedRealpath,
   exists,
   FIRST_TAIL_BYTES,
-  head,
   loadTail,
   MAX_TRANSCRIPT_BYTES,
   readSinceFile,
@@ -553,8 +552,8 @@ export const CODEX_RESCAN_MS = 2000;
 /** Most links of a rewind chain followed. A chain past it reads as clipped, not as an error. */
 export const CODEX_MAX_CHAIN = 64;
 
-/** The most of a file read to find its `session_meta` row. Measured: 19 KB on 0.163.0. */
-const META_BYTES = 256 * 1024;
+/** First header read; custom instructions can require more, within the retained-history budget. */
+const META_FIRST_BYTES = 64 * 1024;
 
 /** One file of a conversation, and how many of its bytes belong to it: `[0, end)`. */
 interface ChainLink {
@@ -611,10 +610,9 @@ export function codexHistoryBase(firstLine: string): HistoryBase | null {
  *
  * THE CONVERSATION IS A CHAIN. The active segment holds only what came after the rewind; `load` and a
  * resetting `readSince` put the retained history in front of it, by following `history_base`
- * pointers to the session's own files ({@link CODEX_MAX_CHAIN} links, a file seen twice ends it). The
- * key stays the active file's path and its `stat` stays the active file's, which is right because a
- * base is frozen: the only thing that changes a conversation's prefix is another rewind, and that
- * changes the path.
+ * pointers to retained files, including a fork's parent conversation. The walk follows at most
+ * {@link CODEX_MAX_CHAIN} links and stops at a repeated file. The key and `stat` stay the active
+ * file's: a base is frozen, and another rewind changes the active path.
  *
  * No continuation-following beyond that: Codex reports its session on the `SessionStart` hook (which
  * fires only at the first prompt, see `REPORTS_SESSION_ON_FIRST_PROMPT` in `registry.ts`), so a
@@ -683,13 +681,14 @@ export class CodexTranscriptSource implements TranscriptSource {
   }
 
   /**
-   * The file a `history_base` names: the session's plain file when the id is the session's own, its
-   * `_<segment>` file otherwise. Looked up in every root, contained by the root that answered.
+   * A historical id names either a plain session file or a segment's final suffix. A fork can
+   * name another conversation's file, so the active session id cannot restrict this lookup.
+   * Looked up in every root, contained by the root that answered.
    */
-  private async findBase(sessionId: string, baseId: string): Promise<string | null> {
-    const suffix = baseId === sessionId ? `-${sessionId}.jsonl` : `-${sessionId}_${baseId}.jsonl`;
+  private async findBase(baseId: string): Promise<string | null> {
+    const suffix = `${baseId}.jsonl`;
     for (const root of this.roots) {
-      const hit = await this.findUnder(root, (name) => name.endsWith(suffix));
+      const hit = await this.findUnder(root, (name) => name.endsWith(`-${suffix}`) || name.endsWith(`_${suffix}`));
       if (hit !== null) return hit;
     }
     return null;
@@ -697,24 +696,29 @@ export class CodexTranscriptSource implements TranscriptSource {
 
   /**
    * The files in front of `active`, newest first, and whether the chain reached a file with no
-   * pointer. `broken` is a base that is gone, a loop, or a chain past {@link CODEX_MAX_CHAIN}: the
-   * caller shows what it has and calls it clipped, as it does a log over the byte cap.
+   * pointer. A missing or unreadable base, a loop, or either read bound ends the walk: the caller
+   * shows what it has and calls it clipped.
    */
-  private async chain(active: string, firstLine: string): Promise<{ links: ChainLink[]; broken: boolean }> {
-    const sessionId = /-([0-9a-f-]{36})(?:_[0-9a-f-]{36})?\.jsonl$/i.exec(active)?.[1]?.toLowerCase();
+  private async chain(active: string, firstLine: string, budget: number): Promise<{ links: ChainLink[]; broken: boolean }> {
     const links: ChainLink[] = [];
-    if (sessionId === undefined) return { links, broken: false };
     const seen = new Set([active]);
+    let left = Math.max(0, budget);
     let base = codexHistoryBase(firstLine);
     while (base !== null) {
       if (links.length >= CODEX_MAX_CHAIN) return { links, broken: true };
-      const path = await this.findBase(sessionId, base.id);
+      const path = await this.findBase(base.id);
       if (path === null || seen.has(path)) return { links, broken: true };
       seen.add(path);
       const st = await statFile(path);
       if (st === null) return { links, broken: true };
-      links.push({ path, end: Math.min(base.end, st.size) });
-      base = codexHistoryBase(await firstLineOf(path));
+      const end = Math.min(base.end, st.size);
+      links.push({ path, end });
+      // This file's tail already fills the prefix: no older header or file can contribute.
+      if (end > left) return { links, broken: true };
+      const first = await firstLineOf(path, left);
+      if (first === null) return { links, broken: true };
+      left -= end;
+      base = codexHistoryBase(first);
     }
     return { links, broken: false };
   }
@@ -730,7 +734,7 @@ export class CodexTranscriptSource implements TranscriptSource {
     firstLine: string,
     budget: number,
   ): Promise<{ text: string; complete: boolean }> {
-    const { links, broken } = await this.chain(active, firstLine);
+    const { links, broken } = await this.chain(active, firstLine, budget);
     const parts: string[] = [];
     let left = Math.max(0, budget);
     for (const link of links) {
@@ -794,12 +798,20 @@ function firstLineIn(text: string): string {
   return end === -1 ? text : text.slice(0, end);
 }
 
-/** The first row of a file — its `session_meta` — read within {@link META_BYTES}. */
-async function firstLineOf(path: string): Promise<string> {
+/** Grow to the first whole header row; an unreadable or over-budget header leaves history clipped. */
+async function firstLineOf(path: string, maxBytes: number): Promise<string | null> {
+  if (maxBytes <= 0) return null;
   try {
-    return firstLineIn(await head(path, META_BYTES));
+    const file = Bun.file(path);
+    for (let size = Math.min(META_FIRST_BYTES, maxBytes); ; size = Math.min(size * 2, maxBytes)) {
+      const bytes = Buffer.from(await file.slice(0, size).arrayBuffer());
+      const newline = bytes.indexOf(0x0a);
+      if (newline !== -1) return bytes.subarray(0, newline).toString("utf8");
+      if (bytes.length < size) return bytes.toString("utf8");
+      if (size === maxBytes) return null;
+    }
   } catch {
-    return "";
+    return null;
   }
 }
 
