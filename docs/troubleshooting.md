@@ -8,7 +8,7 @@ reboot** · **a pane is stuck narrow** · **Collie refuses to open a tmux window
 **`tmux list: output did not parse`** · **`herdr plugin list` shows the old version** ·
 **stale UI after a rebuild** · **I saved a machine in Herdr and the phone does not show it** ·
 **an update started from the phone stays at staging** · **a phone update on macOS leaves Collie
-unloaded** · **on macOS, `collie status` says "loaded, not running"** · **a pane shows no prompt-cache chip** · **a pane has no Chat or History** · **a new Codex pane says it has no history
+unloaded** · **on macOS, `collie status` says "loaded, not running"** · **a pane shows no prompt-cache chip** · **a Kiro pane's History opens empty** · **a pane has no Chat or History** · **a new Codex pane says it has no history
 yet** · **the phone says Collie cannot read a screen the agent is not showing** · **an agent is greyed
 out on the New page** · **Start says there is no folder, or says it could not confirm** ·
 **walky talky: send is refused, "run this inside a pane"** · **walky talky: the message sits in the
@@ -159,6 +159,19 @@ not taken a turn yet, which is not a fault: nothing is shown before it is measur
 on the agent's first reply. A harness whose vendor publishes no cache lifetime shows nothing either,
 and `cache-claims` lists every rule this build does ship.
 
+**A Kiro pane's History opens empty.** Check that the pane's Kiro holds a session lock:
+
+```sh
+cat ~/.kiro/sessions/*/*/.lock
+```
+
+Herdr names no session for a Kiro pane, so Collie finds it by the lock the running Kiro holds. That
+works only on Herdr, the one multiplexer that lists a pane's foreground processes, and only when exactly one Kiro process runs there. Otherwise History says the pane has no agent session.
+
+Collie reads Kiro V3 sessions, started with `--v3` or `--agent-engine v3`, or with V3 set as the
+engine in Kiro's own settings, so start Kiro again that way in that pane. Kiro has no Herdr hook to
+install. If its sessions live somewhere else, set `kiro_root`, then run `collie restart`.
+
 **A pane shows the terminal where you expected Chat.** Chat is the default for an agent pane, so one
 of two things holds. This device chose the terminal earlier: open the pane's **⋮** menu and tap
 **Chat view**. Or the pane has no session or no log to read. A new pane shows Chat with "Send a
@@ -280,7 +293,7 @@ exist. **Try again** sends the same request and never opens a second pane
 
 ## Walky talky
 
-Five symptoms of walky talky come up most. Each one has a command that shows the cause
+Six symptoms of walky talky come up most. Each one has a command that shows the cause
 ([Walky talky](walky-talky.md)).
 
 **`collie walky send` says "run this inside a pane, or send from the phone".** The command ran
@@ -290,13 +303,20 @@ phone. In an agent pane, `collie walky who` marks your pane with `(you)`. The er
 this machine knows this pane" means another Collie owns the pane. The error "no running Collie bridge
 answers" means the bridge is down: run `collie status`.
 
+**The message says "held" and is not typed yet.** `collie walky status <id>` prints "held: draft
+present" or "held: turn running". The box holds a draft, or the agent is working. Collie types the
+message when the box clears or the turn ends, up to 60 minutes. Do not send it again. To let it in
+now, send or clear the draft in that pane. Under an older lead, "queued (outcome known on the lead)"
+also means wait.
+
 **The message sits in the inbox and was not typed.** `collie walky status <id>` prints "waiting in the
-inbox, not typed" and the reason. "held past 10 minutes" means the pane stayed busy, or a dialog
-stayed open, for the whole 10-minute hold: Collie never types into a dialog. "draft present" means the
-box holds your own text. "box not free" means Collie could not read a free input box. "pane busy"
-means an earlier message was still being typed there after 2 minutes. "no terminal" and "bridge
-restarted" are the other two. Run `collie walky inbox` in that pane, or open Messages in the pane's
-menu on the phone. Collie does not type the message again.
+inbox, not typed" and the reason. "held past 60 minutes" means a draft stayed in the box, the pane
+stayed busy, or a dialog stayed open, for the whole 60-minute hold: Collie never types into a draft or
+a dialog. "box not free" means Collie could not read a free input box. "pane busy" means an earlier
+message was still being typed there after 2 minutes. "pane replaced" means another session took the
+pane while the message waited. "no terminal" and "bridge restarted" are the other two. Run `collie
+walky inbox` in that pane, or open Messages in the pane's menu on the phone. Collie does not type the
+message again.
 
 **`collie walky send` says "not sent: pane replaced".** The address ends with a token, such as
 `#k3f9`, and the pane it named has closed. Another pane holds that pane id now, so Collie does not

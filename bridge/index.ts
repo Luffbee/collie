@@ -19,6 +19,7 @@ import { DiskWatch } from "./machine-disks.ts";
 import { MachineSampler } from "./machine-stats.ts";
 import { machineRosterOf, MachineWatch, SOLO_MACHINE_ID, type MachineRosterEntry } from "./machines.ts";
 import { localWatchPane, peerWatchPane } from "./cache/watch-key.ts";
+import { museSessionNameReader } from "./journal/muse.ts";
 import { buildJournalRegistry } from "./journal/registry.ts";
 import { createCacheRulesReader } from "./operator-cache-rules.ts";
 import { AuditLog, fileAuditAppender } from "./audit.ts";
@@ -786,6 +787,12 @@ await activity.load();
 const journals = cfg.transcript
   ? buildJournalRegistry({ ...cfg.journalRoots, durable: [durableLogDir(cfg.stateDir)] })
   : null;
+// The name the operator gave a Muse session, for the engines' pane naming (journal/muse.ts).
+// It reads the same logs the journal does, so it lives and dies with the same switch: with
+// transcripts off no engine is handed a reader, and muse panes keep their fallbacks exactly as
+// before. One reader for the whole bridge — its per-session scans are keyed by session id, so
+// two collie sessions watching one herd share the fold instead of re-walking the log.
+const museNames = cfg.transcript ? museSessionNameReader(cfg.journalRoots.muse) : undefined;
 const cacheRulesReader = createCacheRulesReader(cfg.cacheRulesFile);
 const paneCache =
   journals === null
@@ -1400,6 +1407,9 @@ if (holdStore !== null && sendStore !== null) {
   const waiting = holdStore.list().filter((entry) => entry.state === "held").length;
   if (changed > 0 || waiting > 0) console.log(`[send] hold queue replayed: ${String(waiting)} held, ${String(changed)} row(s) settled after the last run`);
 }
+// Walky talky's last word before a held send goes out (M62 spec 02), set once its service exists below:
+// a message meant for a pane instance that is gone never reaches the pane that took its id.
+let walkyReleaseCheck: ((requestId: string, session: string, paneId: string) => boolean) | null = null;
 // The Surface counters (M56 spec 09): one ledger for the bridge, a day file under `<stateDir>/surface/`.
 // Created with either flag, so an instance that computes no Surface touches no new file. It never
 // blocks a send and never changes a verdict.
@@ -1455,7 +1465,7 @@ const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
   const built = endpoint.kind === "program" ? programAdapter(endpoint.source) : terminalAdapter(endpoint.socketPath);
   const target = built.target;
   const herdr = withBeaconsIfBlind(built.adapter, target);
-  const engine = new StateEngine(herdr, cfg.pollMs);
+  const engine = new StateEngine(herdr, cfg.pollMs, { museSessionName: museNames });
 
   // Event-poked polling: a long-lived watch on the multiplexer pokes an immediate re-poll on any
   // herd change, and while it's healthy the interval relaxes to the safety-net cadence. Events are
@@ -1607,6 +1617,7 @@ const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
           generation: generationOf,
           asks: askBook,
           holds: holdStore ?? undefined,
+          releaseCheck: (requestId, session, paneId) => walkyReleaseCheck?.(requestId, session, paneId) ?? true,
           // A blind send on one of this session's shell panes joins Sent (ADR 0107); any other pane is left out.
           blindSent: sentRecorder(sentStore, () => engine.current().shellPanes),
         })
@@ -1776,15 +1787,22 @@ const walkyRawPanes = (): Omit<WalkyPane, "instance">[] =>
     for (const view of shellPanes) out.push(of(view, false));
     return out;
   });
+/** A Send Protocol outcome for walky talky. A held one carries what holds it now, from its hold file. */
+function walkyResult(sendId: string, outcome: string, reason: string | undefined): SendResult {
+  const why = outcome === "held" ? (holdStore?.get(sendId)?.cause ?? reason) : reason;
+  return why === undefined ? { outcome } : { outcome, reason: why };
+}
 const walkyHost: WalkyHost = {
   panes: () => walkyInstances.stamp(walkyRawPanes()),
-  send: async (pane, sendId, text): Promise<SendResult> => {
+  // A walky send is marked (M62 spec 02): a draft holds it, and its hold ends on walky's one clock.
+  send: async (pane, sendId, text, hold): Promise<SendResult> => {
     const protocol = registry.get(pane.session)?.send;
     if (protocol === undefined) return { outcome: "refused", reason: "no terminal" };
-    const answer = await protocol.handle({ id: sendId, text, mode: "send" }, { session: pane.session, paneId: pane.paneId, harness: pane.harness ?? "" });
+    const request = hold === undefined ? { id: sendId, text, mode: "send" as const } : { id: sendId, text, mode: "send" as const, draftHolds: true, holdUntil: hold.holdUntil };
+    const answer = await protocol.handle(request, { session: pane.session, paneId: pane.paneId, harness: pane.harness ?? "" });
     const receipt = answer.receipt;
     if (receipt === undefined) return { outcome: "unknown" };
-    return receipt.reason === undefined ? { outcome: receipt.outcome } : { outcome: receipt.outcome, reason: receipt.reason };
+    return walkyResult(sendId, receipt.outcome, receipt.reason);
   },
   sendState: (sendId) => {
     const record = sendStore?.get(sendId) ?? null;
@@ -1792,7 +1810,7 @@ const walkyHost: WalkyHost = {
     const receipt = record.receipt;
     // A request with no receipt yet still runs; the start-up recovery ends a crashed one `unknown`.
     if (receipt === undefined) return { outcome: "held" };
-    return receipt.reason === undefined ? { outcome: receipt.outcome } : { outcome: receipt.outcome, reason: receipt.reason };
+    return walkyResult(sendId, receipt.outcome, receipt.reason);
   },
   cancelHeld: (session, paneId, sendId) => {
     registry.get(session)?.send?.cancelHeld(session, paneId, sendId);
@@ -1842,6 +1860,7 @@ const walky = new WalkyService({
   leadName: () => trustStore.current()?.lead?.memberId ?? null,
   remoteSkipped: crew.mode === "lead" ? () => walkyLeadHalf?.skipped() ?? [] : undefined,
 });
+walkyReleaseCheck = (requestId, session, paneId) => walky.deliverer.stillMeant(requestId, session, paneId);
 // A member reports, on each snapshot answer, how the messages from elsewhere ended on its panes, until
 // its lead acks them.
 const walkyReport = crew.mode === "peer" && walkyMemberId !== null ? new WalkyReport(walkyMemberId) : null;

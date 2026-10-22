@@ -347,6 +347,11 @@ export const es: Dictionary = {
   "composer.attach.listAria": "Adjuntos",
   "composer.attach.removeAria": "Quitar {name}",
   "composer.attach.inFront": "Su marcador ya no está en el texto, por lo que Enviar antepone {name}.",
+  "composer.paste.chipStats.one": "{count} line · {chars} chars",
+  "composer.paste.chipStats.other": "{count} lines · {chars} chars",
+  "composer.paste.sheetTitle": "Pasted text #{n}",
+  "composer.paste.expandToInput": "Expand into input",
+  "composer.paste.editAria": "Edit pasted text #{n}",
   "composer.send.reallySend": "¿Confirmar envío?",
   "composer.send.dialogFirst": "Responder al diálogo",
   "composer.send.stopTypingAria": "Detener escritura en la terminal",
@@ -409,8 +414,8 @@ export const es: Dictionary = {
   "composer.protocol.draft": "El cuadro ya tiene un borrador. Añade, reemplaza o cancela.",
   "composer.protocol.typed": "Tu texto está en el cuadro, pero no se pulsó Intro. Envíalo o descártalo.",
   "composer.protocol.unconfirmed": "Collie no puede leer esta pantalla. Revisa el panel y toca Escribir aquí.",
-  "composer.protocol.noticeKey": "Ese número respondería al aviso sobre la caja. Revisa el panel y toca Escribir aquí.",
-  "composer.protocol.noticeKeyHeld": "Ese número respondería al aviso sobre la caja. Respóndelo en su tarjeta o envía el número cuando termine el turno.",
+  "composer.protocol.noticeKey": "Ese mensaje respondería al aviso sobre la caja. Revisa el panel y toca Escribir aquí.",
+  "composer.protocol.noticeKeyHeld": "Ese mensaje respondería al aviso sobre la caja. Respóndelo en su tarjeta o envía el mensaje cuando termine el turno.",
   "composer.protocol.unknown": "Collie no puede determinar si esto se envió. Lea la pantalla y vuelva a enviar si no se envió. Su borrador se conserva.",
   "composer.protocol.busy": "Otro envío a este panel sigue en curso. Espera e inténtalo de nuevo.",
   "composer.protocol.notFree": "El cuadro de entrada no está libre. No se escribió nada.",
@@ -437,6 +442,7 @@ export const es: Dictionary = {
   "composer.protocol.commitCap": "Confirmar y escribir",
   "sendReceipts.title": "Envíos recientes",
   "sendReceipts.empty": "Aún no hay envíos a este panel.",
+  "sendReceipts.kept": "Collie keeps the line of a send on this machine for seven days. A line that looks like a secret is not kept.",
   "sendReceipts.outcome.sent": "Enviado",
   "sendReceipts.outcome.effective": "Confirmado",
   "sendReceipts.outcome.typed_not_submitted": "Escrito, no enviado",
@@ -536,6 +542,7 @@ export const es: Dictionary = {
   "settings.paneOrder.description":
     "Actividad pone arriba, en el panel de control y en el conmutador, el panel donde ocurrió algo por última vez. Caché pone el que pierde antes su caché de prompts. Lugar mantiene el orden de tu terminal.",
   "chat.status.feedbackSent": "Comentarios enviados",
+  "chat.status.answerSent": "Respuesta enviada",
   "chat.status.sent": "Enviado",
   "chat.status.menuChanged": "Menú modificado: recargando",
   "chat.status.askChanged": "El diálogo cambió; la tarjeta muestra el nuevo",
@@ -768,6 +775,25 @@ export const es: Dictionary = {
     "El foco de entrada está en la línea de texto de la terminal. Los botones se reactivan al cerrar el campo.",
   "prompt.feedback.freeText.typedPrefix":
     "Respuesta personalizada en la terminal: ",
+  "prompt.feedback.answer.offer": "Escribir tu propia respuesta",
+  "prompt.feedback.answer.change": "Cambiar esta respuesta",
+  "prompt.feedback.answer.editorLabel": "Tu respuesta",
+  "prompt.feedback.answer.textAria": "Texto de la respuesta",
+  "prompt.feedback.answer.placeholder": "Escribe tu respuesta...",
+  "prompt.feedback.answer.help":
+    "Se escribe en el campo de respuesta de la pregunta y se envía como tu respuesta.",
+  "prompt.feedback.answer.helpWizard":
+    "Se escribe en el campo de respuesta de esta pregunta. Al enviarla, se responde y se pasa a la siguiente.",
+  "prompt.feedback.answer.helpMulti":
+    "Añade tu respuesta como una opción marcada; toca Enviar (o Siguiente) cuando termines.",
+  "prompt.feedback.answer.send": "Enviar respuesta",
+  "prompt.feedback.answer.sending": "Escribiendo tu respuesta...",
+  "prompt.feedback.answer.focused":
+    "El campo de respuesta tiene el teclado en el terminal, así que estos botones escribirían en él. Aun así puedes enviar tu propia respuesta abajo.",
+  "prompt.feedback.answer.typedPrefix": "En el campo de respuesta: ",
+  "prompt.feedback.answer.fieldMoved": "El campo de respuesta del terminal ahora contiene «{text}». Envía de nuevo para reemplazarlo.",
+  "prompt.feedback.answer.fieldEmptied": "El campo de respuesta del terminal se vació. Envía de nuevo para rellenarlo.",
+  "prompt.feedback.answer.questionMoved": "El terminal pasó a otra pregunta: «{question}». No se envió nada. Envía de nuevo para responder a esta.",
 
   // --- paneSettings (one pane's own preferences; today the prompt-cache warning, ADR 0042) ---
   "paneSettings.title": "Configuración del pane",
@@ -943,6 +969,9 @@ export const es: Dictionary = {
   "home.workspaceFilter.aria": "Espacio de trabajo",
   "home.workspaceFilter.all": "Todos los espacios de trabajo",
   "home.workspaceFilter.showHidden": "Mostrar espacios de trabajo ocultos",
+  "home.workspaceFilter.title": "Espacios de trabajo",
+  "home.workspaceFilter.count.one": "{count} espacio de trabajo",
+  "home.workspaceFilter.count.other": "{count} espacios de trabajo",
   "home.sidebar.shells": "Shells",
   "home.pinned.title": "Fijado",
   "home.pinHint.hold": "Mantenga presionado un panel para fijarlo aquí.",
@@ -1501,6 +1530,10 @@ export const es: Dictionary = {
   "promptAction.feedback.empty": "No hay nada para enviar.",
   "promptAction.feedback.boxNotOpened": "El cuadro de comentarios no se abrió. Revisa el panel.",
   "promptAction.feedback.notArrived": "El comentario no llegó. No se envió nada.",
+  "promptAction.answer.fieldNotReached": "No se pudo llegar al campo de respuesta. No se envió nada.",
+  "promptAction.answer.notCleared": "No se pudo vaciar el campo de respuesta. No se envió nada.",
+  "promptAction.answer.notArrived": "Tu respuesta no llegó al campo. No se envió nada.",
+  "promptAction.answer.notTicked": "La respuesta se escribió, pero su fila no se marcó. Revísala en la tarjeta.",
 
   // --- stt (speech-to-text errors, lib/stt.ts + hooks/use-stt-recorder.ts) ---
   "stt.error.busy": "Ocupado. Hay otra transcripción en curso. Reintenta en unos segundos.",
@@ -1682,6 +1715,8 @@ export const es: Dictionary = {
   "settings.updateCard.majorNote": "{version} es una versión mayor.",
   "settings.updateCard.dismiss": "Recordar en el próximo resumen",
   "settings.updateCard.dismissed": "Pospuesto hasta el próximo resumen.",
+  "settings.updateCard.dismissEdge": "Remind me at the next build",
+  "settings.updateCard.dismissedEdge": "Dismissed until the next Edge build.",
   "settings.updateCard.checking": "Comprobando este equipo…",
   "settings.updateCard.details": "Detalles",
   "settings.updateCard.summary.checks.one": "{count} comprobación",
@@ -2526,6 +2561,8 @@ export const es: Dictionary = {
   "walky.state.refusedBecause": "no enviado: {reason}",
   "walky.state.expired": "caducado",
   "walky.state.unknown": "es posible que haya llegado, no se enviará de nuevo",
+  "walky.state.held": "held: {reason}",
+  "walky.state.heldHint": "Typed when the box clears or the turn ends, up to 60 minutes. Do not send it again.",
   // The pane sheet's row and the sheet it opens.
   "walky.sheet.row": "Mensajes",
   "walky.sheet.title": "Mensajes",

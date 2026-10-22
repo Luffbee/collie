@@ -94,7 +94,7 @@ describe("readSend", () => {
   // The review's F3: the bridge's English detail is dropped for every `unconfirmed`, so the notice's own
   // sentence travels as a cause the phone translates. An answer without it keeps the generic sentence.
   it("a refusal with the notice cause says the number would answer the notice, and keeps the commit offer", () => {
-    const body: JsonObject = { receipt: { outcome: "refused", reason: "unconfirmed" }, offers: ["commit", "keys"], cause: "notice_key", detail: "That digit would answer the notice above the box." };
+    const body: JsonObject = { receipt: { outcome: "refused", reason: "unconfirmed" }, offers: ["commit", "keys"], cause: "notice_key", detail: "That message would answer the notice above the box." };
     expect(readSend(readSendReply(body)!)).toMatchObject({ clear: false, note: "noticeKey", offers: ["commit"], detail: null });
     const running: JsonObject = { receipt: { outcome: "refused", reason: "unconfirmed" }, offers: ["keys"], cause: "notice_key" };
     // No commit offered (a running turn, a Replace): the sentence names the card and the turn's end, not Type here.
@@ -312,6 +312,22 @@ describe("the session page's rows (send drill 3)", () => {
     expect(rows.receipts[1]!.detail).toBeUndefined();
     expect(rows.receipts[1]!.saw).toBeUndefined();
     expect(rows.receipts[2]!.detail).toHaveLength(240);
+  });
+
+  it("reads the line of a row off the wire, and leaves out one that is empty or not a string (2026-10-21)", () => {
+    const row = { requestId: "r1abcdefgh", at: 5, mode: "send", outcome: "sent", keys: ["Enter"], gapsMs: {}, harness: "claude", version: "2.1.302" };
+    const rows = readSendReceipts({
+      receipts: [
+        { ...row, line: "ok check please it's past 2pm" },
+        { ...row, requestId: "r2abcdefgh", line: "" },
+        { ...row, requestId: "r3abcdefgh", line: 7 },
+        { ...row, requestId: "r4abcdefgh" },
+      ],
+    });
+    expect(rows.receipts[0]!.line).toBe("ok check please it's past 2pm");
+    expect(rows.receipts[1]!.line).toBeUndefined();
+    expect(rows.receipts[2]!.line).toBeUndefined();
+    expect(rows.receipts[3]!.line).toBeUndefined();
   });
 
   it("reads the cap of a row off the wire and drops one that is not whole", () => {

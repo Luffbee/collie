@@ -377,6 +377,11 @@ export const en = {
   "composer.attach.listAria": "Attachments",
   "composer.attach.removeAria": "Remove {name}",
   "composer.attach.inFront": "Its marker is gone from your text, so Send puts {name} in front.",
+  "composer.paste.chipStats.one": "{count} line · {chars} chars",
+  "composer.paste.chipStats.other": "{count} lines · {chars} chars",
+  "composer.paste.sheetTitle": "Pasted text #{n}",
+  "composer.paste.expandToInput": "Expand into input",
+  "composer.paste.editAria": "Edit pasted text #{n}",
   "composer.send.reallySend": "Really send?",
   "composer.send.dialogFirst": "Answer the dialog",
   "composer.send.stopTypingAria": "Stop typing into terminal",
@@ -442,8 +447,8 @@ export const en = {
   "composer.protocol.draft": "The box already holds a draft. Add to it, replace it, or cancel.",
   "composer.protocol.typed": "Your text is in the box, but Enter was not pressed. Submit it or discard it.",
   "composer.protocol.unconfirmed": "Collie cannot read this screen. Check the pane, then tap Type here.",
-  "composer.protocol.noticeKey": "That number would answer the notice above the box. Check the pane, then tap Type here.",
-  "composer.protocol.noticeKeyHeld": "That number would answer the notice above the box. Answer it on its card, or send the number once the turn has ended.",
+  "composer.protocol.noticeKey": "That message would answer the notice above the box. Check the pane, then tap Type here.",
+  "composer.protocol.noticeKeyHeld": "That message would answer the notice above the box. Answer it on its card, or send it once the turn has ended.",
   "composer.protocol.unknown": "Collie cannot tell if this was sent. Read the screen, then send again if it did not go. Your draft is kept.",
   "composer.protocol.busy": "Another send on this pane is still running. Wait, then try again.",
   "composer.protocol.notFree": "The input box is not free. Nothing was typed.",
@@ -472,6 +477,7 @@ export const en = {
   // The last ten sends for a pane, from the receipts (M56 spec 09). No text, no screen rows.
   "sendReceipts.title": "Recent sends",
   "sendReceipts.empty": "No sends to this pane yet.",
+  "sendReceipts.kept": "Collie keeps the line of a send on this machine for seven days. A line that looks like a secret is not kept.",
   "sendReceipts.outcome.sent": "Sent",
   "sendReceipts.outcome.effective": "Confirmed",
   "sendReceipts.outcome.typed_not_submitted": "Typed, not sent",
@@ -584,6 +590,7 @@ export const en = {
   "settings.paneOrder.description":
     "Activity puts the pane where something last happened at the top of the dashboard and the switcher. Cache puts the one whose prompt cache dies soonest there. Place keeps the order your terminal has.",
   "chat.status.feedbackSent": "Feedback sent",
+  "chat.status.answerSent": "Answer sent",
   "chat.status.sent": "Sent",
   "chat.status.menuChanged": "Menu changed, refreshing",
   "chat.status.askChanged": "The dialog changed; the card shows the new one",
@@ -845,6 +852,24 @@ export const en = {
   "prompt.feedback.freeText.focused":
     "The free-text row has the keyboard in the terminal. These buttons would type into it instead of answering. They resume when it closes.",
   "prompt.feedback.freeText.typedPrefix": "A custom answer is being written in the terminal: ",
+  "prompt.feedback.answer.offer": "Type your own answer",
+  "prompt.feedback.answer.change": "Change this answer",
+  "prompt.feedback.answer.editorLabel": "Your answer",
+  "prompt.feedback.answer.textAria": "Answer text",
+  "prompt.feedback.answer.placeholder": "Write your answer…",
+  "prompt.feedback.answer.help": "Typed into the question's answer field and sent as your answer.",
+  "prompt.feedback.answer.helpWizard":
+    "Typed into this question's answer field. Sending answers it and moves to the next question.",
+  "prompt.feedback.answer.helpMulti":
+    "Adds your answer as a ticked choice; tap Submit (or Next) when you're done.",
+  "prompt.feedback.answer.send": "Send answer",
+  "prompt.feedback.answer.sending": "Typing your answer…",
+  "prompt.feedback.answer.focused":
+    "The answer field has the keyboard in the terminal, so these buttons would type into it. You can still send your own answer below.",
+  "prompt.feedback.answer.typedPrefix": "In the answer field: ",
+  "prompt.feedback.answer.fieldMoved": "The answer field in the terminal now holds “{text}”. Send again to replace it.",
+  "prompt.feedback.answer.fieldEmptied": "The answer field in the terminal was emptied. Send again to fill it.",
+  "prompt.feedback.answer.questionMoved": "The terminal moved on to another question: “{question}”. Nothing was sent. Send again to answer this one.",
 
   // --- paneSettings (one pane's own preferences; today the prompt-cache warning, ADR 0042) ---
   "paneSettings.title": "Pane settings",
@@ -1019,6 +1044,9 @@ export const en = {
   "home.workspaceFilter.aria": "Workspace",
   "home.workspaceFilter.all": "All workspaces",
   "home.workspaceFilter.showHidden": "Show hidden workspaces",
+  "home.workspaceFilter.title": "Workspaces",
+  "home.workspaceFilter.count.one": "{count} workspace",
+  "home.workspaceFilter.count.other": "{count} workspaces",
   "home.sidebar.shells": "Shells",
   "home.pinned.title": "Pinned",
   "home.pinHint.hold": "Hold a pane to pin it here.",
@@ -1594,6 +1622,10 @@ export const en = {
   "promptAction.feedback.empty": "Nothing to send",
   "promptAction.feedback.boxNotOpened": "The feedback box didn't open. Check the pane",
   "promptAction.feedback.notArrived": "The feedback didn't arrive. Nothing was submitted",
+  "promptAction.answer.fieldNotReached": "Couldn't reach the answer field. Nothing was sent",
+  "promptAction.answer.notCleared": "Couldn't clear the answer field. Nothing was sent",
+  "promptAction.answer.notArrived": "Your answer didn't arrive in the field. Nothing was submitted",
+  "promptAction.answer.notTicked": "The answer was typed, but its row did not tick. Check it on the card.",
 
   // --- stt (speech-to-text errors, lib/stt.ts + hooks/use-stt-recorder.ts) ---
   "stt.error.busy": "Busy: another recording is still transcribing. Try again in a moment.",
@@ -1780,6 +1812,10 @@ export const en = {
   "settings.updateCard.majorNote": "{version} is a new major.",
   "settings.updateCard.dismiss": "Remind me next digest",
   "settings.updateCard.dismissed": "Dismissed until the next digest.",
+  // On Edge there is no digest: the push waits only for a newer build (and for 09:00). Same button, same
+  // snooze, so these two say what it does there.
+  "settings.updateCard.dismissEdge": "Remind me at the next build",
+  "settings.updateCard.dismissedEdge": "Dismissed until the next Edge build.",
   "settings.updateCard.checking": "Checking this machine…",
   "settings.updateCard.details": "Details",
   "settings.updateCard.summary.checks.one": "{count} check",
@@ -2712,6 +2748,9 @@ export const en = {
   "walky.state.refusedBecause": "not sent: {reason}",
   "walky.state.expired": "expired",
   "walky.state.unknown": "may have arrived, will not be sent again",
+  // A held message: `accepted` with what holds it. `{reason}` is the bridge's words ("draft present", "turn running").
+  "walky.state.held": "held: {reason}",
+  "walky.state.heldHint": "Typed when the box clears or the turn ends, up to 60 minutes. Do not send it again.",
   // The pane sheet's row and the sheet it opens.
   "walky.sheet.row": "Messages",
   "walky.sheet.title": "Messages",

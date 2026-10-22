@@ -34,7 +34,7 @@ import {
   unreadDialogsSameIdentity,
   type UnreadDialogModel,
 } from "./unread-dialog-model";
-import { wizardsEqual, type WizardModel } from "./wizard-model";
+import { wizardsEqual, wizardsSameIdentity, type WizardModel } from "./wizard-model";
 
 /** The model each interactive block kind carries. Keys are exactly the non-`raw` `Block["kind"]`s —
  *  a new interactive kind that lands without an entry here fails to typecheck in `dialogModelOf`. */
@@ -184,9 +184,12 @@ export const DIALOG_CONTRACT: DialogContract = {
     tail: (m) => m.bindTail,
   },
   wizard: {
-    // Every wizard key commits too — a digit selects AND advances; Left/Right change the step.
+    // Every wizard key commits too — a digit selects AND advances; Left/Right change the step. The
+    // answer recipe (lib/answer-field.ts) moves the pointer and fills the field itself, so its
+    // mid-flight polls key on the identity that ignores both; its entry guard still takes the
+    // byte-faithful `wizardsEqual`, so a field that changed since the render refuses there.
     commits: wizardsEqual,
-    identity: wizardsEqual,
+    identity: wizardsSameIdentity,
     signature: (m) => m.signature,
     region: (m) => m.signature,
   },
@@ -210,8 +213,9 @@ export const DIALOG_CONTRACT: DialogContract = {
     // A footer-named key COMMITS (in the `/model` picker, Enter writes the user's default), so it
     // takes the full signature check; an arrow only moves the highlight — which is precisely what
     // changes the signature — so it compares identity without the leftRight label. A card off a notice
-    // above a live box (`liveBox`) has digit keys only, each printed on its key row, and no arrows: its
-    // region is the notice's rows, which the bridge finds in its fresh read or refuses the tap.
+    // above a live box (`liveBox`) has digit keys only (letter keys only, under a `letters` head), each
+    // printed on its key row, and no arrows: its region is the notice's rows, which the bridge finds in
+    // its fresh read or refuses the tap.
     commits: menusEqual,
     identity: menusSameIdentity,
     signature: (m) => m.signature,
