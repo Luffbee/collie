@@ -30,8 +30,14 @@
 // frame is never free, so one of these shapes in a transcript costs a counter, never a send; over a
 // found frame the stricter rules above keep a quote free.
 //
+// A profile that draws its dialogs in the box's place has its box rows read as that cluster too. There
+// a prompt glyph over a draft soft-wrapped to the box's width ({@link draftWrap}) is read as blank: the
+// wrapped rows under it line up like a pointed list between two rules, and they are one paragraph.
+// The same rows with a row cut by an ellipsis read as neither: no cue, flagged `cutWrap`, unreadable.
+//
 // Pure: the same rows always give the same answer.
 
+import { displayWidth } from "../text-width";
 import { commandListNear, pointsAt, type CommandListRead } from "./command-list";
 import { rowText, type Frame, type FrameRow, type IdleProfile } from "./frame";
 import { isSingleKeyRow } from "./key-row";
@@ -70,6 +76,12 @@ export interface CueRead {
   readonly hash: string;
   /** A panel's dismiss hint stands alone over the found box ({@link PANEL_FOOT}): the panel takes the keys, not the box. */
   readonly panelFoot?: true;
+  /**
+   * The box's rows would read as a soft-wrapped draft, but a row ends in an ellipsis ({@link draftWrap}
+   * `cut`): a draft and a menu cut to the box's width look the same there. The screen is unreadable for
+   * this read: no dialog, no draft, nothing free (fold.ts `surfaceOfScreen`).
+   */
+  readonly cutWrap?: true;
 }
 
 /** The most non-blank rows the no-frame cluster reads (a list it would cut is read whole). */
@@ -80,6 +92,8 @@ export const CLUSTER_GAP_ROWS = 3;
 export const FOOTER_MAX_ROWS = 2;
 /** Commands in a list that make it an overlay shape. */
 const COMMAND_LIST_MIN = 3;
+/** Cells a soft-wrapped row may stop short of the box's width before its next word would have fit. */
+const WRAP_SLACK = 8;
 
 /** Glyphs a dialog draws in front of the highlighted row. */
 const POINTERS = "❯›>▶►→➜❱▸➤⟩❭〉";
@@ -465,8 +479,9 @@ export function noticeOver(texts: readonly string[], frame: Frame | null, idle: 
  * The cues of a screen read under a profile: the frame's own cues, or, when the profile draws its
  * dialogs where the box stands (`idle.dialogsInBox`), the cues of the rows from the box's top edge down,
  * the box rows included. The typed command's own list on either side of the box ({@link ownCommandList})
- * and a notice over the box ({@link noticeOver}) are left out of both, and the box's own prompt glyph
- * ({@link withoutOwnPrompt}) out of the second.
+ * and a notice over the box ({@link noticeOver}) are left out of both. The second also reads the box's
+ * own prompt glyph ({@link withoutOwnPrompt}) as blank, and the prompt glyph over a soft-wrapped draft
+ * ({@link draftWrap}); a draft-shaped box cut by an ellipsis reads as no cue at all, flagged `cutWrap`.
  */
 export function readCuesFor(allRows: readonly FrameRow[], frame: Frame | null, idle: IdleProfile | null): CueRead {
   const texts = allRows.map(rowText);
@@ -476,10 +491,77 @@ export function readCuesFor(allRows: readonly FrameRow[], frame: Frame | null, i
   // From the top edge down: a dialog in the box's place lies there, and the transcript above is no part of it.
   // The box's own prompt glyph, where the layout names one (`frame.ownPrompt`), is no pointer there.
   const at = frame.top;
-  const down = readCues(withoutOwnPrompt(rows, frame).slice(at), null, null);
+  // A draft-shaped box with a row cut by an ellipsis is neither a draft nor a dialog: claim unreadable.
+  if (plain.strength !== "strong" && wrapUnderGlyph(withoutOwnPrompt(rows, frame).map(rowText), frame) === "cut") {
+    return { ...plain, cues: [], strength: "none", cutWrap: true };
+  }
+  const down = readCues(withoutPromptGlyph(withoutOwnPrompt(rows, frame), frame).slice(at), null, null);
   // A weak shape inside the box is the box's own hint row (OMP draws "to change thinking effort" there).
   if (down.strength !== "strong" || plain.strength === "strong") return plain;
   return { ...down, cluster: down.cluster.map((i) => i + at), cues: down.cues.map((cue) => ({ kind: cue.kind, row: cue.row + at })) };
+}
+
+/**
+ * The shape of a found box's draft, from the prompt row down to its last non-blank row. `wrapped`: one
+ * paragraph soft-wrapped to the box's width, two rows or more, no blank row between them, and every row
+ * but the last filled to the top edge's width, so the next row's first word would not have fit on it
+ * (within {@link WRAP_SLACK}). A draft typed with newlines has short rows and fails this (`no`), so it
+ * reads as a list still: the conservative side, a send refused, never a dialog typed into.
+ *
+ * `cut`: the rows pass that test, but a row ends in an ellipsis ({@link endsInEllipsis}). pi cuts a menu
+ * or hint row wider than the box with `…` (or `...`), so the row fills the width the way a soft wrap
+ * does, and a wrapped draft and a cut menu cannot be told apart. A row cut so is taken as filled. Neither
+ * reading is safe: as a draft, Enter would answer a menu; as a menu (the older reading, a pointed list),
+ * a tap's Enter would submit the draft. So `cut` makes the read unreadable ({@link CueRead.cutWrap}):
+ * no dialog card, no taps, no free Send. Unreadable is the safe failure; a wrong dialog is not.
+ */
+function draftWrap(texts: readonly string[], frame: Frame): "wrapped" | "cut" | "no" {
+  // The top edge spans the box: an open box's bottom row is its last row (a statusline), not a rule.
+  const width = displayWidth(texts[frame.top]!.trimEnd());
+  // A blank top edge gives no width to fill: read no wrap.
+  if (width <= WRAP_SLACK) return "no";
+  const { prompt } = frame.interior;
+  let last = frame.interior.last;
+  while (last > prompt && isBlank(texts[last]!)) last--;
+  if (last === prompt) return "no";
+  let cut = false;
+  for (let i = prompt; i <= last; i++) if (endsInEllipsis(texts[i]!)) cut = true;
+  for (let i = prompt; i < last; i++) {
+    const row = texts[i]!.trimEnd();
+    const next = texts[i + 1]!.trim().split(/\s/u)[0]!;
+    if (isBlank(row) || next.length === 0) return "no";
+    if (endsInEllipsis(row)) continue;
+    if (displayWidth(row) + 1 + displayWidth(next) <= width - WRAP_SLACK) return "no";
+  }
+  return cut ? "cut" : "wrapped";
+}
+
+/** Whether a row's text ends in an ellipsis: the character `…` or three ASCII dots. */
+function endsInEllipsis(text: string): boolean {
+  const end = text.trimEnd();
+  return end.endsWith("…") || end.endsWith("...");
+}
+
+/** The {@link draftWrap} of a box whose prompt row opens on a pointer glyph the frame took as the prompt
+ *  marker (the draft does not start with it), or `no` for any other box. */
+function wrapUnderGlyph(texts: readonly string[], frame: Frame): "wrapped" | "cut" | "no" {
+  if (frame.placeholder) return "no";
+  const glyph = texts[frame.interior.prompt]!.trimStart()[0];
+  if (glyph === undefined || !POINTERS.includes(glyph) || frame.interior.text.startsWith(glyph)) return "no";
+  return draftWrap(texts, frame);
+}
+
+/** The rows with the pointer glyph the box's prompt row opens on read as blank, when the frame took it as
+ *  the prompt marker (the draft does not start with it) and the draft under it is soft-wrapped
+ *  ({@link draftWrap}). */
+function withoutPromptGlyph(rows: readonly FrameRow[], frame: Frame): readonly FrameRow[] {
+  const texts = rows.map(rowText);
+  if (wrapUnderGlyph(texts, frame) !== "wrapped") return rows;
+  const glyph = texts[frame.interior.prompt]!.trimStart()[0]!;
+  const segments = [...rows[frame.interior.prompt]!.segments];
+  const at = segments.findIndex((run) => run.text.includes(glyph));
+  segments[at] = { ...segments[at]!, text: segments[at]!.text.replace(glyph, " ") };
+  return rows.map((row, i) => (i === frame.interior.prompt ? { segments } : row));
 }
 
 /**

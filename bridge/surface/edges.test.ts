@@ -13,9 +13,10 @@ import { EDGE_SCHEMA_VERSION, type BeaconMarker, type EdgeRecord } from "../beac
 import type { EdgeSpool } from "../beacon-io.ts";
 import type { ForegroundProcess } from "../journal/types.ts";
 import { muxOk, type MuxGrid, type MuxGridRequest, type MuxOutcome } from "../mux/types.ts";
+import type { JsonValue } from "../json.ts";
 import type { AgentView } from "../types.ts";
 import { isFree, modalWord } from "../../web/src/lib/surface/surface.ts";
-import { deliverEdge, EDGE_MAX_AGE_MS, EDGE_TAG, EdgeRouter, HOOK_LIVENESS_MS, kindOfEdge, placeEdge, type EdgeHoldInfo, type EdgeSinks, type EdgeTarget, type PlacedEdge, type SavedSource, type SourceStore } from "./edges.ts";
+import { deliverEdge, EDGE_MAX_AGE_MS, EDGE_TAG, EdgeRouter, HOOK_LIVENESS_MS, kindOfEdge, modelAfter, placeEdge, type EdgeHoldInfo, type EdgeSinks, type EdgeTarget, type PlacedEdge, type SavedSource, type SourceStore } from "./edges.ts";
 import { SurfaceShadow } from "./shadow.ts";
 
 const PANES = join(import.meta.dir, "..", "..", "web", "src", "fixtures", "panes");
@@ -23,6 +24,8 @@ const screen = (name: string): string => readFileSync(join(PANES, name), "utf8")
 const IDLE = "claude-lab--idle-after-turn--w82.txt";
 const RUNNING = "claude--working-esc-to-interrupt.txt";
 const PERMISSION = "claude-lab--permission-bash--w82.txt";
+/** Claude Code 2.1.309 after Escape before the first token: the prompt back in the box, no Interrupted row. */
+const RESTORED = "claude--v2-1-309-stopped-prompt-restored--w120.txt";
 /** The harness the fixtures were captured under. Test files may name it. */
 const HARNESS = "claude";
 
@@ -237,6 +240,125 @@ describe("the hook target on the liveness tick", () => {
   });
 });
 
+describe("the start's model (a fresh pane names its model before its first message)", () => {
+  test("a start edge's model stays on the pane's source over the later edges of the same pid, and leaves with it", async () => {
+    const { r, spool, lines } = router([target()]);
+    spool.files.push(JSON.stringify(record({ event: "SessionStart", model: "claude-sonnet-5-5", at: 1_000_100 })));
+    await r.tick();
+    expect(r.modelOf("main", "w1:p1")).toEqual({ model: "claude-sonnet-5-5", at: 1_000_100 });
+    expect(lines.some((line) => line.includes("event=SessionStart") && line.endsWith("model=claude-sonnet-5-5"))).toBe(true);
+    expect(r.modelOf("main", "w1:p2")).toBeUndefined();
+
+    spool.files.push(JSON.stringify(record({ event: "Stop", at: 1_000_200 })));
+    await r.tick();
+    expect(r.modelOf("main", "w1:p1")).toEqual({ model: "claude-sonnet-5-5", at: 1_000_100 });
+
+    // A /clear starts again in the same process, and its start names the model anew.
+    spool.files.push(JSON.stringify(record({ event: "SessionStart", model: "claude-opus-5-5[1m]", at: 1_000_300 })));
+    await r.tick();
+    expect(r.modelOf("main", "w1:p1")).toEqual({ model: "claude-opus-5-5[1m]", at: 1_000_300 });
+
+    spool.files.push(JSON.stringify(record({ event: "SessionEnd", at: 1_000_400 })));
+    await r.tick();
+    expect(r.modelOf("main", "w1:p1")).toBeUndefined();
+  });
+
+  test("another process in the pane does not inherit the model", () => {
+    const known = { pid: PID, pidStartTime: START, model: { model: "claude-sonnet-5-5", at: 1 } };
+    expect(modelAfter(known, record({ event: "Stop" }))).toEqual({ model: "claude-sonnet-5-5", at: 1 });
+    expect(modelAfter(known, record({ event: "Stop", pid: PID + 1 }))).toBeUndefined();
+    expect(modelAfter(known, record({ event: "Stop", pidStartTime: START + 1 }))).toBeUndefined();
+    expect(modelAfter(undefined, record({ event: "SessionStart" }))).toBeUndefined();
+  });
+
+  test("the parse keeps a model name and drops a malformed one, never the edge", () => {
+    const parse = (model: JsonValue) => parseEdge(JSON.stringify({ ...record({ event: "SessionStart" }), model }));
+    expect(parse("claude-opus-5-5[1m]")?.model).toBe("claude-opus-5-5[1m]");
+    for (const bad of ["opus\n5", "x".repeat(129), "", "   ", 42, null, { name: "opus" }, "\u001b[31mopus"]) {
+      const edge = parse(bad);
+      expect(edge?.event).toBe("SessionStart");
+      expect(edge?.model).toBeUndefined();
+    }
+    expect(parse("m".repeat(128))?.model).toHaveLength(128);
+  });
+
+  test("a restarted bridge still knows the model, at the time its hook ran", async () => {
+    const saved: SavedSource[][] = [];
+    const store: SourceStore = { load: () => saved.at(-1) ?? [], save: (sources) => void saved.push([...sources]) };
+    const spool = new FakeSpool();
+    const first = new EdgeRouter({ spool, store, liveness: alive, targets: () => [target()], log: () => undefined, now: () => 1_000_500 });
+    spool.files.push(JSON.stringify(record({ event: "SessionStart", model: "claude-sonnet-5-5", at: 1_000_100 })));
+    await first.tick();
+    spool.files.push(JSON.stringify(record({ event: "SessionStart", model: "claude-opus-5-5", at: 1_000_200 })));
+    await first.tick();
+    // The newest save holds the model of the newest start, with its own time.
+    expect(saved.at(-1)?.map((s) => [s.record.model, s.modelAt])).toEqual([["claude-opus-5-5", 1_000_200]]);
+    // A later edge that names none: the save that follows (if any) keeps the model and its time.
+    spool.files.push(JSON.stringify(record({ event: "Stop", at: 1_000_300 })));
+    await first.tick();
+    const restarted = new EdgeRouter({ spool: new FakeSpool(), store, liveness: alive, targets: () => [target()], log: () => undefined, now: () => 2_000_000 });
+    await restarted.tick();
+    expect(restarted.modelOf("main", "w1:p1")).toEqual({ model: "claude-opus-5-5", at: 1_000_200 });
+  });
+});
+
+describe("the start's model is the process's, never the pane id's", () => {
+  // The model rides on the pane's hook source, which holds the pid and its start time. A pane id that a
+  // new process takes over (after the old one died with no end edge, or across a bridge restart) never
+  // shows the old process's model.
+  const NEXT_PID = PID + 1;
+  const NEXT_START = START + 50;
+
+  test("a new process in the same pane id, after the old one died with no end edge, shows no model", async () => {
+    let old = true;
+    const liveness: BeaconLiveness = { startTimeOf: (pid) => Promise.resolve(pid === PID && old ? START : pid === NEXT_PID ? NEXT_START : null) };
+    const { r, spool } = router([target()], liveness);
+    spool.files.push(JSON.stringify(record({ event: "SessionStart", model: "claude-sonnet-5-5", at: 1_000_100 })));
+    await r.tick();
+    expect(r.modelOf("main", "w1:p1")?.model).toBe("claude-sonnet-5-5");
+    // Killed: no SessionEnd. A new process's first edge in the same pane names no model.
+    old = false;
+    spool.files.push(JSON.stringify(record({ event: "UserPromptSubmit", pid: NEXT_PID, pidStartTime: NEXT_START, at: 1_000_200 })));
+    await r.tick();
+    expect(r.modelOf("main", "w1:p1")).toBeUndefined();
+  });
+
+  test("a dead process's model leaves at the next liveness check, before any new edge", async () => {
+    let old = true;
+    const liveness: BeaconLiveness = { startTimeOf: (pid) => Promise.resolve(pid === PID && old ? START : null) };
+    const { r, spool, advance } = router([target()], liveness);
+    spool.files.push(JSON.stringify(record({ event: "SessionStart", model: "claude-sonnet-5-5", at: 1_000_100 })));
+    await r.tick();
+    old = false;
+    advance(HOOK_LIVENESS_MS);
+    await r.tick();
+    expect(r.modelOf("main", "w1:p1")).toBeUndefined();
+  });
+
+  test("a restarted bridge seeds no model for a pane id whose saved process is gone, though another runs there", async () => {
+    const saved: SavedSource[][] = [];
+    const store: SourceStore = { load: () => saved.at(-1) ?? [], save: (sources) => void saved.push([...sources]) };
+    const spool = new FakeSpool();
+    const first = new EdgeRouter({ spool, store, liveness: alive, targets: () => [target()], log: () => undefined, now: () => 1_000_500 });
+    spool.files.push(JSON.stringify(record({ event: "SessionStart", model: "claude-sonnet-5-5", at: 1_000_100 })));
+    await first.tick();
+    expect(saved.at(-1)?.map((s) => s.record.model)).toEqual(["claude-sonnet-5-5"]);
+    // After the restart the pane id holds another process; the saved pid is gone, or reused with another start.
+    for (const liveness of [
+      { startTimeOf: (pid: number) => Promise.resolve(pid === NEXT_PID ? NEXT_START : null) },
+      { startTimeOf: (pid: number) => Promise.resolve(pid === PID ? NEXT_START : null) },
+    ] satisfies BeaconLiveness[]) {
+      const restartedSpool = new FakeSpool();
+      const restarted = new EdgeRouter({ spool: restartedSpool, store: { load: () => saved.at(-1) ?? [], save: () => undefined }, liveness, targets: () => [target()], log: () => undefined, now: () => 2_000_000 });
+      await restarted.tick();
+      expect(restarted.modelOf("main", "w1:p1")).toBeUndefined();
+      restartedSpool.files.push(JSON.stringify(record({ event: "Stop", pid: NEXT_PID, pidStartTime: NEXT_START, at: 2_000_100 })));
+      await restarted.tick();
+      expect(restarted.modelOf("main", "w1:p1")).toBeUndefined();
+    }
+  });
+});
+
 describe("the live sources across a restart", () => {
   class MemoryStore implements SourceStore {
     saved: readonly SavedSource[] = [];
@@ -292,6 +414,37 @@ describe("edges in the shadow", () => {
     await s.shadow.observe([agent("w1:p1")]);
     expect(isFree(s.shadow.surfaceOf("w1:p1")!)).toBe(true);
     expect(s.counted).toEqual(["prompt", "stop"]);
+  });
+
+  // Second live pass: Escape before the first token puts the prompt back into Claude Code's box, and no
+  // Stop hook fires. Collie's own `stopped` receipt is the stop the hook did not send.
+  test("a Stop receipt ends the prompt edge's block on a restored prompt; counted apart from the hooks' stop", async () => {
+    const s = shadowRig("2.1.309");
+    s.mux.set("w1:p1", RESTORED, 1);
+    await s.shadow.observe([agent("w1:p1")]);
+    s.shadow.edge("w1:p1", "prompt", s.advance(10));
+    await s.reread();
+    for (let i = 0; i < 6; i++) {
+      s.advance(3000);
+      await s.shadow.observe([agent("w1:p1")]);
+    }
+    expect(s.shadow.surfaceOf("w1:p1")).toMatchObject({ turn: "running", composer: "draft" });
+    expect(s.shadow.stopSeen("w1:p1")).toBe(true);
+    expect(s.shadow.surfaceOf("w1:p1")).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "draft" });
+    expect(s.pending).toHaveLength(0);
+    expect(s.counted).toEqual(["prompt", "stop-receipt"]);
+    expect(s.shadow.stopSeen("w1:p9")).toBe(false);
+  });
+
+  test("a Stop receipt never frees a screen that still reads running", async () => {
+    const s = shadowRig();
+    s.mux.set("w1:p1", RUNNING, 1);
+    await s.shadow.observe([agent("w1:p1")]);
+    s.shadow.edge("w1:p1", "prompt", s.advance(10));
+    await s.reread();
+    s.shadow.stopSeen("w1:p1");
+    expect(s.shadow.surfaceOf("w1:p1")?.turn).toBe("running");
+    expect(isFree(s.shadow.surfaceOf("w1:p1")!)).toBe(false);
   });
 
   test("never free: no edge kind frees a dialog on screen, and each edge asks for one fresh read", async () => {

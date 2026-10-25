@@ -1,6 +1,8 @@
-import { Smartphone, Terminal, X } from "lucide-react";
+import { Check, Smartphone, Terminal, TriangleAlert, X } from "lucide-react";
 
+import type { SendRefusal } from "@/components/send-notice";
 import { Button } from "@/components/ui/button";
+import { NOTICE_ACTION } from "@/components/ui/notice";
 import { useLocale } from "@/hooks/use-locale";
 import { t } from "@/lib/i18n";
 
@@ -21,10 +23,10 @@ interface TerminalDraftPreviewProps {
  * The 44px floor for the x, bought back as hit area (DESIGN.md §6): the face is `size-6`, 24px, and
  * `-inset-2.5` reaches 10px out on every side, so 24 + 20 = 44 in both axes.
  */
-const DISMISS_TAP_TARGET = "relative before:absolute before:-inset-2.5 before:content-['']";
+export const DISMISS_TAP_TARGET = "relative before:absolute before:-inset-2.5 before:content-['']";
 
-/** The translucent card both floating notices stand on: it covers terminal text and moves nothing. */
-const FLOATING_CARD =
+/** The translucent card the floating notices stand on: it covers terminal text and moves nothing. */
+export const FLOATING_CARD =
   "pointer-events-auto flex items-start gap-1.5 rounded-lg border border-foreground/20 bg-card/95 py-1.5 pr-1.5 pl-2.5 text-xs text-muted-foreground shadow-md backdrop-blur-sm";
 
 // A read-only notice for a draft stranded on the terminal's "❯" line (a message queued then recalled
@@ -85,7 +87,41 @@ export function OfflineDraftNote({ onDismiss }: { onDismiss: () => void }) {
   );
 }
 
-function DismissButton({ onDismiss, label }: { onDismiss: () => void; label: string }) {
+/**
+ * What a Clear answered (ADR 0116, the Clear paragraph), in the same floating slot and card as the
+ * terminal-draft notice (ADR 0061), so the notice moves neither the composer nor the belt when it comes
+ * or goes. After `cleared` with the cleared text kept, Restore types that text back into the box
+ * (`onRestore`); the composer decides how long it is offered and withdraws it (null) otherwise. The x
+ * hides the notice.
+ */
+export function ClearNotice({ refusal, onRestore, restoring, onDismiss }: { refusal: SendRefusal; onRestore: (() => void) | null; restoring: boolean; onDismiss: () => void }) {
+  useLocale();
+  const Icon = refusal.tone === "caution" ? TriangleAlert : Check;
+  return (
+    <div data-slot="clear-notice" className={FLOATING_CARD}>
+      <Icon className="mt-0.5 size-3 shrink-0" />
+      <div data-slot="clear-notice-sentence" className="min-w-0 flex-1 self-center leading-snug">
+        {refusal.sentence}
+      </div>
+      {onRestore !== null && (
+        <Button
+          variant="ghost"
+          size="sm"
+          data-slot="clear-restore"
+          className={`${NOTICE_ACTION} shrink-0 self-center font-medium`}
+          aria-label={t("keys.clear.restoreAria")}
+          disabled={restoring}
+          onClick={onRestore}
+        >
+          {t("keys.clear.restore")}
+        </Button>
+      )}
+      <DismissButton onDismiss={onDismiss} label={t("keys.clear.dismissAria")} />
+    </div>
+  );
+}
+
+export function DismissButton({ onDismiss, label }: { onDismiss: () => void; label: string }) {
   return (
     <button
       type="button"

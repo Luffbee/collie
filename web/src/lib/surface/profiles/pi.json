@@ -136,7 +136,18 @@
       "pattern": "^\\s*Follow-up: (?<text>\\S.*?)\\s*$",
       "hint": "^\\s*↳ Alt\\+Up to edit all queued messages\\s*$",
       "hintGap": 0
-    }
+    },
+    "steer": [
+      "Enter"
+    ],
+    "steerWitness": [
+      {
+        "pattern": "^\\s*Steering: (?<text>\\S.*?)\\s*$",
+        "hint": "^\\s*↳ Alt\\+Up to edit all queued messages\\s*$",
+        "hintGap": 0,
+        "between": "^\\s*Follow-up: \\S"
+      }
+    ]
   },
   "collapse": {
     "pattern": "\\[paste #\\d+ (?:\\+(?<lines>\\d+) lines|(?<chars>\\d+) chars)\\]"

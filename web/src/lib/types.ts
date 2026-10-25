@@ -194,6 +194,12 @@ export interface AgentView {
    */
   effort?: string;
   /**
+   * How full the context is and how much of the subscription's windows is used, as the harness's own
+   * statusLine reported them. Mirrors `PaneWire.usage` in bridge/types.ts. **Absent, never a
+   * placeholder**: drawn as dots beside the model (components/model-tag.tsx), and nothing decides on it.
+   */
+  usage?: PaneUsage;
+  /**
    * What the checkout holding this pane's folder is on. Mirrors `PaneWire.gitHead` in bridge/types.ts.
    *
    * **Absent, never a placeholder**: a folder in no checkout, a reading the bridge has not taken yet,
@@ -246,6 +252,20 @@ export interface AgentView {
    * a crew member older than the protocol), and the composer says so (M56 spec 06).
    */
   sendProtocol?: true;
+  /**
+   * Mirrors `PaneWire.canStop` (M68): a Stop has a key to press on this pane, because its profile names an
+   * interrupt key and is not revoked. The belt draws Stop for a pane with a screen only with it, and
+   * only while `surface.turn` is `running` (`stopFor`, lib/harness-bar.ts). The bridge decides from the
+   * profile; the app holds no harness name. Absent means no Stop here, and on an older bridge.
+   */
+  canStop?: boolean;
+  /**
+   * Mirrors `PaneWire.canSteer` (M69): a send on this pane may steer the running turn (`when: "steer"`
+   * on `POST /api/send`). The composer offers Steer on the Send button's long press only when this is
+   * true and the turn reads running. Absent from an older bridge, on a durable pane and on a harness
+   * Collie cannot steer.
+   */
+  canSteer?: boolean;
   /**
    * Mirrors `PaneWire.held` (M56 spec 15): the pane's held sends, oldest first. The composer draws one
    * queued row per entry, with the text and Cancel (Resend on an ended one).
@@ -1282,25 +1302,38 @@ export interface ToolQuestion {
   options: readonly { label: string; description?: string }[];
 }
 
+/** One task of a plan, and where it stands. Other harnesses' words are mapped onto these five by the bridge. */
+export type PlanStatus = "pending" | "in_progress" | "done" | "blocked" | "dropped";
+export interface PlanTask {
+  title: string;
+  status: PlanStatus;
+  note?: string;
+}
+
 /**
  * What a tool call did, in the shape the thing it did suggests. Mirrors
- * `bridge/journal/tool-call.ts`, where the reasoning for the nine kinds lives.
+ * `bridge/journal/tool-call.ts`, where the reasoning for the ten kinds lives (ADR 0119).
  *
  * Every branch's FIRST field is the one a person would name the call by, so a row can be drawn from
- * `kind` plus one field. A tool outside the nine is not an error, it is `other`, which still carries
+ * `kind` plus one field. A tool outside the ten is not an error, it is `other`, which still carries
  * a name and a summary.
  */
 export type ToolCall =
   | { kind: "edit"; path: string; added: number; removed: number; diff?: Hunk[]; created?: boolean }
-  | { kind: "execute"; command: string; description?: string; exitCode?: number }
+  /** `background`: started and returned at once (`bash_background`, `monitor`). `ongoing`: it has not ended yet, though its start result is in. */
+  | { kind: "execute"; command: string; description?: string; exitCode?: number; background?: true; ongoing?: true }
   | { kind: "read"; path: string; range?: [number, number] }
   | { kind: "search"; query: string; where?: string; hits?: number }
   | { kind: "fetch"; url: string }
   | { kind: "delete" | "move"; path: string; to?: string }
-  | { kind: "task"; agent?: string; summary: string; agentId?: string }
+  /** `agentId` names the subagent's own log. `ongoing`: a background sub-agent that has not finished, though its start result is in. */
+  | { kind: "task"; agent?: string; summary: string; agentId?: string; ongoing?: true }
+  /** A task list the agent keeps rewriting (ADR 0119). On pi its updates are folded into the one card. */
+  | { kind: "plan"; name: string; tasks: readonly PlanTask[] }
   /** The agent asked the operator to choose. One entry per question the call carried. `answers[i]` is the list of chosen labels for question `i`, present only once the call completed with answers. */
   | { kind: "question"; name: string; summary: string; questions: readonly ToolQuestion[]; answers?: readonly (readonly string[])[] }
-  | { kind: "other"; name: string; summary: string };
+  /** `quiet`: bookkeeping (memory, phase, job list) drawn as a muted line. */
+  | { kind: "other"; name: string; summary: string; quiet?: true };
 
 /**
  * One renderable piece of a transcript turn. Mirrors `bridge/transcript.ts` (wire types are
@@ -2513,3 +2546,22 @@ export type PaneProgress =
   | { kind: "percent"; value: number; label?: string };
 
 
+
+/** A subscription window, by the label the phone draws for it. Mirrors `UsageWindow` in bridge/usage.ts. */
+export type UsageWindow = "5h" | "7d";
+
+/** One subscription window's reading. Mirrors `UsageLimit` in bridge/usage.ts. */
+export interface UsageLimit {
+  window: UsageWindow;
+  /** Percent of the window used, 0 to 100. */
+  used: number;
+  /** When the window resets, epoch ms. */
+  resetsAt?: number;
+}
+
+/** A pane's usage numbers. Mirrors `PaneUsage` in bridge/usage.ts; every part absent when unreported. */
+export interface PaneUsage {
+  /** Percent of the context window used, 0 to 100. */
+  context?: number;
+  limits?: UsageLimit[];
+}

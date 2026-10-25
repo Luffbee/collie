@@ -47,6 +47,24 @@ describe("commandsFor", () => {
     expect(cmds.find((c) => c.command === "/always-approve")?.dangerous).toBe(true);
   });
 
+  it("asks first on the rows that change a harness configuration, like /logout", () => {
+    const dangerous = (agent: string, command: string): boolean | undefined => commandsFor(agent).find((c) => c.command === command)?.dangerous;
+    expect(dangerous("agy", "/plugin")).toBe(true);
+    expect(dangerous("grok", "/statusline")).toBe(true);
+    expect(dangerous("muse", "/manage-settings")).toBe(true);
+    expect(dangerous("claude", "/logout")).toBe(true);
+  });
+
+  it("returns the Muse catalog for 'muse'", () => {
+    const cmds = commandsFor("muse");
+    // Muse 1.4.7 completes /mod to /model only; its configuration doc's /models does not exist.
+    expect(cmds.some((c) => c.command === "/model")).toBe(true);
+    expect(cmds.some((c) => c.command === "/models")).toBe(false);
+    // Both start a fresh session; Muse's docs differ only in whether the scrollback is wiped.
+    expect(cmds.find((c) => c.command === "/new")?.dangerous).toBe(true);
+    expect(cmds.find((c) => c.command === "/clear")?.dangerous).toBe(true);
+  });
+
   it("returns the omp catalog for 'omp'", () => {
     const cmds = commandsFor("omp");
     expect(cmds.length).toBeGreaterThan(0);
@@ -87,6 +105,35 @@ describe("commandsFor", () => {
     expect(commandsFor("agy-cli")).toEqual(agyCmds);
   });
 
+  it("returns the Muse catalog for 'muse', proven on Muse captures only", () => {
+    const cmds = commandsFor("muse");
+    expect(cmds.length).toBeGreaterThan(0);
+    // Palette rows with Muse's own summaries (muse--slash-palette-1410.txt).
+    for (const command of ["/bug", "/clear", "/compact", "/copy", "/deep-research", "/export"]) {
+      expect(cmds.some((c) => c.command === command), command).toBe(true);
+    }
+    // Typed or probed: /usage ran, /model and /resume show arg hints, /effort and /hud opened
+    // their pickers live, /loop is the placeholder tip, /permissions the approval hint row.
+    expect(cmds.find((c) => c.command === "/model")).toMatchObject({ takesArg: true, argHint: "[<model-id>]" });
+    expect(cmds.find((c) => c.command === "/resume")).toMatchObject({ takesArg: true, argHint: "[--last|<id-or-name>]" });
+    expect(cmds.find((c) => c.command === "/loop")).toMatchObject({ takesArg: true });
+    for (const command of ["/usage", "/effort", "/hud", "/permissions"]) {
+      expect(cmds.some((c) => c.command === command), command).toBe(true);
+    }
+    // Built-in skill rows, shipped with the CLI rather than the capturing machine.
+    for (const command of ["/plan", "/resume-claude", "/resume-codex"]) {
+      expect(cmds.some((c) => c.command === command), command).toBe(true);
+    }
+    // Clearing the terminal wipes the session: two-tap like every other catalog's /clear.
+    expect(cmds.find((c) => c.command === "/clear")?.dangerous).toBe(true);
+    // Rows neither 453's docs/1.4.7 sourcing nor a screen capture vouches for stay out: never
+    // invent commands the CLI is not proven to have. (453 documents /new, /fork, /rewind, /tasks
+    // and /workflows from docs plus 1.4.7's own completion, so only the truly-unseen stay out.)
+    for (const command of ["/init", "/quit", "/exit", "/logout", "/tree", "/skills"]) {
+      expect(cmds.some((c) => c.command === command), command).toBe(false);
+    }
+  });
+
   it("is case-insensitive", () => {
     expect(commandsFor("CLAUDE")).toBe(commandsFor("claude"));
     expect(commandsFor("Codex")).toBe(commandsFor("codex"));
@@ -94,6 +141,7 @@ describe("commandsFor", () => {
     expect(commandsFor("OpenCode")).toBe(commandsFor("opencode"));
     expect(commandsFor("OMP")).toBe(commandsFor("omp"));
     expect(commandsFor("GROK")).toBe(commandsFor("grok"));
+    expect(commandsFor("MUSE")).toBe(commandsFor("muse"));
   });
 
   it("trims surrounding whitespace", () => {
@@ -107,6 +155,7 @@ describe("commandsFor", () => {
     expect(commandsFor("pi-go")).toBe(commandsFor("pi"));
     expect(commandsFor("omp-dev")).toBe(commandsFor("omp"));
     expect(commandsFor("grok-build")).toBe(commandsFor("grok"));
+    expect(commandsFor("muse-code")).toBe(commandsFor("muse"));
   });
 
   it("returns [] for unknown / absent agents", () => {
@@ -130,7 +179,7 @@ describe("commandsFor", () => {
     }
   });
 
-  it.each(["claude", "codex", "pi", "opencode", "omp", "grok"])(
+  it.each(["claude", "codex", "pi", "opencode", "omp", "grok", "muse"])(
     "exposes for '%s' a 'common' subset that is a proper, non-empty subset of all commands",
     (agent) => {
       const all = commandsFor(agent);
@@ -142,13 +191,14 @@ describe("commandsFor", () => {
     },
   );
 
-  it.each(["claude", "codex", "pi", "opencode", "omp", "grok"])(
+  it.each(["claude", "codex", "pi", "opencode", "omp", "grok", "muse"])(
     "'%s' entries are well-formed (slash-prefixed, unique, arg hints only when takesArg)",
     (agent) => {
       const all = commandsFor(agent);
       const seen = new Set<string>();
       for (const c of all) {
-        expect(c.command.startsWith("/")).toBe(true);
+        // Codex names a skill with its `$` mention sigil; every other row is a slash command.
+        expect(c.command.startsWith("/") || (agent === "codex" && c.command.startsWith("$"))).toBe(true);
         expect(seen.has(c.command)).toBe(false); // no duplicate commands within a catalog
         seen.add(c.command);
         expect(c.description.length).toBeGreaterThan(0);
@@ -157,6 +207,59 @@ describe("commandsFor", () => {
       }
     },
   );
+});
+
+describe("built-in skills in the shipped catalogs", () => {
+  // Each row was seen in the agent's own completion on 2026-10-15; the per-agent picks are pinned so
+  // a regeneration that drops one is a red test rather than a quiet gap.
+  const names = (agent: string) => commandsFor(agent).map((c) => c.command);
+
+  it("lists Codex's five system skills as `$` mentions", () => {
+    expect(names("codex").filter((c) => c.startsWith("$"))).toEqual([
+      "$imagegen",
+      "$openai-docs",
+      "$review-agent",
+      "$skill-creator",
+      "$skill-installer",
+    ]);
+  });
+
+  it("lists opencode's one built-in skill, which its `/` menu does not show", () => {
+    expect(names("opencode")).toContain("/customize-opencode");
+  });
+
+  it("lists Grok's bundled skills a person can invoke, and none it hides", () => {
+    const grok = names("grok");
+    for (const skill of ["/build-with-ai", "/create-skill", "/pr-babysit", "/resume-claude", "/statusline"]) {
+      expect(grok).toContain(skill);
+    }
+    for (const hidden of ["/docx", "/pdf", "/pptx"]) expect(grok).not.toContain(hidden);
+  });
+
+  it("lists only the built-in skills agy's default agent puts in its `/` menu", () => {
+    const agy = names("agy");
+    for (const skill of ["/agy-customizations", "/antigravity-guide", "/plugin"]) expect(agy).toContain(skill);
+    for (const off of ["/automation", "/generative_ui", "/run-workflow"]) expect(agy).not.toContain(off);
+  });
+
+  it("lists Muse's ten user-invocable bundled skills, and none it hides", () => {
+    const muse = names("muse");
+    const ten = [
+      "/create-plugin",
+      "/create-skill",
+      "/doctor",
+      "/grill",
+      "/import",
+      "/manage-settings",
+      "/migrate",
+      "/plan",
+      "/resume-claude",
+      "/resume-codex",
+    ];
+    expect(ten).toHaveLength(10);
+    for (const skill of ten) expect(muse).toContain(skill);
+    for (const hidden of ["/taste", "/git", "/read-session"]) expect(muse).not.toContain(hidden);
+  });
 });
 
 // The operator's own rows (commands.toml → /api/config). The shipped catalogs cannot carry a
@@ -289,6 +392,9 @@ describe("commandsFor with the operator's own rows", () => {
     const mine = { agent: "claude", command: "/mine", description: "Mine", takesArg: false, argHint: "" };
     // The scope resolves the variant, and having done so it owns that pane's palette.
     expect(commandsFor("claude-code", [mine]).map((c) => c.command)).toEqual(["/mine"]);
+    // Same for the Muse family: `muse` reaches a `muse-code` pane's palette.
+    const museMine = { agent: "muse", command: "/mine", description: "Mine", takesArg: false, argHint: "" };
+    expect(commandsFor("muse-code", [museMine]).map((c) => c.command)).toEqual(["/mine"]);
   });
 
   it("does not let the catalog's prefix tolerance widen a narrow scope", () => {
@@ -301,6 +407,10 @@ describe("commandsFor with the operator's own rows", () => {
     // Same for every other family with a bare-prefix rule.
     const omp = { agent: "omp-experimental", command: "/deploy", description: "X", takesArg: false, argHint: "" };
     expect(commandsFor("omp", [omp]).some((c) => c.command === "/deploy")).toBe(false);
+    const muse = { agent: "muse-experimental", command: "/deploy", description: "X", takesArg: false, argHint: "" };
+    expect(commandsFor("muse", [muse]).some((c) => c.command === "/deploy")).toBe(false);
+    expect(commandsFor("muse-code", [muse]).some((c) => c.command === "/deploy")).toBe(false);
+    expect(commandsFor("muse-experimental", [muse]).some((c) => c.command === "/deploy")).toBe(true);
   });
 
   it("prefers the exact scope over the family one, whichever was declared first", () => {
@@ -408,19 +518,14 @@ describe("suggestCommands (#458)", () => {
     expect(claude[0]?.common).toBe(true);
     expect(claude.some((c) => !c.common)).toBe(true);
 
-    const codexWithSkill = [
-      ...commandsFor("codex"),
-      {
-        command: "$imagegen",
-        description: "Generate or edit images",
-        takesArg: true,
-        argHint: "[request]",
-        common: false,
-        dangerous: false,
-      },
-    ];
-    const codexSkills = suggestCommands("$", codexWithSkill).map((c) => c.command);
-    expect(codexSkills).toEqual(["$imagegen"]);
+    const codexSkills = suggestCommands("$", commandsFor("codex")).map((c) => c.command);
+    expect(codexSkills).toEqual([
+      "$imagegen",
+      "$openai-docs",
+      "$review-agent",
+      "$skill-creator",
+      "$skill-installer",
+    ]);
 
     // Claude has no `$` commands, so `$` returns nothing there.
     expect(suggestCommands("$100", commandsFor("claude"))).toEqual([]);

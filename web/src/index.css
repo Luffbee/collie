@@ -362,6 +362,9 @@
     oklch(0.38 0.12 245),
     oklch(0.89 0.06 235)
   );
+  /* The frame of the pane you are working in on a large screen (ADR 0120): a sky-200 in the dark
+     half; a stronger blue in the light half, where a pale frame would vanish on white. */
+  --pane-active: light-dark(oklch(0.6 0.14 240), oklch(0.9 0.058 231));
   --secondary: light-dark(oklch(0.94 0 0), oklch(0.269 0 0));
   --secondary-foreground: light-dark(oklch(0.205 0 0), oklch(0.985 0 0));
   /* The INERT fill — a well, a disabled track, a quiet chip on a card. Value unchanged (rgb 235
@@ -674,6 +677,7 @@
   --color-primary-foreground: var(--primary-foreground);
   --color-control-on: var(--control-on);
   --color-control-on-foreground: var(--control-on-foreground);
+  --color-pane-active: var(--pane-active);
   --color-secondary: var(--secondary);
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
@@ -1288,6 +1292,40 @@
   view-transition-name: none;
 }
 
+/*
+ * ── The name's suffix: grey at rest, the herd's three inks under a pointer ──
+ *
+ * "PWA" of the sidebar's ColliePWA rests in the muted ink, the same size as "Collie", as on the
+ * website (collie-website `components/wordmark.tsx`). Hover the logo row, or reach its mark with the
+ * keyboard, and the three letters take P `--status-done`, W `--status-working`, A `--status-blocked`,
+ * fading back over 240ms. Altan tried the inks at rest on 2026-10-24 and reverted it the same day.
+ *
+ * THE ONE RULE IT MUST NOT BREAK: this must never read as a live status. The trigger is the READER'S
+ * POINTER and nothing else; the colours are fixed per letter and NO APPLICATION STATE MAY EVER DRIVE
+ * THEM. Nothing here moves: no keyframes, no animation.
+ */
+.wordmark-ink {
+  color: var(--muted-foreground);
+  transition: color 240ms ease-out;
+}
+
+.wordmark-ink:nth-child(1) {
+  --wordmark-lit: var(--status-done);
+}
+
+.wordmark-ink:nth-child(2) {
+  --wordmark-lit: var(--status-working);
+}
+
+.wordmark-ink:nth-child(3) {
+  --wordmark-lit: var(--status-blocked);
+}
+
+.wordmark-lockup:hover .wordmark-ink,
+.wordmark-lockup:focus-within .wordmark-ink {
+  color: var(--wordmark-lit);
+}
+
 /* Submission progress bar — a slim indeterminate strip across the very top of the viewport while a
    mutation is in flight (components/busy-bar). The `appear` animation holds it fully invisible for
    120ms (delay + `both` fill), so an action that resolves and unmounts within that window never
@@ -1468,6 +1506,29 @@
   }
 }
 
+/* THE PANE NAVIGATION PAD'S STEP PULSE (components/pane-nav-overlay.tsx, ADR 0121). Each step of the
+   two-finger or joystick move rings the arrow it took once: a square of the arrow's own size grows and
+   fades in 350ms. Transform and opacity only, on a layer that takes no pointer and holds no space, so
+   nothing moves. Reduced motion: no pulse at all; the filled arrow alone says the step. */
+.pane-nav-pulse {
+  animation: pane-nav-pulse 350ms cubic-bezier(0, 0, 0.2, 1) 1 both;
+}
+@keyframes pane-nav-pulse {
+  from {
+    transform: scale(1);
+    opacity: 0.9;
+  }
+  to {
+    transform: scale(1.6);
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pane-nav-pulse {
+    display: none;
+  }
+}
+
 /* THE CHANGES COUNT LINE (components/change-count.tsx ChangeCountSlot), on each row of the dashboard's
    Changes tab and in the Changes screen's header. The screen's list skeleton (routes/changes.tsx)
    breathes with `.count-skeleton` too, and its first real rows arrive with `.count-arrive`. Until a workspace's
@@ -1610,4 +1671,87 @@
   --belt-icon: round(calc(1rem * var(--belt-scale)), 1px);
   --belt-text: calc(0.75rem * var(--belt-scale));
   --belt-rule: round(calc(1.25rem * var(--belt-scale)), 1px);
+}
+
+/* A LARGE SCREEN'S FOCUS MOVE (ADR 0120). Every column draws its belt, and only the focused one adds
+   the reply box under it. When a column takes the focus its box eases in from no height, so the belt
+   rises to its place over 200ms instead of jumping, and the transcript above, pinned to its bottom,
+   keeps its last line in sight the whole way. The clip lives only inside the keyframes, so the box's
+   attach menu, which opens above it, is never cut once the move ends. Reduced motion: no ease. */
+[data-strip-focus] [data-slot="composer-box"] {
+  animation: strip-reply-in 200ms ease-out backwards;
+}
+@keyframes strip-reply-in {
+  from {
+    max-height: 0;
+    opacity: 0;
+    overflow: clip;
+  }
+  to {
+    max-height: 16rem;
+    opacity: 1;
+    overflow: clip;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-strip-focus] [data-slot="composer-box"] {
+    animation: none;
+  }
+}
+
+/* HALF-OPEN FOLDABLES (ADR 0120, "Folded postures"). The geometry comes from the Viewport Segments
+   environment variables only, each with a fallback, so a browser that answers the media query but
+   not the variable still lays out. Nothing straddles the fold: each region ends at its segment.
+
+   TABLETOP (two segments, one above the other). The pane screen ends at the top segment's bottom
+   edge, and the focused pane's chrome block (belt, then reply box) stands in the bottom segment,
+   anchored at its top edge, with the reply box filling the rest of it. */
+[data-slot="fold-frame"][data-fold="tabletop"] {
+  padding-bottom: calc(var(--app-h) - env(viewport-segment-bottom 0 0, 50dvh));
+}
+[data-fold="tabletop"] [data-segment="bottom"] {
+  position: fixed;
+  inset-inline: 0;
+  top: env(viewport-segment-top 0 1, 50dvh);
+  bottom: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+[data-fold="tabletop"] [data-segment="bottom"] > :first-child {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+}
+[data-fold="tabletop"] [data-segment="bottom"] [data-slot="composer-box"] {
+  flex: 1 1 auto;
+  align-items: stretch;
+}
+[data-fold="tabletop"] [data-segment="bottom"] [data-slot="composer-box"] textarea {
+  field-sizing: fixed;
+  max-height: none;
+}
+
+/* BOOK (two segments side by side), from 600px. Two columns, one per segment, with the fold's own
+   width between them as a gutter; the rail (3.5rem) stands at the left segment's start. One column
+   alone takes the right segment, beside the full sidebar in the left one. */
+[data-fold="book"] {
+  --fold-a: env(viewport-segment-right 0 0, 50vw);
+  --fold-b: env(viewport-segment-left 1 0, 50vw);
+}
+[data-fold="book"] .fold-gutter {
+  flex: 0 0 calc(var(--fold-b) - var(--fold-a));
+}
+[data-fold="book"] .fold-left-col {
+  flex: 0 0 calc(var(--fold-a) - 3.5rem);
+  width: calc(var(--fold-a) - 3.5rem);
+}
+[data-fold="book"] .fold-right-col {
+  flex: 1 1 0;
+  min-width: 0;
+}
+[data-fold="book"] .fold-left-full {
+  width: var(--fold-a);
 }

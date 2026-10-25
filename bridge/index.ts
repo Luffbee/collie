@@ -200,6 +200,8 @@ import { Snooze } from "./snooze.ts";
 import { StateEngine } from "./state-engine.ts";
 import { SubagentTracker } from "./subagents.ts";
 import { TodoTracker } from "./todos.ts";
+import { diskUsageFiles, usageDir, UsageTracker } from "./usage.ts";
+import { AccountWindows, defaultAccountSources, diskCredentialSeams, isTurnEnd } from "./account-windows.ts";
 import {
   bridgeStampSync,
   compareSemver,
@@ -236,6 +238,8 @@ import {
 import { collieVersion, collieVersionBare } from "./version.ts";
 import { SurfaceShadow, type ShadowOptions } from "./surface/shadow.ts";
 import { AskAnswerer, AskBook } from "./surface/ask.ts";
+import { ClearService } from "./surface/clear.ts";
+import { StopService, type StopDeps } from "./surface/stop.ts";
 import { gateFor } from "./surface/key-gate.ts";
 import { RowRing, SendProtocol, SessionLocks } from "./surface/protocol.ts";
 import { ProgramDriver, type ProgramPort } from "./surface/durable-driver.ts";
@@ -801,6 +805,22 @@ const paneCache =
 const todos = journals === null ? null : new TodoTracker(journals, Date.now);
 // Each pane's running subagents (bridge/subagents.ts), read on the same poll as the todo list.
 const subagents = journals === null ? null : new SubagentTracker(journals, Date.now);
+// The account's 5-hour and 7-day windows (bridge/account-windows.ts, ADR 0118): one ask to the vendor
+// with the operator's own harness login, read on this machine, only while a pane of that harness is
+// here (Codex needs no ask: its own session files carry them). `COLLIE_ACCOUNT_WINDOWS` names the harnesses: unset is
+// claude and codex, `all` adds the unverified opencode and grok, `0` turns it off: no login is read and nothing is asked.
+const accountWindows = new AccountWindows({
+  enabled: cfg.accountWindows.length > 0,
+  sources: defaultAccountSources(diskCredentialSeams(process.env), cfg.accountWindows),
+  fetch: (url, init) => fetch(url, init),
+  now: Date.now,
+  userAgent: `collie/${crewVersion}`,
+  log: (line) => console.log(line),
+});
+// Each pane's context use and subscription windows (bridge/usage.ts), from the files the statusLine
+// wrapper and the beacon write, joined with the account windows above. No journal needed: the pane's
+// session id is the key.
+const usage = new UsageTracker(usageDir(cfg.stateDir), diskUsageFiles, Date.now, accountWindows);
 
 // Which branch each pane's folder is on (bridge/git-head.ts). One for the whole bridge: every
 // session's poll feeds it its folders, and the server reads it from memory at serialise time.
@@ -1521,6 +1541,13 @@ const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
   if (subagents !== null) {
     engine.onUpdate((s) => void subagents.refresh(s.agents, { session: name }).catch(() => {}));
   }
+  engine.onUpdate((s) => void usage.refresh(s.agents, name).catch(() => {}));
+  // The account windows ride the same poll (first reading, then every five minutes while a pane of the
+  // harness is here) and a turn's end (at most once a minute per harness). Neither waits on the ask.
+  engine.onUpdate((s) => accountWindows.observe(s.agents, name));
+  engine.onTransition((agent, from, to) => {
+    if (isTurnEnd(from, to)) accountWindows.poke(agent.agent);
+  });
 
   // Background notifications on lifecycle transitions (foreground toasts are computed client-side by
   // diffing snapshots). Each session gets its own coordinator + notification slot: the primary keeps
@@ -1714,12 +1741,24 @@ const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
   engine.start();
   poker.start();
   const parts = built.probe === undefined ? { herdr, engine, poker, notifications } : { herdr, engine, poker, notifications, program: built.probe };
-  const withHooks = hooks === undefined ? parts : { ...parts, hooks };
+  // The start edge's model rides with the hook source that carried it (bridge/pane-model.ts).
+  const hookModel = hooks === undefined || edgeRouter === null ? undefined : (paneId: string) => edgeRouter.modelOf(name, paneId);
+  const withHooks = hooks === undefined ? parts : hookModel === undefined ? { ...parts, hooks } : { ...parts, hooks, hookModel };
   const withSurface = surface === undefined ? withHooks : { ...withHooks, surface };
   const withSend = send === undefined ? withSurface : { ...withSurface, send };
   const withAsks = asks === undefined ? withSend : { ...withSend, asks };
   const withHold = hold === undefined ? withAsks : { ...withAsks, hold };
-  return driver === undefined ? withHold : { ...withHold, driver };
+  // A Stop on a pane with a screen (M68 spec 01). It reads and presses on its own, so it needs neither the
+  // request store nor the Send Protocol flag: a terminal session always has it.
+  // Its `stopped` receipt is the stop edge the harness may not send (Claude Code fires no Stop hook on Escape).
+  const stopped = surface === undefined ? undefined : (paneId: string): void => void surface.stopSeen(paneId);
+  const stopDeps: StopDeps = { mux: herdr, gate: gateFor(herdr), profile: (harness) => sendProfile(harness) };
+  const stop = endpoint.kind === "terminal" ? new StopService(stopped === undefined ? stopDeps : { ...stopDeps, stopped }) : undefined;
+  const withStop = stop === undefined ? withHold : { ...withHold, stop };
+  // A Clear of the harness's box (ADR 0116, the Clear paragraph): the same mux, key gate and profile as the Stop.
+  const clear = endpoint.kind === "terminal" ? new ClearService({ mux: herdr, gate: gateFor(herdr), profile: (harness) => sendProfile(harness) }) : undefined;
+  const withClear = clear === undefined ? withStop : { ...withStop, clear };
+  return driver === undefined ? withClear : { ...withClear, driver };
 };
 
 const registry = new SessionRegistry({
@@ -2810,6 +2849,7 @@ const server = startServer({
   cache: paneCache ?? undefined,
   todos: todos ?? undefined,
   subagents: subagents ?? undefined,
+  usage,
   gitHeads,
   walkyInstance: (session, paneId) => walkyInstances.tokenOf(session, paneId),
   walky,

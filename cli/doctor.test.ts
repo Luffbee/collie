@@ -18,6 +18,7 @@ import { BEACON_HOOKS } from "./beacon.ts";
 import { durableFindings } from "./durable-findings.ts";
 import type { CliContext } from "./context.ts";
 import {
+  accountWindowsFinding,
   cmdDoctor,
   type DoctorDeps,
   type Finding,
@@ -407,6 +408,7 @@ describe("collie doctor — the contract", () => {
       "beacon-hooks-claude",
       "beacons",
       "skill-walky-talky",
+      "account-windows",
       "herdr-version",
       "integration-claude",
       "integration-codex",
@@ -1701,6 +1703,7 @@ describe("the finding set is scoped by the chosen multiplexer", () => {
       "beacon-hooks-claude",
       "beacons",
       "skill-walky-talky",
+      "account-windows",
       "agent-sessions",
       "journal-roots",
       "cache-claims",
@@ -1902,6 +1905,71 @@ describe("walky-refusals", () => {
     const finding = (await findings(h)).byCheck.get("walky-refusals")!;
     expect(finding.status).toBe("ok");
     expect(finding.detail).toBe("4 refused since 2026-10-18: rate limit 3, pair limit 1");
+  });
+});
+
+describe("account-windows", () => {
+  const CLAUDE_PART = "claude: on (reads ~/.claude/.credentials.json";
+  const UNVERIFIED_OFF =
+    "opencode: off by default, unverified (COLLIE_ACCOUNT_WINDOWS=all); grok: off by default, unverified (COLLIE_ACCOUNT_WINDOWS=all)";
+
+  test("one ok row: by default claude and codex are on, opencode and grok off and unverified; 0 says off", async () => {
+    const on = (await findings(harness(null))).byCheck.get("account-windows")!;
+    expect(on.status).toBe("ok");
+    expect(on.detail).toMatch(
+      /^claude: on \(reads .*\.credentials\.json, asks api\.anthropic\.com\); codex: on \(reads .*sessions\); opencode: off by default, unverified \(COLLIE_ACCOUNT_WINDOWS=all\); grok: off by default, unverified \(COLLIE_ACCOUNT_WINDOWS=all\)$/,
+    );
+    const off = (await findings(harness(null, [], { env: { COLLIE_ACCOUNT_WINDOWS: "0" } }))).byCheck.get("account-windows")!;
+    expect(off.status).toBe("ok");
+    expect(off.detail).toBe("off, every source is turned off by COLLIE_ACCOUNT_WINDOWS: no login or session file is read and nothing is asked");
+  });
+
+  test("the row names the default files under the operator's home", () => {
+    const finding = accountWindowsFinding({ ctx: context({}, {}), host: HOST, files: fakeFiles({}) });
+    expect(finding.detail).toBe(
+      `${CLAUDE_PART}${HOST.platform === "darwin" ? " or the Keychain" : ""}, asks api.anthropic.com); codex: on (reads ~/.codex/sessions); ${UNVERIFIED_OFF}`,
+    );
+  });
+
+  test("all lists opencode and grok on and unverified, with their file and host once they have a login, and nothing of the files is printed", () => {
+    const ctx = context({ COLLIE_ACCOUNT_WINDOWS: "all" }, {});
+    const files = fakeFiles({
+      [`${ctx.home}/.local/share/opencode/auth.json`]: JSON.stringify({ "opencode-go": { type: "api", key: "sk-ant-oat01-fake-token-for-tests" } }),
+      [`${ctx.home}/.grok/auth.json`]: "{}",
+    });
+    const detail = accountWindowsFinding({ ctx, host: HOST, files }).detail;
+    expect(detail).toContain("opencode: on, unverified (reads ~/.local/share/opencode/auth.json, asks opencode.ai)");
+    expect(detail).toContain("grok: on, unverified (reads ~/.grok/auth.json, asks cli-chat-proxy.grok.com)");
+    expect(detail).not.toContain("sk-ant-oat01");
+  });
+
+  test("an auth store without the Go entry stays at no Go key once opencode is on", () => {
+    const ctx = context({ COLLIE_ACCOUNT_WINDOWS: "opencode" }, {});
+    const files = fakeFiles({ [`${ctx.home}/.local/share/opencode/auth.json`]: JSON.stringify({ openrouter: { type: "api", key: "placeholder" } }) });
+    expect(accountWindowsFinding({ ctx, host: HOST, files }).detail).toContain("opencode: on, unverified (no Go key)");
+  });
+
+  test("a named list shows the named harnesses on and the others off", () => {
+    const ctx = context({ COLLIE_ACCOUNT_WINDOWS: "codex" }, {});
+    expect(accountWindowsFinding({ ctx, host: HOST, files: fakeFiles({}) }).detail).toBe(
+      "claude: off (not in your list); codex: on (reads ~/.codex/sessions); opencode: off (not in your list); grok: off (not in your list)",
+    );
+  });
+
+  test("an off harness's login file is never looked at, not even for existence", () => {
+    const ctx = context({}, {});
+    const asked: string[] = [];
+    const files = { ...fakeFiles({}), read: (path: string) => (asked.push(path), null), exists: (path: string) => (asked.push(path), false) };
+    accountWindowsFinding({ ctx, host: HOST, files });
+    expect(asked).toEqual([]);
+  });
+
+  test("an unknown id is named and ignored, and only the known ids are on", () => {
+    const ctx = context({ COLLIE_ACCOUNT_WINDOWS: "claude,gork" }, {});
+    const detail = accountWindowsFinding({ ctx, host: HOST, files: fakeFiles({}) }).detail;
+    expect(detail).toContain("claude: on (");
+    expect(detail).toContain("codex: off (not in your list)");
+    expect(detail).toContain('COLLIE_ACCOUNT_WINDOWS: unknown id "gork" ignored');
   });
 });
 

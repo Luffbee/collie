@@ -6,9 +6,11 @@ import { Button } from "@/components/ui/button";
 import { Collapse } from "@/components/ui/collapse";
 import {
   DurableBar,
+  ScreenStop,
   HarnessBar,
   useHarnessBarItems,
   type DurableBarProps,
+  type ScreenStopProps,
 } from "@/components/harness-bar";
 import { StatusDot } from "@/components/status-badge";
 import { OverflowEdges } from "@/components/ui/overflow-edges";
@@ -22,9 +24,10 @@ import { t as translate } from "@/lib/i18n";
 import type { OperatorCommand } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-// ONE ROW OF ACTIONS, DIRECTLY ABOVE THE INPUT. Collie's own controls first — Keys, Type, Quick,
-// Agent, the display gear — then the running harness's own commands in a section of their own. It
-// scrolls sideways; nothing wraps and nothing is dropped.
+// ONE ROW OF ACTIONS, DIRECTLY ABOVE THE INPUT. Stop stands at the belt's start (in view at rest, no
+// scroll needed; dimmed while no turn runs, so the belt never reflows); then Collie's own controls —
+// Keys, Type, Quick, Agent, the display gear — then the running harness's own commands in a section of their own. It scrolls
+// sideways; nothing wraps and nothing is dropped.
 //
 // IT IS A BELT: ONE FULL-BLEED BAND, NOT TWO FLOATING CAPSULES. The row is a continuous strip that
 // runs edge to edge, closed above and below by a hairline, with a quiet ground of its own. Collie's
@@ -400,6 +403,13 @@ export interface ActionsRowProps {
    * whole of the old behaviour. The composer of a pane with no screen is the one caller.
    */
   durable?: Pick<DurableBarProps, "items" | "state">;
+  /**
+   * STOP FOR A PANE WITH A SCREEN (M68 spec 02), the FIRST child of the scroller, before Collie's own controls: the
+   * belt scrolls sideways and the first child is in view at rest, so Stop needs no scroll. Present whenever
+   * the bridge says a key exists (`stopFor`), dimmed in place while `running` is false; absent is the whole
+   * of the old behaviour. The composer owns the request and the receipt. A pane with no screen keeps the program bar's own Stop and never gets this one.
+   */
+  stop?: Pick<ScreenStopProps, "onStop" | "paneId" | "running">;
   /** Which thumb the belt is laid out for; see {@link Hand}. Default `"right"`, the shipped layout. */
   hand?: Hand;
   /**
@@ -512,7 +522,7 @@ export interface ActionsRowProps {
   };
 }
 
-export function ActionsRow({ general, agent, mine, onRun, disabled, durable, hand = "right", handle, changes, clear, agents }: ActionsRowProps) {
+export function ActionsRow({ general, agent, mine, onRun, disabled, durable, stop, hand = "right", handle, changes, clear, agents }: ActionsRowProps) {
   useLocale();
 
   const harnessItems = useHarnessBarItems(agent, mine);
@@ -533,7 +543,7 @@ export function ActionsRow({ general, agent, mine, onRun, disabled, durable, han
 
   // Nothing to draw at all. Render nothing rather than an empty scroller, so the row costs no
   // height.
-  if (general.length === 0 && harnessItems.length === 0 && (durable?.items.length ?? 0) === 0) return null;
+  if (general.length === 0 && harnessItems.length === 0 && (durable?.items.length ?? 0) === 0 && stop === undefined) return null;
 
   return (
     <div
@@ -643,6 +653,12 @@ export function ActionsRow({ general, agent, mine, onRun, disabled, durable, han
               left && "[direction:rtl]",
             )}
           >
+            {/* STOP IS THE FIRST CHILD OF THE SCROLLER, before Collie's own controls. The belt scrolls
+                sideways and the first child is the one always in view at rest, so a running turn can be
+                stopped without a scroll, and a button that is always drawn moves nothing when a turn
+                starts or ends. Under `hand="left"` the scroller is `[direction:rtl]`, so the first child lands at the belt's right end, mirrored like every other control; that is
+                intended and not special-cased. */}
+            {stop !== undefined && <ScreenStop onStop={stop.onStop} paneId={stop.paneId} running={stop.running} disabled={disabled} hand={hand} />}
             {general.length > 0 && (
               // The word "Controls" is `sr-only` and load-bearing: sighted it labelled a run of
               // self-labelling buttons and earned nothing, but in the accessibility tree it is the only

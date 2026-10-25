@@ -27,6 +27,8 @@ vi.mock("@/lib/chat-gate", async (importOriginal) => ({
 }));
 
 import { server } from "@/test/setup";
+import { __resetBeltIntents, queueBeltIntent, takeBeltIntent } from "@/lib/belt-intent";
+import { paneScopeKey } from "@/lib/scope";
 import { clearStatus, setStatus, useStatus } from "@/lib/status";
 import { setAutoZenEnabled, setZenEnabled, __resetZen } from "@/lib/zen";
 import { HarnessPrefsControl } from "@/components/harness-prefs-control";
@@ -49,6 +51,7 @@ import { COLLAPSE_MS } from "./ui/collapse";
 import { AgentChat } from "./agent-chat";
 import { saveChatTail } from "@/lib/chat-tail";
 import { __resetMaskedHint, maskedHintRetired } from "@/lib/masked-hint";
+import { ARM_DWELL_MS } from "@/lib/arm";
 
 // M46 spec 11 turns every send off for a pane the bridge has not answered lately (lib/liveness.ts).
 // These suites drive sends against a mocked network and never poll first, so they pin the pane live;
@@ -4868,5 +4871,141 @@ describe("AgentChat, the newest turn's picture on a pi pane (M39, #292)", () => 
     });
     expect(screen.queryByText("the agent's newest picture, from its log")).toBeNull();
     expect(screen.queryByRole("img", { name: "Terminal graphics" })).toBeNull();
+  });
+});
+
+// M68 spec 02: Stop on the belt of a pane with a screen. The rule is `stopFor` (the bridge says a key exists;
+// the turn only decides live or dimmed); the first tap arms, the second posts the request id alone and the receipt shows under the box.
+describe("AgentChat: Stop on a pane with a screen", () => {
+  const RUNNING: Surface = { revision: 4, turn: "running", modal: "none", composer: "empty" };
+  const IDLE_SURFACE: Surface = { revision: 4, turn: "idle", modal: "none", composer: "empty" };
+  const stopAgent = (over: Partial<AgentView>): AgentView => ({ ...fixtureAgents[0]!, sendProtocol: true, ...over });
+  const beltStop = () => document.querySelector("[data-slot='belt-stop']");
+  /** A second tap counts only ARM_DWELL_MS after the arm (lib/arm.ts): wait it out, as a thumb does. */
+  const pastTheDwell = () => new Promise<void>((resolve) => setTimeout(resolve, ARM_DWELL_MS));
+
+  function serveStop(receipt: JsonValue) {
+    const posted: JsonValue[] = [];
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/abort$/, async ({ request }) => {
+        // SAFETY: the phone's own JSON.stringify body is JSON, a JsonValue.
+        posted.push((await request.json()) as JsonValue);
+        return HttpResponse.json(receipt);
+      }),
+    );
+    return posted;
+  }
+
+  it("draws no Stop on a pane the bridge has no key for, running or idle", async () => {
+    renderChat({ agent: stopAgent({ surface: RUNNING }) });
+    await screen.findByRole("button", { name: "Pane actions" });
+    expect(beltStop()).toBeNull();
+    cleanup();
+    renderChat({ agent: stopAgent({ surface: IDLE_SURFACE }) });
+    await screen.findByRole("button", { name: "Pane actions" });
+    expect(beltStop()).toBeNull();
+  });
+
+  it("draws a dimmed Stop on an idle pane that has a key, and a tap posts nothing and arms nothing", async () => {
+    const user = userEvent.setup();
+    const posted = serveStop({ requestId: "echo-0003", outcome: "refused", reason: "turn_idle" });
+    renderChat({ agent: stopAgent({ surface: IDLE_SURFACE, canStop: true }) });
+    const stop = await screen.findByRole("button", { name: "Stop the turn" });
+    expect(stop).toHaveAttribute("data-slot", "belt-stop");
+    expect(stop).toHaveAttribute("aria-disabled", "true");
+    await user.click(stop);
+    await pastTheDwell();
+    await user.click(stop);
+    expect(posted).toHaveLength(0);
+    expect(screen.queryByRole("button", { name: "Tap again to stop the turn" })).toBeNull();
+  });
+
+  it("arms on the first tap, posts one fresh request id on the second and tells the receipt under the box", async () => {
+    const user = userEvent.setup();
+    const posted = serveStop({ requestId: "echo-0001", outcome: "stopped", keys: ["Escape"] });
+    renderChat({ agent: stopAgent({ surface: RUNNING, canStop: true }) });
+    await user.click(await screen.findByRole("button", { name: "Stop the turn" }));
+    expect(posted).toHaveLength(0);
+    await pastTheDwell();
+    await user.click(screen.getByRole("button", { name: "Tap again to stop the turn" }));
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0]).toEqual({ requestId: expect.stringMatching(/^[A-Za-z0-9_-]{8,64}$/) });
+    expect(await screen.findByText("Stopped.")).toBeInTheDocument();
+  });
+
+  it("tells a refusal in its own words and presses nothing more", async () => {
+    const user = userEvent.setup();
+    const posted = serveStop({ requestId: "echo-0002", outcome: "refused", reason: "draft_present" });
+    renderChat({ agent: stopAgent({ surface: RUNNING, canStop: true }) });
+    await user.click(await screen.findByRole("button", { name: "Stop the turn" }));
+    await pastTheDwell();
+    await user.click(screen.getByRole("button", { name: "Tap again to stop the turn" }));
+    expect(await screen.findByText("The box holds your text and this harness's stop key would clear it.")).toBeInTheDocument();
+    expect(posted).toHaveLength(1);
+  });
+});
+
+describe("AgentChat — the focused column of a large screen's strip (ADR 0120)", () => {
+  afterEach(() => __resetBeltIntents());
+
+  it("hides the belt's Switch pill, which the sidebar replaces, and keeps it below 600 px", () => {
+    const phone = renderChat();
+    expect(within(phone.container).queryByRole("button", { name: "Switch pane" })).not.toBeNull();
+    cleanup();
+    const { container } = renderChat({ inStrip: true });
+    expect(within(container).queryByRole("button", { name: "Switch pane" })).toBeNull();
+    // The belt itself stays, with the reply box under it.
+    expect(within(container).getByRole("button", { name: "Keys" })).toBeInTheDocument();
+    expect(within(container).getByPlaceholderText(/type a reply/i)).toBeInTheDocument();
+    // The column is the bound, so the phone's width ladder stands down.
+    expect(container.querySelector(".md\\:max-w-screen-md")).toBeNull();
+  });
+
+  it("runs a belt tap left in another column through this pane's own composer, once", async () => {
+    const agent = fixtureAgents[0]!;
+    queueBeltIntent(paneScopeKey(undefined, agent.paneId), { kind: "action", id: "keys" });
+    const { container } = renderChat({ inStrip: true });
+    await waitFor(() => expect(within(container).getByRole("button", { name: "Keys" })).toHaveAttribute("aria-expanded", "true"));
+    // Taken: a remount of the same pane does not open the dock again.
+    expect(takeBeltIntent(paneScopeKey(undefined, agent.paneId))).toBeNull();
+  });
+
+  it("leaves the tab row and the pane row to the space header and the sidebar, and the space name to the space header", () => {
+    const sibling: AgentView = { ...fixtureAgents[0]!, paneId: "w1:p9" };
+    const strips = { tabs: fixtureTabs, agents: [...fixtureAgents, sibling] };
+    const phone = renderChat(strips);
+    expect(within(phone.container).queryByRole("navigation", { name: "Tabs" })).not.toBeNull();
+    expect(within(phone.container).queryByRole("navigation", { name: "Panes" })).not.toBeNull();
+    expect(phone.container.querySelector('[data-slot="pane-place"]')?.textContent).not.toBe("");
+    cleanup();
+    const { container } = renderChat({ ...strips, inStrip: true });
+    expect(within(container).queryByRole("navigation", { name: "Tabs" })).toBeNull();
+    expect(within(container).queryByRole("navigation", { name: "Panes" })).toBeNull();
+    expect(within(container).queryByRole("button", { name: /^Show tabs/ })).toBeNull();
+    // The header's second line keeps the pane's own facts and drops the space's name.
+    expect(container.querySelector('[data-slot="pane-place"]')?.textContent).toBe("");
+  });
+
+  it("leaves another pane's belt tap alone", () => {
+    queueBeltIntent(paneScopeKey(undefined, "w9:p9"), { kind: "action", id: "keys" });
+    const { container } = renderChat({ inStrip: true });
+    expect(within(container).getByRole("button", { name: "Keys" })).toHaveAttribute("aria-expanded", "false");
+    expect(takeBeltIntent(paneScopeKey(undefined, "w9:p9"))).toEqual({ kind: "action", id: "keys" });
+  });
+});
+
+describe("AgentChat — a tabletop fold (ADR 0120, folded postures)", () => {
+  it("marks the chrome block for the bottom segment: the belt, then the reply box; the header stays above", () => {
+    const { container } = renderChat({ tabletop: true });
+    const bottom = container.querySelector<HTMLElement>('[data-segment="bottom"]');
+    expect(bottom?.dataset.slot).toBe("chrome-block");
+    expect(within(bottom!).getByRole("button", { name: "Keys" })).toBeInTheDocument();
+    expect(within(bottom!).getByPlaceholderText(/type a reply/i)).toBeInTheDocument();
+    expect(container.querySelector("header")?.closest('[data-segment="bottom"]') ?? null).toBeNull();
+  });
+
+  it("marks nothing when the screen is flat", () => {
+    const { container } = renderChat();
+    expect(container.querySelector("[data-segment]")).toBeNull();
   });
 });

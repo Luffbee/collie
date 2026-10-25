@@ -14,8 +14,10 @@ import type { HeldCancelAnswer, SendAnswer } from "../../web/src/lib/surface/sen
 import { parseAnsi } from "../../web/src/lib/ansi.ts";
 import { lineText, splitLines } from "../../web/src/lib/blocks.ts";
 import { findInputFrame } from "../../web/src/lib/surface/frame.ts";
+import { surfaceOfScreen } from "../../web/src/lib/surface/fold.ts";
+import { isFree, type Surface } from "../../web/src/lib/surface/surface.ts";
 import { KeyGate } from "./key-gate.ts";
-import { boxMatches, commandBoxMatches, GENERIC_PROBE, wholePaste, LOCK_BOUND_MS, locateText, neverHeldEntry, probeLanding, RowRing, SendProtocol, SessionLocks, steadyRow, type SendDeps, type SendRequest } from "./protocol.ts";
+import { boxMatches, commandBoxMatches, GENERIC_PROBE, wholePaste, LOCK_BOUND_MS, locateText, neverHeldEntry, probeLanding, RowRing, runsInTurnEntry, SendProtocol, SessionLocks, steadyRow, type SendDeps, type SendRequest } from "./protocol.ts";
 import { RequestStore } from "./requests.ts";
 import { SurfaceLedger } from "./counters.ts";
 import { HoldStore } from "./holds.ts";
@@ -2953,6 +2955,33 @@ describe("the offers as new requests", () => {
     neverEscape(pane);
   });
 
+  test("replace with a slash command (the belt's Model onto a draft): Replace and Cancel only, then the box is emptied and the command sent", async () => {
+    const { pane, send } = rig();
+    pane.box = "old draft";
+    pane.afterInput = (p, what) => {
+      if (what.startsWith("paste:/")) p.popup = ["  /model       Set the AI model for Claude Code", "  /mcp         Manage MCP servers"];
+      if (what.endsWith("Enter")) p.popup = null;
+    };
+    const refused = await send("/model", { mode: "command" });
+    expect(refused.receipt).toMatchObject({ outcome: "refused", reason: "draft_present", keys: [] });
+    // Add would send "old draft /model", a message nobody means: a command is offered Replace and Cancel only.
+    expect(refused.offers).toEqual(["replace", "cancel"]);
+    // The same request id again is a replay of the stored receipt, with the same two offers.
+    const replayed = await send("/model", { id: refused.receipt!.requestId, mode: "command" });
+    expect(replayed).toMatchObject({ replayed: true, receipt: { reason: "draft_present" }, offers: ["replace", "cancel"] });
+    // A plain message onto the same draft keeps all three, and so does its replay.
+    const plain = await send("a plain thought");
+    expect(plain.offers).toEqual(["append", "replace", "cancel"]);
+    expect((await send("a plain thought", { id: plain.receipt!.requestId })).offers).toEqual(["append", "replace", "cancel"]);
+    const answer = await send("/model", { mode: "replace" });
+    expect(answer.receipt).toMatchObject({ outcome: "sent" });
+    expect(answer.receipt?.keys.at(-1)).toBe("Enter");
+    expect(pane.calls).toEqual(["paste:/model"]);
+    expect(pane.transcript.at(-1)).toBe("> /model");
+    expect(pane.keysSeen.filter((k) => k === "Backspace").length).toBeGreaterThanOrEqual("old draft".length);
+    neverEscape(pane);
+  });
+
   test("replace: the clear is its own step, so S0 keeps its two reads and its own gap", async () => {
     const r = rig();
     r.pane.box = "old draft";
@@ -4429,6 +4458,32 @@ describe("the held send (M56 spec 15)", () => {
     expect(released?.receipt?.keys.at(-1)).toBe("Enter");
   });
 
+  test("a steer while a held command waits runs now, ahead of it, and the held command still goes after the turn (M69)", async () => {
+    const r = await piHeldCommand("held-pi-03");
+    r.pane.inTurn = true;
+    // pi draws a steer as `Steering: <text>` over its edit hint (lab, pi 1.3.0, 2026-10-23).
+    const press = r.pane.writeKeys;
+    r.pane.writeKeys = async (paneId, keys) => {
+      const before = r.pane.steered.length;
+      const ack = await press(paneId, keys);
+      for (const text of r.pane.steered.slice(before)) r.pane.transcript.push(`Steering: ${text}`, "↳ Alt+Up to edit all queued messages");
+      return ack;
+    };
+    const steer = await r.send("also say hello at the end", { id: "steer-pi-03", when: "steer", fromPhone: true });
+    expect(steer.receipt).toMatchObject({ requestId: "steer-pi-03", outcome: "steered" });
+    expect(steer.receipt?.keys.at(-1)).toBe("Enter");
+    expect(r.pane.steered).toEqual(["also say hello at the end"]);
+    expect(r.holds.get("held-pi-03")?.state).toBe("held");
+    expect(r.holds.get("steer-pi-03")).toBeNull();
+    // The turn runs on a poll, then ends: the held command goes after it, as before the steer.
+    expect(await tick(r, RUNNING)).toEqual([]);
+    r.pane.inTurn = false;
+    const [released] = await freeTwice(r);
+    expect(released?.receipt).toMatchObject({ requestId: "held-pi-03", outcome: "sent" });
+    expect(released?.receipt?.keys.at(-1)).toBe("Enter");
+    expect(r.holds.list()).toEqual([]);
+  });
+
   test("a held command on a pane whose version was not read waits for a polled turn too; a held text there keeps the quiet path", async () => {
     const clock = { now: 1_000_000 };
     const holds = new HoldStore(join(dir, "held"), () => clock.now);
@@ -4966,6 +5021,13 @@ class OmpPane extends FakePane {
   showWorking = true;
   /** Texts Enter sent into the turn: steering, which the send must never do. */
   steered: string[] = [];
+  /**
+   * The command words OMP runs at once when Enter takes them in a turn, never as steering text (lab,
+   * 18.12.2, 2026-10-19: `/goal`). Empty runs none, the shape before the lab.
+   */
+  runsAtOnce: string[] = [];
+  /** Commands Enter ran at once in a turn. */
+  ran: string[] = [];
 
   constructor() {
     super("generic");
@@ -4976,7 +5038,11 @@ class OmpPane extends FakePane {
         if (key === "ctrl+q" || (key === "Enter" && this.inTurn)) {
           this.keysSeen.push(key);
           const text = this.box.replace(/\n/gu, " ");
-          if (text.length > 0 && key === "Enter") this.steered.push(text);
+          if (key === "Enter" && this.runsAtOnce.includes(text.split(" ")[0] ?? "")) {
+            // The command runs before the turn sees it: its status line prints above the box.
+            this.ran.push(text);
+            this.transcript.push(` ran ${text}`);
+          } else if (text.length > 0 && key === "Enter") this.steered.push(text);
           else if (text.length > 0 && this.inTurn) this.queued.push(text);
           else if (text.length > 0) this.transcript.push(` > ${text}`);
           this.box = "";
@@ -4997,10 +5063,11 @@ class OmpPane extends FakePane {
   }
 }
 
-function omp(options: { version?: string; edit?: (profile: Profile) => Profile } = {}): Rig & { pane: OmpPane } {
+function omp(options: { version?: string; edit?: (profile: Profile) => Profile; holds?: HoldStore } = {}): Rig & { pane: OmpPane } {
   const pane = new OmpPane();
   const rigOptions: Parameters<typeof rig>[0] = { pane, harness: "omp", version: options.version ?? "18.6.1" };
   if (options.edit !== undefined) rigOptions.edit = options.edit;
+  if (options.holds !== undefined) rigOptions.holds = options.holds;
   const made = rig(rigOptions);
   return { ...made, pane };
 }
@@ -5062,6 +5129,347 @@ describe("OMP: Ctrl+Q sends, Enter steers (M56 spec 14 review)", () => {
     const answer = await win.send("write the summary now");
     expect(answer.receipt).toMatchObject({ outcome: "sent", keys: ["probe", "Backspace", "Enter"] });
     expect(win.pane.keysSeen).not.toContain("ctrl+q");
+  });
+});
+
+describe("OMP runs `/goal` at once in a turn (keys.commandsRunInTurn, lab 18.12.2, 2026-10-19)", () => {
+  /** An OMP pane in a turn, its fake running `/goal` at once on Enter as 18.12.2 did in the lab. */
+  const goalTurn = (options: Parameters<typeof omp>[0] = {}): Rig & { pane: OmpPane } => {
+    const made = omp({ version: "18.12.2", ...options });
+    made.pane.inTurn = true;
+    made.pane.runsAtOnce = ["/goal"];
+    return made;
+  };
+  /** The profile with its one range revoked. */
+  const revoke = (profile: Profile): Profile => ({ ...profile, versions: [{ ...profile.versions[0], status: "revoked" }] });
+
+  test("the shipped profile lists /goal alone, with its lab note", () => {
+    const keys = loadProfiles().get("omp")!.keys;
+    expect(keys.commandsRunInTurn).toEqual(["/goal"]);
+    expect(keys.commandsRunInTurnNote).toContain("18.12.2");
+  });
+
+  test("runsInTurnEntry matches the word alone or followed by white space, on a version the turn may trust", () => {
+    const log = { log: () => undefined };
+    const provisional = profileFor("omp", "18.12.2", log);
+    expect(provisional?.status).toBe("provisional");
+    expect(runsInTurnEntry("/goal pause", provisional)).toBe("/goal");
+    expect(runsInTurnEntry("  /goal  ", provisional)).toBe("/goal");
+    expect(runsInTurnEntry("/goal\tresume", provisional)).toBe("/goal");
+    expect(runsInTurnEntry("/goals", provisional)).toBeNull();
+    expect(runsInTurnEntry("/model", provisional)).toBeNull();
+    expect(runsInTurnEntry("pause /goal", provisional)).toBeNull();
+    expect(runsInTurnEntry("/goal pause", profileFor("omp", "18.6.1", log))).toBe("/goal");
+    // An unread version, a revoked range, and a profile with no list match nothing.
+    expect(runsInTurnEntry("/goal pause", profileFor("omp", null, log))).toBeNull();
+    const revoked = new Map([["omp", revoke(loadProfiles().get("omp")!)]]);
+    expect(runsInTurnEntry("/goal pause", profileFor("omp", "18.6.1", { ...log, profiles: revoked }))).toBeNull();
+    expect(runsInTurnEntry("/goal pause", profileFor("omp", "18.12.2", { ...log, profiles: revoked }))).toBeNull();
+    expect(runsInTurnEntry("/goal pause", profileFor("pi", "0.87.1", log))).toBeNull();
+  });
+
+  test("/goal pause in a turn goes in at once with Enter: probed, sent, never queued, never steered, nothing held", async () => {
+    const holds = new HoldStore(join(dir, "held"), () => 1_000_000);
+    const { pane, send } = goalTurn({ holds });
+    const answer = await send("/goal pause", { mode: "command" });
+    expect(answer.receipt).toMatchObject({ outcome: "sent", keys: ["probe", "Backspace", "Enter"], version: "18.12.2", profileStatus: "provisional" });
+    expect(answer.receipt?.queued).toBeUndefined();
+    expect(pane.ran).toEqual(["/goal pause"]);
+    expect(pane.steered).toEqual([]);
+    expect(pane.queued).toEqual([]);
+    expect(pane.keysSeen).not.toContain("ctrl+q");
+    expect(holds.list()).toEqual([]);
+    neverEscape(pane);
+  });
+
+  test("/goal status, /goal resume and a bare /goal go the same way, on the verified range too", async () => {
+    for (const version of ["18.6.1", "18.12.2"]) {
+      for (const text of ["/goal status", "/goal resume", "/goal"]) {
+        const { pane, send } = goalTurn({ version });
+        const answer = await send(text, { mode: "command" });
+        expect([version, text, answer.receipt?.outcome, answer.receipt?.keys.at(-1)]).toEqual([version, text, "sent", "Enter"]);
+        expect(pane.ran).toEqual([text]);
+        expect(pane.steered).toEqual([]);
+      }
+    }
+  });
+
+  test("the answer streaming above the box while /goal is typed does not stop it", async () => {
+    const { pane, send } = goalTurn();
+    let streamed = 0;
+    pane.afterInput = (p) => {
+      streamed++;
+      p.transcript.push(` tick ${String(streamed)} of the streaming answer`);
+    };
+    const answer = await send("/goal resume", { mode: "command" });
+    expect(answer.receipt).toMatchObject({ outcome: "sent", keys: ["probe", "Backspace", "Enter"] });
+    expect(answer.receipt?.queued).toBeUndefined();
+    expect(pane.ran).toEqual(["/goal resume"]);
+    expect(pane.steered).toEqual([]);
+  });
+
+  test("a command the list does not name is held as before, nothing typed: /model, /goals, a prompt template", async () => {
+    for (const text of ["/model", "/goals", "/labnote"]) {
+      const holds = new HoldStore(join(dir, `held-${text.slice(1)}`), () => 1_000_000);
+      const { pane, send } = goalTurn({ holds });
+      const answer = await send(text, { mode: "command" });
+      expect([text, answer.receipt?.outcome, answer.receipt?.keys]).toEqual([text, "held", []]);
+      expect(holds.list().map((entry) => [entry.text, entry.waitsForTurn])).toEqual([[text, true]]);
+      expect(pane.keysSeen).toEqual([]);
+      expect(pane.ran).toEqual([]);
+    }
+  });
+
+  test("without a hold queue a command the list does not name is refused turn_running, nothing typed", async () => {
+    const { pane, send } = goalTurn();
+    const answer = await send("/model", { mode: "command" });
+    expect(answer.receipt).toMatchObject({ outcome: "refused", reason: "turn_running", keys: [] });
+    expect(answer.detail).toBe("A command waits until the turn ends.");
+    expect(pane.calls).toEqual([]);
+  });
+
+  test("on an idle box /goal pause takes Enter as every command does", async () => {
+    const { pane, send } = goalTurn();
+    pane.inTurn = false;
+    const answer = await send("/goal pause", { mode: "command" });
+    expect(answer.receipt).toMatchObject({ outcome: "sent", keys: ["probe", "Backspace", "Enter"] });
+    expect(answer.receipt?.queued).toBeUndefined();
+    expect(pane.transcript.at(-1)).toBe("> /goal pause");
+    expect(pane.ran).toEqual([]);
+  });
+
+  test("an unread version or a revoked range keeps the hold: the command waits for the turn, never Entered", async () => {
+    const cases: { name: string; version: string; edit?: (profile: Profile) => Profile }[] = [
+      { name: "unread", version: "no version here" },
+      { name: "revoked", version: "18.6.1", edit: revoke },
+      { name: "revoked, borrowed", version: "18.12.2", edit: revoke },
+    ];
+    for (const c of cases) {
+      const holds = new HoldStore(join(dir, `held-${c.name}`), () => 1_000_000);
+      const options: Parameters<typeof omp>[0] = { version: c.version, holds };
+      if (c.edit !== undefined) options.edit = c.edit;
+      const { pane, send } = goalTurn(options);
+      const answer = await send("/goal pause", { mode: "command" });
+      expect([c.name, answer.receipt?.outcome, answer.receipt?.keys]).toEqual([c.name, "held", []]);
+      expect(holds.list().map((entry) => entry.waitsForTurn)).toEqual([true]);
+      expect(pane.keysSeen).toEqual([]);
+    }
+  });
+
+  test("a profile without the list holds /goal pause in a turn, the shape before the lab", async () => {
+    const holds = new HoldStore(join(dir, "held"), () => 1_000_000);
+    const withoutList = (profile: Profile): Profile => {
+      const { commandsRunInTurn, commandsRunInTurnNote, ...keys } = profile.keys;
+      void commandsRunInTurn;
+      void commandsRunInTurnNote;
+      return { ...profile, keys };
+    };
+    const { pane, send } = goalTurn({ holds, edit: withoutList });
+    expect((await send("/goal pause", { mode: "command" })).receipt).toMatchObject({ outcome: "held", keys: [] });
+    expect(pane.keysSeen).toEqual([]);
+  });
+
+  test("a text with a line break never runs in turn: /goal pause then more text matches nothing, on the OMP profile", () => {
+    const log = { log: () => undefined };
+    const match = profileFor("omp", "18.12.2", log);
+    expect(runsInTurnEntry("/goal pause", match)).toBe("/goal");
+    expect(runsInTurnEntry("/goal pause\nmore text", match)).toBeNull();
+    expect(runsInTurnEntry("/goal pause\r\nmore text", match)).toBeNull();
+    expect(runsInTurnEntry("/goal\nmore text", match)).toBeNull();
+    expect(runsInTurnEntry("/goal pause\n", match)).toBeNull();
+  });
+
+  test("/goal pause with a draft already in the box is refused draft_present, nothing typed", async () => {
+    const { pane, send } = goalTurn();
+    pane.box = "half a thought";
+    const answer = await send("/goal pause", { mode: "command" });
+    expect(answer.receipt).toMatchObject({ outcome: "refused", reason: "draft_present", keys: [] });
+    expect(pane.ran).toEqual([]);
+    expect(pane.keysSeen).toEqual([]);
+  });
+
+  test("/goal pause with an OMP approval dialog on screen is refused not_free, nothing typed", async () => {
+    const pane = new FakePane("generic");
+    pane.fixed = readFileSync(join(import.meta.dir, "../../web/src/fixtures/panes/omp--approval-bash.txt"), "utf8").replace(/\r\n/gu, "\n");
+    const { send } = rig({ pane, harness: "omp", version: "18.12.2" });
+    const answer = await send("/goal pause", { mode: "command" });
+    expect(answer.receipt).toMatchObject({ outcome: "refused", reason: "not_free", keys: [] });
+    expect(pane.calls).toEqual([]);
+    expect(pane.keysSeen).toEqual([]);
+  });
+
+  test("the shipped Claude profile has no in-turn command list: /goal pause matches nothing", () => {
+    const log = { log: () => undefined };
+    expect(runsInTurnEntry("/goal pause", profileFor("claude", "2.1.301", log))).toBeNull();
+    expect(loadProfiles().get("claude")!.keys.commandsRunInTurn).toBeUndefined();
+  });
+
+  test("a pane with held sends: /goal pause does not wait behind them, and they stay held", async () => {
+    const holds = new HoldStore(join(dir, "held"), () => 1_000_000);
+    const { pane, send, protocol } = goalTurn({ holds });
+    expect((await send("/model", { id: "held-goal-01", mode: "command" })).receipt).toMatchObject({ outcome: "held" });
+    const answer = await send("/goal pause", { id: "goal-now-01", mode: "command" });
+    expect(answer.receipt).toMatchObject({ requestId: "goal-now-01", outcome: "sent", keys: ["probe", "Backspace", "Enter"] });
+    expect(pane.ran).toEqual(["/goal pause"]);
+    expect(protocol.heldOf("main", "%1").map((row) => row.requestId)).toEqual(["held-goal-01"]);
+    // A command the list does not name still joins the end of the queue.
+    expect((await send("/compact", { id: "held-goal-02", mode: "command" })).receipt).toMatchObject({ outcome: "held", keys: [] });
+    expect(protocol.heldOf("main", "%1").map((row) => row.requestId)).toEqual(["held-goal-01", "held-goal-02"]);
+  });
+});
+
+// The same send, replayed from a real OMP 18.12.2 (captured 2026-10-22, Herdr 0.9.5, 119 columns, a local
+// fake model endpoint, no model call). Each screen the Send Protocol reads is a file in
+// web/src/fixtures/panes/omp--v18-12-2-goal-*--w119.txt, read off the pane as the bridge reads it
+// (`pane.read` visible, format ansi). The pane below answers each read with the capture taken at that
+// step of the lab's send: the probe typed, the text typed, Enter pressed. Nothing on a screen is drawn
+// by the test.
+describe("OMP 18.12.2 `/goal` in a goal turn, replayed from the real capture (lab 2026-10-22)", () => {
+  const PANES = join(import.meta.dir, "../../web/src/fixtures/panes");
+  /** A capture's text, line breaks as the bridge's read takes them. */
+  const capture = (name: string): string => readFileSync(join(PANES, `omp--v18-12-2-goal-${name}--w119.txt`), "utf8").replace(/\r\n/gu, "\n");
+  const OMP = loadProfiles().get("omp")!;
+  const surfaceOf = (name: string): Surface =>
+    surfaceOfScreen({ seq: 0, source: "screen", at: 0, revision: 1, rows: splitLines(parseAnsi(capture(name))), ask: null }, OMP.idle).surface;
+
+  /** The captures of one send in the lab: what the screen read before, with the probe, with the text typed, and after Enter. */
+  interface Stages {
+    before: string;
+    probe: string;
+    typed: string;
+    /** The reads after Enter, in the order the lab took them; the last one stands for every later read. */
+    after: string[];
+  }
+  const PAUSE: Stages = { before: "turn-running", probe: "turn-running-probe", typed: "pause-typed", after: ["pause-result", "pause-result-later"] };
+  const RESUME: Stages = { before: "resume-before", probe: "resume-probe", typed: "resume-typed", after: ["resume-result"] };
+  const BARE: Stages = { before: "bare-before", probe: "bare-probe", typed: "bare-typed", after: ["bare-menu"] };
+
+  /** An OMP pane whose every read is one of the captures: the empty box, the probe in the box, the text in the box, or a read after Enter. */
+  const replay = (stages: Stages, text: string): FakePane => {
+    const pane = new FakePane("generic");
+    let entered = false;
+    let after = 0;
+    pane.afterInput = (_p, what) => {
+      if (what === "keys:Enter") entered = true;
+    };
+    pane.beforeRead = (p) => {
+      if (entered) {
+        p.fixed = capture(stages.after[Math.min(after++, stages.after.length - 1)]!);
+      } else if (p.box === "") p.fixed = capture(stages.before);
+      else if (p.box === PROBE) p.fixed = capture(stages.probe);
+      else if (p.box === text) p.fixed = capture(stages.typed);
+      else throw new Error(`the lab never saw the box hold ${JSON.stringify(p.box)}`);
+    };
+    return pane;
+  };
+  const sendOn = async (stages: Stages, text: string, options: { holds?: HoldStore; edit?: (profile: Profile) => Profile } = {}): Promise<{ answer: SendAnswer; pane: FakePane }> => {
+    const pane = replay(stages, text);
+    const made = rig({ pane, harness: "omp", version: "18.12.2", ...options });
+    return { answer: await made.send(text, { mode: "command" }), pane };
+  };
+
+  test("the captured screens carry OMP's own words, version and width", () => {
+    // eslint-disable-next-line no-control-regex
+    const plain = (name: string): string => capture(name).replace(/\u001b\[[0-9;:]*m/gu, "");
+    expect(plain("turn-running")).toContain("v18.12.2");
+    expect(plain("turn-running")).toContain("⎋ Working…");
+    expect(plain("turn-running")).toContain("🎯 Goal");
+    expect(plain("pause-result")).toContain("Goal mode paused.");
+    expect(plain("pause-result")).toContain("⏸ Goal");
+    expect(plain("pause-result")).toContain("⎋ Working…");
+    expect(plain("resume-before")).toContain("⏸ Goal");
+    expect(plain("resume-result")).toContain("Goal mode resumed.");
+    expect(plain("resume-result")).toContain("🎯 Goal");
+    for (const entry of ["Show details", "Adjust budget…", "Pause", "Drop", "↑/↓ navigate  ⏎ select  ⎋ cancel"]) expect(plain("bare-menu")).toContain(entry);
+  });
+
+  test("the reader sees a running turn and a free box on the screen before /goal pause, and again before /goal resume", () => {
+    for (const name of ["turn-running", "resume-before", "bare-before"]) {
+      const surface = surfaceOf(name);
+      expect([name, surface.turn, surface.modal, surface.composer]).toEqual([name, "running", "none", "empty"]);
+      expect(isFree(surface), name).toBe(false);
+    }
+  });
+
+  test("the screens after /goal pause and /goal resume still read a running turn: the goal turn goes on", () => {
+    for (const name of ["pause-result", "pause-result-later", "resume-result"]) {
+      const surface = surfaceOf(name);
+      expect([name, surface.turn, surface.modal, surface.composer]).toEqual([name, "running", "none", "empty"]);
+    }
+  });
+
+  test("the screen after a bare /goal is a menu the reader does not call free", () => {
+    const surface = surfaceOf("bare-menu");
+    expect(surface.modal).not.toBe("none");
+    expect(isFree(surface)).toBe(false);
+  });
+
+  test("/goal pause is sent in the turn as a command: probe, Backspace, Enter, never the queue key, receipt sent", async () => {
+    const holds = new HoldStore(join(dir, "held"), () => 1_000_000);
+    const { answer, pane } = await sendOn(PAUSE, "/goal pause", { holds });
+    expect(answer.receipt).toMatchObject({ outcome: "sent", keys: ["probe", "Backspace", "Enter"], version: "18.12.2", profileStatus: "provisional" });
+    expect(answer.receipt?.queued).toBeUndefined();
+    expect(pane.calls[0]).toBe(`type:${PROBE}`);
+    expect(pane.keysSeen).toEqual(["Backspace", "Enter"]);
+    expect(pane.keysSeen).not.toContain("ctrl+q");
+    expect(holds.list()).toEqual([]);
+    neverEscape(pane);
+  });
+
+  // What the first version of this change missed: with `/goal pause` typed OMP draws the argument's list
+  // under the box, the pointer on `pause`. Without `commandList.argumentList` that pointer is on another
+  // command, and S1 leaves the text typed.
+  test("without commandList.argumentList the real screen's list reads as another command and Enter is never pressed", async () => {
+    const withoutFlag = (profile: Profile): Profile => {
+      const list = profile.idle.volatile.below.commandList!;
+      const { argumentList, ...rest } = list;
+      void argumentList;
+      return { ...profile, idle: { ...profile.idle, volatile: { ...profile.idle.volatile, below: { ...profile.idle.volatile.below, commandList: rest } } } };
+    };
+    const { answer, pane } = await sendOn(PAUSE, "/goal pause", { edit: withoutFlag });
+    expect(answer.receipt).toMatchObject({ outcome: "typed_not_submitted", reason: "modal_cue", keys: ["probe", "Backspace"] });
+    expect(pane.keysSeen).toEqual(["Backspace"]);
+  });
+
+  test("/goal resume on the paused screen goes the same way", async () => {
+    const { answer, pane } = await sendOn(RESUME, "/goal resume");
+    expect(answer.receipt).toMatchObject({ outcome: "sent", keys: ["probe", "Backspace", "Enter"], version: "18.12.2" });
+    expect(answer.receipt?.queued).toBeUndefined();
+    expect(pane.keysSeen).toEqual(["Backspace", "Enter"]);
+    neverEscape(pane);
+  });
+
+  test("a bare /goal goes the same way, and the menu it opens is on the next screen", async () => {
+    const { answer, pane } = await sendOn(BARE, "/goal");
+    expect(answer.receipt).toMatchObject({ outcome: "sent", keys: ["probe", "Backspace", "Enter"], version: "18.12.2" });
+    expect(pane.keysSeen).toEqual(["Backspace", "Enter"]);
+    neverEscape(pane);
+  });
+
+  test("a command the list does not name is held on the same running screen, and nothing is typed", async () => {
+    for (const text of ["/model", "/goals", "/compact"]) {
+      const holds = new HoldStore(join(dir, `held-${text.slice(1)}`), () => 1_000_000);
+      const { answer, pane } = await sendOn(PAUSE, text, { holds });
+      expect([text, answer.receipt?.outcome, answer.receipt?.keys]).toEqual([text, "held", []]);
+      expect(holds.list().map((entry) => [entry.text, entry.waitsForTurn])).toEqual([[text, true]]);
+      expect(pane.calls).toEqual([]);
+      expect(pane.keysSeen).toEqual([]);
+    }
+  });
+
+  test("with no hold queue a command the list does not name is refused turn_running on the same screen, nothing typed", async () => {
+    const { answer, pane } = await sendOn(PAUSE, "/model");
+    expect(answer.receipt).toMatchObject({ outcome: "refused", reason: "turn_running", keys: [] });
+    expect(pane.calls).toEqual([]);
+  });
+
+  test("an unread version keeps /goal pause held on the real screen: the list applies only where the turn is trusted", async () => {
+    const holds = new HoldStore(join(dir, "held-unread"), () => 1_000_000);
+    const pane = replay(PAUSE, "/goal pause");
+    const made = rig({ pane, harness: "omp", version: "no version here", holds });
+    const answer = await made.send("/goal pause", { mode: "command" });
+    expect([answer.receipt?.outcome, answer.receipt?.keys]).toEqual(["held", []]);
+    expect(pane.calls).toEqual([]);
   });
 });
 
@@ -5402,7 +5810,7 @@ describe("a send at a box that is not free is held, not refused (2026-10-17 fiel
     r.pane.box = "half a thought";
     r.pane.dialog = DIALOG;
     const answer = await r.send("/compact", { id: "box-0000008", mode: "replace" });
-    expect(answer.receipt?.outcome).toBe("refused");
+    expect(answer.receipt).toMatchObject({ outcome: "refused", reason: "not_free" });
     expect(r.holds.list()).toEqual([]);
     // The same Replace with a plain text is held.
     const plain = await r.send("a plain thought", { id: "box-0000009", mode: "replace" });
@@ -6324,7 +6732,8 @@ describe("omp 18.11's box composer (issue 497)", () => {
     };
     pane.afterInput = (p, what) => {
       if (taken === null || (what !== "keys:Enter" && what !== "keys:ctrl+q")) return;
-      if (options.running === true) above.push(`  1. ${taken}`, "  └ Alt+↑ to edit");
+      // OMP's queue block, header first (omp--v18-6-queue-after): the queued row reads only under it.
+      if (options.running === true) above.push(" After yield · 1", `   1. ${taken}`, "   └ Alt+↑ to edit");
       else above.push(` ${taken.replace(/\n/gu, " ")}`, "");
       taken = null;
       p.box = "";
@@ -6533,6 +6942,18 @@ describe("S1 reads the turn again before the commit key (PR 491): a turn starts 
     expect({ steered: pane.steered, outcome: answer.receipt?.outcome }).toEqual({ steered: [], outcome: "typed_not_submitted" });
   });
 
+  test("omp: /goal pause typed on an idle box, a turn starts while it goes in (the status row's spinner): it takes Enter, which OMP runs at once, never steering", async () => {
+    const { pane, send } = omp({ version: "18.12.2" });
+    pane.runsAtOnce = ["/goal"];
+    pane.showWorking = false;
+    pane.afterInput = (_p, what) => {
+      if (what === "type:/goal pause" || what === "paste:/goal pause") pane.inTurn = true;
+    };
+    const answer = await send("/goal pause", { mode: "command" });
+    expect({ steered: pane.steered, ran: pane.ran, outcome: answer.receipt?.outcome, key: answer.receipt?.keys.at(-1) }).toEqual({ steered: [], ran: ["/goal pause"], outcome: "sent", key: "Enter" });
+    expect(answer.receipt?.queued).toBeUndefined();
+  });
+
   test("codex: /new (never held) typed on an idle box, a turn starts while it goes in: no Enter into the turn", async () => {
     const pane = new FakePane("codex");
     const { send } = rig({ pane, harness: "codex", version: "0.159.2" });
@@ -6636,7 +7057,7 @@ describe("S1 reads the turn again before the commit key (PR 491): a turn starts 
 describe("pi under pi-powerline-footer's inset editor (issue 544, live 2026-10-20)", () => {
   // eslint-disable-next-line no-control-regex
   const plain = (row: string): string => row.replace(/\u001b\[[0-9;:]*m/gu, "");
-  const capture = (name: string): string[] => readFileSync(join(import.meta.dir, `../../web/src/fixtures/panes/${name}`), "utf8").split("\n");
+  const capture = (name: string): string[] => readFileSync(join(import.meta.dir, `../../web/src/fixtures/panes/${name}`), "utf8").split(/\r?\n/u);
   const GLYPH = " \u001b[38;2;200;200;200m>\u001b[39m";
   const WIDGET = " \u001b[38;5;244m↳\u001b[39m \u001b[38;5;244mReply with exactly DONE-1 and nothing else.\u001b[39m";
   const INSET_WRAP = 112;
@@ -6733,4 +7154,366 @@ describe("pi under pi-powerline-footer's inset editor (issue 544, live 2026-10-2
       neverEscape(pane);
     });
   }
+});
+
+// M69 spec 02: the steer, replayed from real captures of pi 1.3.0, Codex 0.164.0 and OMP 18.6.1 (lab
+// 2026-10-23, web/src/fixtures/panes/*-{steer,queue}-*--w120.txt). Each read answers with the capture
+// the lab took at that point: the text typed, then one capture per read after the commit key (the last
+// one stands for every later read). The empty box and the probe are the typed capture with the line
+// taken out of the box, or the probe put in its place.
+describe("steer or queue (M69), replayed from the real captures (lab 2026-10-23)", () => {
+  const PANES = join(import.meta.dir, "../../web/src/fixtures/panes");
+  const LINE = "also say hello at the end";
+  const capture = (name: string): string => readFileSync(join(PANES, `${name}--w120.txt`), "utf8");
+  // eslint-disable-next-line no-control-regex
+  const plainRow = (row: string): string => row.replace(/\u001b\[[0-9;:]*m/gu, "");
+  /** The capture with the box's text (the line's last place on the screen) replaced. */
+  const inBox = (screen: string, text: string): string => {
+    const at = screen.lastIndexOf(LINE);
+    return screen.slice(0, at) + text + screen.slice(at + LINE.length);
+  };
+  /** The capture without the rows whose plain text holds one of these. */
+  const without = (screen: string, rows: readonly string[]): string =>
+    screen
+      .split("\n")
+      .filter((row) => !rows.some((part) => plainRow(row).includes(part)))
+      .join("\n");
+
+  interface Replayed {
+    pane: FakePane;
+    /** Each text write and key with the rig's clock when it went in. */
+    log: [string, number][];
+  }
+  /** `typedName` names a capture, or is a whole screen built from captures (it holds a newline). */
+  const replay = (typedName: string, after: readonly string[], clock: { now: number }, line = LINE): Replayed => {
+    const lab = typedName.includes("\n") ? typedName : capture(typedName);
+    const typed = line === LINE ? lab : inBox(lab, line);
+    const pane = new FakePane("generic");
+    const log: [string, number][] = [];
+    let committed = false;
+    let read = 0;
+    pane.afterInput = (_p, what) => {
+      log.push([what, clock.now]);
+      if (what.startsWith("keys:") && what !== "keys:Backspace") committed = true;
+    };
+    pane.beforeRead = (p) => {
+      if (committed) p.fixed = after[Math.min(read++, after.length - 1)]!;
+      else if (p.box === "") p.fixed = inBox(lab, "");
+      else if (p.box === PROBE) p.fixed = inBox(lab, PROBE);
+      else if (p.box === line) p.fixed = typed;
+      else throw new Error(`the lab never saw the box hold ${JSON.stringify(p.box)}`);
+    };
+    return { pane, log };
+  };
+  const steerOn = async (
+    harness: string,
+    version: string,
+    typedName: string,
+    after: readonly string[],
+    over: Partial<SendRequest> = { when: "steer", fromPhone: true },
+    holds?: HoldStore,
+    line = LINE,
+  ): Promise<{ answer: SendAnswer } & Replayed & { clock: { now: number } }> => {
+    const clock = { now: 1_000_000 };
+    const replayed = replay(typedName, after, clock, line);
+    const made = rig({ pane: replayed.pane, harness, version, clock, holds });
+    return { answer: await made.send(line, over), clock, ...replayed };
+  };
+  /** The capture with each row whose plain text, trimmed, matches `pick` replaced by `row`. */
+  const swapRow = (screen: string, pick: (plain: string) => boolean, row: string): string =>
+    screen
+      .split("\n")
+      .map((at) => (pick(plainRow(at).trim()) ? row : at))
+      .join("\n");
+  const STEER = { when: "steer", fromPhone: true } as const;
+
+  test("pi 1.3.0: Enter after the text; no row at 0.4 s, the Steering row at 1.2 s: steered", async () => {
+    const { answer, pane } = await steerOn("pi", "1.3.0", "pi--v130-steer-typed", [capture("pi--v130-steer-after-now"), capture("pi--v130-steer-after")]);
+    expect(answer.receipt).toMatchObject({ outcome: "steered", keys: ["probe", "Backspace", "Enter"], version: "1.3.0" });
+    expect(answer.receipt?.queued).toBeUndefined();
+    expect(answer.receipt?.reason).toBeUndefined();
+    expect(pane.keysSeen).not.toContain("alt+Enter");
+    neverEscape(pane);
+  });
+
+  // Live rerun 2026-10-23: with a follow-up queued first, pi draws `Steering: say banana`, then
+  // `Follow-up: ok`, then the hint. The block witness read the hint right under the Steering row only,
+  // so the receipt said unknown and kept the draft, and a resend would have steered twice.
+  test("pi 1.3.0: a steer after a queued follow-up, its `Follow-up:` row between the Steering row and the hint: steered", async () => {
+    const after = capture("pi--v130-steer-after-queued");
+    expect(after.split("\n").map(plainRow).filter((row) => /^\s*(?:Steering|Follow-up): /u.test(row)).map((row) => row.trim())).toEqual(["Steering: say banana", "Follow-up: ok"]);
+    const { answer, pane } = await steerOn("pi", "1.3.0", "pi--v130-steer-typed", [capture("pi--v130-steer-after-now"), after], STEER, undefined, "say banana");
+    expect(answer.receipt).toMatchObject({ outcome: "steered", keys: ["probe", "Backspace", "Enter"], version: "1.3.0" });
+    expect(answer.receipt?.queued).toBeUndefined();
+    expect(pane.keysSeen).not.toContain("alt+Enter");
+    neverEscape(pane);
+  });
+
+  test("Codex 0.164.0: one second between the text and Enter, the steer header at 0.4 s: steered", async () => {
+    const { answer, pane, log } = await steerOn("codex", "0.164.0", "codex--v0164-steer-typed", [capture("codex--v0164-steer-after-now")]);
+    expect(answer.receipt).toMatchObject({ outcome: "steered", keys: ["probe", "Backspace", "Enter"] });
+    expect(pane.keysSeen).not.toContain("Tab");
+    const wrote = log.find(([what]) => what === `paste:${LINE}`)![1];
+    const entered = log.find(([what]) => what === "keys:Enter")![1];
+    expect(entered - wrote).toBeGreaterThanOrEqual(1000);
+  });
+
+  test("Codex 0.164.0: no witness at 0.4 s or 1.2 s, the line as `› <line>` in the transcript at 2 s: steered", async () => {
+    const after = capture("codex--v0164-steer-after");
+    const bare = without(after, [`› ${LINE}`]);
+    expect(bare.split("\n").length).toBe(after.split("\n").length - 1);
+    const { answer } = await steerOn("codex", "0.164.0", "codex--v0164-steer-typed", [bare, bare, after]);
+    expect(answer.receipt).toMatchObject({ outcome: "steered", keys: ["probe", "Backspace", "Enter"] });
+  });
+
+  test("OMP 18.6.1: the box still holds the line at 0.4 s, the backgrounded tool and the line in the transcript at 1.2 s: steered", async () => {
+    const { answer, pane } = await steerOn("omp", "18.6.1", "omp--v18-6-steer-typed", [capture("omp--v18-6-steer-after-now"), capture("omp--v18-6-steer-after")]);
+    expect(answer.receipt).toMatchObject({ outcome: "steered", keys: ["probe", "Backspace", "Enter"] });
+    expect(pane.keysSeen).not.toContain("ctrl+q");
+  });
+
+  // Live rerun 2026-10-23: a steer while OMP streams waits for the next step in a block `Steering · 1`
+  // / `1. <line>` / `└ Alt+↑ to edit`, the rows and hint of OMP's queue under another header. The
+  // queued row read the block without its header, so the receipt said sent and queued ("Queued
+  // instead") although OMP steered.
+  test("OMP 18.6.1: the `Steering · 1` block over the line: steered, not queued", async () => {
+    const after = capture("omp--v18-6-steer-pending-block");
+    expect(after.split("\n").map((row) => plainRow(row).trim())).toEqual(expect.arrayContaining(["Steering · 1", "1. say banana", "└ Alt+↑ to edit"]));
+    const { answer, pane } = await steerOn("omp", "18.6.1", "omp--v18-6-steer-typed", [after], STEER, undefined, "say banana");
+    expect(answer.receipt).toMatchObject({ outcome: "steered", keys: ["probe", "Backspace", "Enter"] });
+    expect(answer.receipt?.queued).toBeUndefined();
+    expect(pane.keysSeen).not.toContain("ctrl+q");
+  });
+
+  // Live rerun 2026-10-23, second pass: with `ok` queued first, a steer draws its `Steering · 1` block
+  // over the queue's `After yield · 1` block, and one `└ Alt+↑ to edit` hint stands under both. The
+  // steer witness read up from the hint, took ` After yield · 1` for a wrapped row of `1. ok` and
+  // stopped at `Steering · 1` with nothing found: unknown, the draft kept, a resend would steer twice.
+  test("OMP 18.6.1: a steer after a queued `ok`, its `Steering · 1` block over the `After yield · 1` block, one hint: steered", async () => {
+    const after = capture("omp--v18-6-steer-over-queued");
+    const { answer, pane } = await steerOn("omp", "18.6.1", "omp--v18-6-steer-typed", [after], STEER, undefined, "say banana");
+    expect(answer.receipt).toMatchObject({ outcome: "steered", keys: ["probe", "Backspace", "Enter"] });
+    expect(answer.receipt?.queued).toBeUndefined();
+    expect(answer.receipt?.reason).toBeUndefined();
+    expect(pane.keysSeen).not.toContain("ctrl+q");
+  });
+
+  test("OMP 18.6.1: the same stacked screen after the queue key for `ok`: sent, queued (the After yield block is still read)", async () => {
+    const { answer } = await steerOn("omp", "18.6.1", "omp--v18-6-queue-typed", [capture("omp--v18-6-steer-over-queued")], {}, undefined, "ok");
+    expect(answer.receipt).toMatchObject({ outcome: "sent", queued: true });
+    expect(answer.receipt?.keys.at(-1)).toBe("ctrl+q");
+  });
+
+  test("OMP 18.6.1: `ok` queued already and steered again; the stacked screen's `ok` is the After yield block's: no steer", async () => {
+    const stacked = capture("omp--v18-6-steer-over-queued").split("\n");
+    const block = stacked.filter((row) => /^\s*(?:After yield · 1|1\. ok|└ Alt\+↑ to edit)\s*$/u.test(plainRow(row)));
+    expect(block).toHaveLength(3);
+    // The queue-typed capture with that block over its spinner row: `ok` is queued before the steer.
+    const typed = capture("omp--v18-6-queue-typed").split("\n");
+    const spinner = typed.findIndex((row) => plainRow(row).includes("Running counting loop"));
+    const before = [...typed.slice(block.length + 1, spinner), ...block, "", ...typed.slice(spinner)].join("\n");
+    const { answer } = await steerOn("omp", "18.6.1", before, [capture("omp--v18-6-steer-over-queued")], STEER, undefined, "ok");
+    expect(answer.receipt?.outcome).not.toBe("steered");
+  });
+
+  test("OMP 18.6.1: the queue's `After yield · 1` block after a steer key: sent, queued", async () => {
+    const { answer } = await steerOn("omp", "18.6.1", "omp--v18-6-queue-typed", [capture("omp--v18-6-queue-after-now"), capture("omp--v18-6-queue-after")]);
+    expect(answer.receipt).toMatchObject({ outcome: "sent", queued: true, keys: ["probe", "Backspace", "Enter"] });
+  });
+
+  test("OMP 18.6.1 without a steer: the queue key, `After yield · 1` over the line: sent, queued", async () => {
+    const { answer, pane } = await steerOn("omp", "18.6.1", "omp--v18-6-queue-typed", [capture("omp--v18-6-queue-after-now"), capture("omp--v18-6-queue-after")], {});
+    expect(answer.receipt).toMatchObject({ outcome: "sent", queued: true });
+    expect(answer.receipt?.keys.at(-1)).toBe("ctrl+q");
+    expect(pane.keysSeen).not.toContain("Enter");
+  });
+
+  test("OMP: the queue's rows and hint under no header are neither queued nor a steer block", async () => {
+    const after = without(capture("omp--v18-6-queue-after"), ["After yield"]);
+    const { answer } = await steerOn("omp", "18.6.1", "omp--v18-6-queue-typed", [after]);
+    expect(answer.receipt?.queued).toBeUndefined();
+    expect(answer.receipt?.outcome).not.toBe("steered");
+  });
+
+  test("OMP: the line in the transcript alone, with no backgrounded tool, is a steer too", async () => {
+    const after = without(capture("omp--v18-6-steer-after"), ["Backgrounded early to handle an incoming message"]);
+    const lines = after.split("\n").map((row) => plainRow(row).trimEnd());
+    expect(lines.some((row) => row.includes("Backgrounded early"))).toBe(false);
+    const { answer } = await steerOn("omp", "18.6.1", "omp--v18-6-steer-typed", [after]);
+    expect(answer.receipt?.outcome).toBe("steered");
+  });
+
+  // A transcript row or a marker counts only once the box let the text go (review before the tag): a
+  // short text is also a line the agent may write, and a marker does not say which text went in.
+  test("OMP, the short text `ok` still in the box while the agent writes the line ` ok`: not steered, typed_not_submitted at the deadline", async () => {
+    const after = swapRow(inBox(capture("omp--v18-6-steer-after-now"), "ok"), (plain) => plain === "- name: null", " ok");
+    expect(after.split("\n").filter((row) => plainRow(row) === " ok")).toHaveLength(1);
+    const { answer } = await steerOn("omp", "18.6.1", "omp--v18-6-steer-typed", [after], STEER, undefined, "ok");
+    expect(answer.receipt).toMatchObject({ outcome: "typed_not_submitted", reason: "submit_failed", keys: ["probe", "Backspace", "Enter"] });
+  });
+
+  test("OMP, the short text `ok`: the line in the transcript and the box empty: steered", async () => {
+    const after = without(inBox(capture("omp--v18-6-steer-after"), "ok"), ["Backgrounded early to handle an incoming message"]);
+    expect(after.split("\n").filter((row) => plainRow(row).trimEnd() === " ok")).toHaveLength(1);
+    const { answer } = await steerOn("omp", "18.6.1", "omp--v18-6-steer-typed", [after], STEER, undefined, "ok");
+    expect(answer.receipt).toMatchObject({ outcome: "steered", keys: ["probe", "Backspace", "Enter"] });
+  });
+
+  test("OMP: the backgrounded tool while the line is still in the box: not steered, typed_not_submitted", async () => {
+    const marker = capture("omp--v18-6-steer-after")
+      .split("\n")
+      .find((row) => plainRow(row).includes("Backgrounded early to handle an incoming message"))!;
+    const after = swapRow(capture("omp--v18-6-steer-after-now"), (plain) => plain.includes("⟦Timeout: 60s⟧"), marker);
+    expect(after).toContain(LINE);
+    const { answer } = await steerOn("omp", "18.6.1", "omp--v18-6-steer-typed", [after]);
+    expect(answer.receipt).toMatchObject({ outcome: "typed_not_submitted", reason: "submit_failed" });
+  });
+
+  test("OMP: the backgrounded tool and the box empty, the transcript row not drawn yet: steered", async () => {
+    const after = without(capture("omp--v18-6-steer-after"), [LINE]);
+    expect(after).toContain("Backgrounded early to handle an incoming message");
+    const { answer } = await steerOn("omp", "18.6.1", "omp--v18-6-steer-typed", [after]);
+    expect(answer.receipt?.outcome).toBe("steered");
+  });
+
+  test("pi: the Steering block counts as drawn, the box check does not apply to a block witness", async () => {
+    const typedRows = capture("pi--v130-steer-typed").split("\n");
+    const rows = capture("pi--v130-steer-after").split("\n");
+    const box = rows.findIndex((row, at) => at > 0 && plainRow(rows[at - 1]!).includes("Working") && plainRow(row).trim() === "");
+    expect(box).toBeGreaterThan(0);
+    rows[box] = typedRows.find((row) => plainRow(row).startsWith(LINE))!;
+    const { answer } = await steerOn("pi", "1.3.0", "pi--v130-steer-typed", [rows.join("\n")]);
+    expect(answer.receipt?.outcome).toBe("steered");
+  });
+
+  test("the harness's queued row shows instead of the steer witness: sent, queued", async () => {
+    const { answer } = await steerOn("pi", "1.3.0", "pi--v130-steer-typed", [capture("pi--v130-queue-after-now"), capture("pi--v130-queue-after")]);
+    expect(answer.receipt).toMatchObject({ outcome: "sent", queued: true, keys: ["probe", "Backspace", "Enter"] });
+  });
+
+  test("the line still in the box after the last read: typed_not_submitted, offered Submit and Discard", async () => {
+    const { answer } = await steerOn("omp", "18.6.1", "omp--v18-6-steer-typed", [capture("omp--v18-6-steer-after-now")]);
+    expect(answer.receipt).toMatchObject({ outcome: "typed_not_submitted", reason: "submit_failed", keys: ["probe", "Backspace", "Enter"] });
+    expect(answer.offers).toEqual(["submit", "discard", "keys"]);
+  });
+
+  test("an empty box and no row after the last read: unknown(no_evidence)", async () => {
+    const { answer } = await steerOn("pi", "1.3.0", "pi--v130-steer-typed", [capture("pi--v130-steer-after-now")]);
+    expect(answer.receipt).toMatchObject({ outcome: "unknown", reason: "no_evidence", keys: ["probe", "Backspace", "Enter"] });
+  });
+
+  test("when absent, pi in a turn takes today's path: the queue key, never Enter, sent and queued", async () => {
+    const { answer, pane } = await steerOn("pi", "1.3.0", "pi--v130-queue-typed", [capture("pi--v130-queue-after-now"), capture("pi--v130-queue-after")], {});
+    expect(answer.receipt).toMatchObject({ outcome: "sent", queued: true, keys: ["probe", "Backspace", "alt+Enter"] });
+    expect(pane.keysSeen).not.toContain("Enter");
+  });
+
+  test("a steer on an idle turn goes as a plain send: the submit key, receipt sent", async () => {
+    const r = rig({ pane: new FakePane("codex"), harness: "codex", version: "0.164.0" });
+    const answer = await r.send("tidy the parser please", { when: "steer", fromPhone: true });
+    expect(answer.receipt).toMatchObject({ outcome: "sent" });
+    expect(answer.receipt?.keys.at(-1)).toBe("Tab");
+    expect(r.pane.keysSeen).not.toContain("Enter");
+  });
+
+  test("Claude has no steer key: steer_unsupported, nothing read past S0 typed", async () => {
+    const r = rig();
+    r.pane.over = ["✻ Working… (3s · esc to interrupt)"];
+    const answer = await r.send("also say hello", { when: "steer", fromPhone: true });
+    expect(answer.receipt).toMatchObject({ outcome: "refused", reason: "steer_unsupported", keys: [] });
+    expect(r.pane.calls).toEqual([]);
+  });
+
+  test("an unread version is not trusted with a turn: steer_unsupported", async () => {
+    const { answer, pane } = await steerOn("pi", "no version here", "pi--v130-steer-typed", [capture("pi--v130-steer-after")]);
+    expect(answer.receipt).toMatchObject({ outcome: "refused", reason: "steer_unsupported", keys: [] });
+    expect(pane.calls).toEqual([]);
+  });
+
+  test("a command never steers: steer_unsupported before any read", async () => {
+    const { answer, pane } = await steerOn("pi", "1.3.0", "pi--v130-steer-typed", [capture("pi--v130-steer-after")], { when: "steer", fromPhone: true, mode: "command" });
+    expect(answer.receipt).toMatchObject({ outcome: "refused", reason: "steer_unsupported", keys: [] });
+    expect(pane.readsSeen).toBe(0);
+  });
+
+  test("a walky talky delivery asking to steer is refused steer_not_allowed, never typed and never held", async () => {
+    const holds = new HoldStore(join(dir, "held-walky-steer"), () => 1_000_000);
+    const walky = { when: "steer" as const, draftHolds: true, holdUntil: 2_000_000 };
+    const { answer, pane } = await steerOn("pi", "1.3.0", "pi--v130-steer-typed", [capture("pi--v130-steer-after")], walky, holds);
+    expect(answer.receipt).toMatchObject({ outcome: "refused", reason: "steer_not_allowed", keys: [] });
+    expect(pane.calls).toEqual([]);
+    expect(pane.readsSeen).toBe(0);
+    expect(holds.list()).toEqual([]);
+  });
+
+  // The S1-idle fallback (review before the tag): S0 read the turn running, the turn ended while the
+  // text went in, so the steer goes as the plain send S0's read put it on. On pi and Codex the key of
+  // that path is the profile's queue key, which is also its submit key: read from the profile here.
+  for (const [harness, version] of [["pi", "0.87.1"], ["codex", "0.164.0"]] as const) {
+    test(`${harness}: the turn ends while the text goes in: the steer presses keys.submit, the profile's queue key, and says sent`, async () => {
+      const keys = loadProfiles().get(harness)!.keys;
+      expect(keys.queueKey).toBeDefined();
+      expect([keys.queueKey]).toEqual([...keys.submit]);
+      const pane = harness === "pi" ? new PiPane(keys.queueKey!) : new FakePane("codex");
+      if (pane instanceof PiPane) pane.inTurn = true;
+      else pane.over = ["• Working (4s • esc to interrupt)"];
+      pane.afterInput = (p, what) => {
+        if (!what.startsWith("paste:") && !what.startsWith("type:")) return;
+        if (what === `paste:${PROBE}` || what === `type:${PROBE}`) return;
+        if (p instanceof PiPane) p.inTurn = false;
+        else p.over = [];
+      };
+      const answer = await rig({ pane, harness, version }).send(LINE, { when: "steer", fromPhone: true });
+      expect(answer.receipt).toMatchObject({ outcome: "sent" });
+      expect(answer.receipt?.keys.at(-1)).toBe(keys.submit[0]);
+      expect(pane.keysSeen).not.toContain("Enter");
+    });
+  }
+
+  // Re-read before the key (counsel on the Edge 5 candidate): the read after the steer pause and
+  // before the steer key refuses the press when a dialog drew over the typed text. The key would
+  // answer the dialog, so no key leaves and the receipt says why.
+  for (const [harness, version, typedName, dialog] of [
+    ["codex", "0.164.0", "codex--v0164-steer-typed", "codex--v0156-approval-exec-2opt.txt"],
+    ["omp", "18.6.1", "omp--v18-6-steer-typed", "omp--v18-4-approval-bash.txt"],
+  ] as const) {
+    test(`${harness}: an approval dialog draws between the text and the steer key: no key, typed_not_submitted(dialog_open)`, async () => {
+      const clock = { now: 1_000_000 };
+      const replayed = replay(typedName, [capture(`${typedName.replace("-typed", "-after")}`)], clock);
+      const shown = replayed.pane.beforeRead!;
+      const approval = readFileSync(join(PANES, dialog), "utf8");
+      replayed.pane.beforeRead = async (p, n) => {
+        await shown(p, n);
+        if (p.box === LINE) p.fixed = approval;
+      };
+      const made = rig({ pane: replayed.pane, harness, version, clock });
+      const answer = await made.send(LINE, STEER);
+      expect(answer.receipt).toMatchObject({ outcome: "typed_not_submitted", reason: "dialog_open" });
+      expect(replayed.pane.keysSeen).not.toContain("Enter");
+      expect(answer.receipt?.keys).toEqual(["probe", "Backspace"]);
+      neverEscape(replayed.pane);
+    });
+  }
+
+  test("pi: the box is gone on the read before the steer key: no key, typed_not_submitted(unreadable)", async () => {
+    const clock = { now: 1_000_000 };
+    const replayed = replay("pi--v130-steer-typed", [capture("pi--v130-steer-after")], clock);
+    const shown = replayed.pane.beforeRead!;
+    replayed.pane.beforeRead = async (p, n) => {
+      await shown(p, n);
+      if (p.box === LINE) p.fixed = "just some words\non a plain screen\n";
+    };
+    const answer = await rig({ pane: replayed.pane, harness: "pi", version: "1.3.0", clock }).send(LINE, STEER);
+    expect(answer.receipt).toMatchObject({ outcome: "typed_not_submitted", reason: "unreadable", keys: ["probe", "Backspace"] });
+    expect(replayed.pane.keysSeen).not.toContain("Enter");
+  });
+
+  test("a steer refused at S0 is never held, even with a hold queue", async () => {
+    const holds = new HoldStore(join(dir, "held-steer"), () => 1_000_000);
+    const r = rig({ holds });
+    r.pane.over = ["✻ Working… (3s · esc to interrupt)"];
+    const answer = await r.send("also say hello", { when: "steer", fromPhone: true });
+    expect(answer.receipt?.outcome).toBe("refused");
+    expect(holds.list()).toEqual([]);
+  });
 });
