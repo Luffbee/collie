@@ -25,7 +25,7 @@ import { join } from "node:path";
 import { asJsonNumber, asJsonObject, asJsonString, type JsonValue } from "../../web/src/lib/json.ts";
 import { ASK_ID, ASK_OUTCOMES, ASK_REASONS, type AskReceipt } from "../../web/src/lib/surface/ask.ts";
 import { ASK_CHANNELS } from "../../web/src/lib/surface/surface.ts";
-import { readSendCap, readSurfaceWords, RECEIPT_DETAIL_MAX, REQUEST_ID, SEND_MODES, SEND_OUTCOMES, SEND_REASONS, type ReadMark, type SendMode, type SendReceipt, type SendStep } from "../../web/src/lib/surface/send.ts";
+import { readSendCap, readSurfaceWords, RECEIPT_DETAIL_MAX, REQUEST_ID, SEND_LATES, SEND_MODES, SEND_OUTCOMES, SEND_REASONS, type ReadMark, type SendMode, type SendReceipt, type SendStep } from "../../web/src/lib/surface/send.ts";
 import { SENT_MAX_LINE, sentLineOf } from "../secret-line.ts";
 
 /** How long a settled request is kept, so a retry after a long network gap still finds its receipt. */
@@ -110,7 +110,9 @@ const ASK_FILE = /^ask\.(ask-[0-9a-f]{14})\.json$/;
 
 const PHASES = ["accepted", "submit-sent", "settled", "held"] as const;
 const PROFILE_STATUSES = ["verified", "provisional", "revoked"] as const;
-const STEPS = ["s0", "clear", "probe", "write", "s1", "commit", "s2"] as const;
+/** The longest `binary` path a stored receipt keeps; a longer one is dropped. */
+const RECEIPT_BINARY_MAX = 4_096;
+const STEPS = ["profile", "settle", "s0", "proof", "clear", "probe", "write", "s1", "commandSettle", "commit", "s2"] as const;
 
 function pick<const T extends string>(value: JsonValue | undefined, allowed: readonly T[]): T | undefined {
   return allowed.find((word) => word === value);
@@ -193,9 +195,15 @@ function parseReceipt(value: JsonValue | undefined): SendReceipt | undefined {
     outcome,
   };
   const whole: ReceiptDraft = { ...receipt };
+  // `binary` is lenient like `detail`: a value that is not a path is dropped, and the receipt stays.
+  const binary = node.binary === undefined ? undefined : asJsonString(node.binary);
+  if (binary !== undefined && binary.length > 0 && binary.length <= RECEIPT_BINARY_MAX) whole.binary = binary;
   if (reason !== undefined) whole.reason = reason;
   if (cap !== undefined) whole.cap = cap;
   if (node.queued === true) whole.queued = true;
+  // `late` is lenient like `detail`: a word this module did not write is dropped, and the receipt stays.
+  const late = node.late === undefined ? undefined : pick(node.late, SEND_LATES);
+  if (late !== undefined) whole.late = late;
   if (acknowledged !== undefined) whole.acknowledged = acknowledged;
   if (detail !== undefined) whole.detail = detail;
   if (saw !== undefined) whole.saw = saw;
@@ -385,8 +393,8 @@ export class RequestStore {
 
   /**
    * A settled `sent` or `unknown` that a matching prompt edge confirmed (M56 spec 11) becomes
-   * `effective`, its reason dropped. That is the one change a settled record can take, and it takes it
-   * once. Returns the outcome it had, or null when the record is not one a prompt edge may close.
+   * `effective`, its reason dropped. That and {@link markReturned} are the changes a settled record can
+   * take, each once. Returns the outcome it had, or null when the record is not one a prompt edge may close.
    */
   markEffective(id: string): "sent" | "unknown" | null {
     const known = this.get(id);
@@ -396,6 +404,22 @@ export class RequestStore {
     const { reason: _dropped, ...rest } = receipt;
     this.write({ ...known, receipt: { ...rest, outcome: "effective" } });
     return receipt.outcome;
+  }
+
+  /**
+   * A settled `sent` receipt that said `queued`, or a `steered` one, gets `late: "returned"` (ADR 0122):
+   * the harness put its text back into the input box, and it never became a prompt. The outcome and
+   * `queued` stay, since both were true when it settled; the mark says what happened after. Taken once.
+   * Returns whether the record took it.
+   */
+  markReturned(id: string): boolean {
+    const known = this.get(id);
+    const receipt = known?.receipt;
+    if (known === null || known.phase !== "settled" || receipt === undefined) return false;
+    const waited = (receipt.outcome === "sent" && receipt.queued === true) || receipt.outcome === "steered";
+    if (!waited || receipt.late !== undefined) return false;
+    this.write({ ...known, receipt: { ...receipt, late: "returned" } });
+    return true;
   }
 
   /**
@@ -411,6 +435,13 @@ export class RequestStore {
     return held;
   }
 
+  /** A held request's pane moved to an agent its own profile names: the record takes the pane's new generation. */
+  moveHeld(id: string, paneGeneration: string): void {
+    const known = this.get(id);
+    if (known === null || known.phase !== "held" || known.paneGeneration === paneGeneration) return;
+    this.write({ ...known, paneGeneration });
+  }
+
   /** A held request's release starts: it runs again as accepted, bounded from now. Null when it is not held. */
   rearm(id: string, paneGeneration?: string): SendRecord | null {
     const known = this.get(id);
@@ -422,7 +453,7 @@ export class RequestStore {
     return armed;
   }
 
-  /** The request's end: its receipt. A settled record changes once at most after this (`markEffective`). */
+  /** The request's end: its receipt. A settled record changes once at most after this (`markEffective`, or `markReturned`). */
   settle(id: string, receipt: SendReceipt): SendRecord | null {
     const known = this.get(id);
     if (known === null) return null;

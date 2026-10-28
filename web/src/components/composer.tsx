@@ -1,11 +1,11 @@
 import { forwardRef, useContext, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { ChangeEvent, ClipboardEvent, CSSProperties, ReactNode } from "react";
+import type { ChangeEvent, ClipboardEvent, CSSProperties, MouseEvent, ReactNode } from "react";
 import { useRevalidator } from "react-router";
 import { Check, FileText, Image, Keyboard, ListEnd, ListTodo, Loader2, Mic, Monitor, Navigation, Paperclip, Pencil, Send, Settings2, Slash, Square, Terminal, TriangleAlert, X, Zap } from "lucide-react";
 
 import { StatusDot } from "@/components/status-badge";
-import { applyDraftFontSize, fontStack, inputFocusZoomsPage, sentSuggestionsOf } from "@/hooks/use-display-prefs";
+import { applyDraftFontSize, fontStack, inputFocusZoomsPage, reportOfferOf, sentSuggestionsOf } from "@/hooks/use-display-prefs";
 import type { DisplayPrefs, Hand } from "@/hooks/use-display-prefs";
 import { usePendingConfirm } from "@/hooks/use-pending-confirm";
 import { useDirectTyping } from "@/hooks/use-direct-typing";
@@ -87,8 +87,10 @@ import { adapterFor } from "@/lib/harness";
 import { useLive } from "@/lib/liveness";
 import { useCatchingUp, useLocked } from "@/lib/idle";
 import { ClearNotice, OfflineDraftNote, TerminalDraftPreview } from "@/components/terminal-draft-preview";
+import { ReportCard } from "@/components/report-card";
 import { textToKeySequence } from "@/lib/key-queue";
 import { isLead, paneScopeKey, scopeKey, type Scope } from "@/lib/scope";
+import { closeTrouble, noteSend, openReport, streakIds, useTroubleOffer } from "@/lib/report/store";
 import { takeBeltIntent } from "@/lib/belt-intent";
 import type { PaneSubagent, PaneTodo } from "@/lib/types";
 import { AgentsSheet, subagentName } from "@/components/agents-sheet";
@@ -154,6 +156,11 @@ interface ComposerProps {
    * the menu has no such row, whatever the harness is.
    */
   canSteer?: boolean | undefined;
+  /**
+   * The pane's Chat holds a returned queued card (ADR 0122): a Stop put a queued message back in the
+   * box. A send refused `draft_present` then points at that card instead of at an unseen draft.
+   */
+  returnedDraft?: boolean;
   /** True for a bare shell pane — tweaks the placeholder copy. */
   isShell: boolean;
   /** The pane's folder, absolute. Sent (M61) lists "This folder" with it; absent, it offers the machine only. */
@@ -449,7 +456,7 @@ interface ClearedDraft {
 
 
 export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Composer(
-  { paneId, instance, surface, unreachableNote, scope, stopOffered = false, agent, canSteer, isShell, cwd, gone, readOnly, composing, onAnswerDialog, dialogCard = false, text, terminalDraft, rawTerminalDraft, prefs, display, onSent, onOpenMessages, held: heldRows, chatEntries, pullHandle, draftNoticeSlot, changesPill, stale, hand = "right", aboveBelt, floatingHint, screen, todos, subagents },
+  { paneId, instance, surface, unreachableNote, scope, stopOffered = false, agent, canSteer, returnedDraft = false, isShell, cwd, gone, readOnly, composing, onAnswerDialog, dialogCard = false, text, terminalDraft, rawTerminalDraft, prefs, display, onSent, onOpenMessages, held: heldRows, chatEntries, pullHandle, draftNoticeSlot, changesPill, stale, hand = "right", aboveBelt, floatingHint, screen, todos, subagents },
   ref,
 ) {
   const revalidator = useRevalidator();
@@ -555,6 +562,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // Compared by VALUE (its cache key), never by object identity: a scope is a value passed as an
   // object, and an identity compare here would re-run the save/restore below on every poll.
   const scopeId = scopeKey(scope);
+  // Report a problem (ADR 0123): this pane's failure streak, and whether this device offers the card.
+  const reportKey = paneScopeKey(scope, paneId);
+  const reportOn = isLead(scope) && reportOfferOf(prefs);
+  const reportCount = useTroubleOffer(reportKey);
   const draftPaneRef = useRef({ scope, scopeId, paneId });
   // THE BELT'S X AND ITS UNDO (M40 spec 04, issue #291). The X empties this box in one tap
   // (`clearByHand`); until the operator's next act the same slot is Undo, and this is what Undo puts
@@ -984,6 +995,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const blockPad = composing ? "pb-2" : "pb-[calc(env(safe-area-inset-bottom)_+_0.5rem)]";
   const blockRef = useRef<HTMLDivElement>(null);
   const openedByKeyboard = useRef(false);
+  // Which mic opened the takeover, so focus returns to that button: the round primary one on an empty
+  // box, or the small one beside Attach while the box holds a draft.
+  const micOpener = useRef<"primary" | "draft">("primary");
   // When the takeover goes away, focus goes back to the round button at the end of the row (the mic,
   // or Send once a transcript landed), but only if focus was on the takeover or nowhere: a pane
   // switch that moved focus elsewhere is not ours to take back.
@@ -1004,7 +1018,11 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     let frame = 0;
     let frames = 0;
     const settle = () => {
-      const target = blockRef.current?.querySelector<HTMLElement>('[data-slot="composer-primary"]');
+      const block = blockRef.current;
+      const target =
+        (micOpener.current === "draft"
+          ? block?.querySelector<HTMLElement>('[data-slot="composer-mic-draft"]')
+          : null) ?? block?.querySelector<HTMLElement>('[data-slot="composer-primary"]');
       if (!target) return;
       const now = document.activeElement;
       if (now !== null && now !== document.body && !blockRef.current?.contains(now)) return;
@@ -1267,6 +1285,18 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
       />
     ) : null;
 
+  // Report a problem (ADR 0123): after three failed sends in a row on this pane, a card offers the report
+  // sheet. It floats with the others, under the held card, so it moves nothing; the cross keeps it quiet
+  // until the streak ends. Off on a crew member's pane (the next slice) and when Settings turned it off.
+  const reportCard =
+    reportOn && reportCount > 0 ? (
+      <ReportCard
+        count={reportCount}
+        onReport={() => openReport({ paneId, scope, requestIds: streakIds(reportKey) })}
+        onClose={() => closeTrouble(reportKey)}
+      />
+    ) : null;
+
   // The place both float in: a column, the held card on top and the draft or offline notice nearest
   // the belt, with a small gap. Pass-through wrapper (`pointer-events-none`); each card takes touches
   // back. In the pane view's slot the slot does the positioning; alone, the column floats above this
@@ -1281,7 +1311,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
       <ClearNotice refusal={clearNote.refusal} onRestore={restoreOpen ? () => void restoreDraft() : null} restoring={restoring} onDismiss={() => setClearNote(null)} />
     ) : null;
   const floating =
-    heldCard !== null || floatingNotice !== null || clearCard !== null || (floatingHint !== undefined && floatingHint !== null) ? (
+    heldCard !== null || reportCard !== null || floatingNotice !== null || clearCard !== null || (floatingHint !== undefined && floatingHint !== null) ? (
       <div
         data-slot="floating-cards"
         className={cn(
@@ -1290,6 +1320,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         )}
       >
         {heldCard}
+        {reportCard}
         {floatingNotice}
         {clearCard}
         {floatingHint}
@@ -1559,6 +1590,11 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         return false;
       }
       const { reply, reading } = res;
+      // Report a problem (ADR 0123): the answer joins this pane's streak. Plain rules over the outcome and
+      // reason (lib/report/trouble.ts); nothing is sent and nothing is retried. This machine's panes only.
+      if (reportOn && reply.outcome !== null) {
+        noteSend(reportKey, paneId, { requestId: res.requestId, outcome: reply.outcome, reason: reply.reason, cap: reply.cap !== null, at: Date.now() });
+      }
       if (reading.clear) {
         setProtocolOffer(null);
         afterVerifiedSend(resend?.shown ?? t, isDraft, verifiedNote(reading.note, when));
@@ -1567,7 +1603,12 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
       // A resend makes no offer: an offer would carry the row's text, which may be masked.
       const offered = reading.offers.length > 0 && resend === undefined;
       setProtocolOffer(offered ? { text: t, isDraft, rowsHash: reply.rowsHash, offers: reading.offers, capAck: reading.cap !== null } : null);
-      setSendRefusal(readingRefusal(reading), reply.surface ?? shownSurface, offered);
+      const refusal = readingRefusal(reading);
+      setSendRefusal(
+        returnedDraft && reading.note === "draft" ? { ...refusal, sentence: translate("composer.protocol.draftIsReturned") } : refusal,
+        reply.surface ?? shownSurface,
+        offered,
+      );
       // An `unknown` outcome is an open question the journal can still answer (#511): remember the
       // send, so its text landing as a user turn retires this notice and the kept draft. A resend
       // carries no text of its own to recognise, so it is never remembered.
@@ -1654,6 +1695,32 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const confirmingSend = sendConfirm.pending === "send";
   // A modal ask owns the agent's keyboard: the Send slot and the placeholder say so (spec 10).
   const askOwnsKeys = slot === "answer" && !direct.active;
+  // The mic beside Attach, for a box that holds a draft or a chip (issue 573): the round button is Send
+  // then, and a second clip is how a person adds to what is already written. Two mics never show at
+  // once. It stays away while the round slot holds a word ("Answer the dialog" / "Really send?"), where
+  // the row is already tight.
+  const draftMicShown = micShown && !direct.active && hasDraft && !askOwnsKeys && !confirmingSend;
+  const micAriaLabel = !micAvailable
+    ? (stt?.reason ?? translate("composer.mic.unavailable"))
+    : recorder.phase === "recording"
+      ? translate("composer.mic.stopAria")
+      : translate("composer.mic.recordAria");
+  const micIcon =
+    recorder.phase === "transcribing" ? (
+      <Loader2 className="size-4 animate-spin" />
+    ) : recorder.phase === "recording" ? (
+      <Square className="size-4 fill-current" />
+    ) : (
+      <Mic className="size-4" />
+    );
+  const micDisabled = !micAvailable || locked || offline || sending || recorder.phase === "transcribing";
+  function onMicClick(e: MouseEvent, opener: "primary" | "draft") {
+    // `detail` is 0 for a click the keyboard made: the takeover then shows its focus mark.
+    openedByKeyboard.current = e.detail === 0;
+    micOpener.current = opener;
+    if (recorder.phase === "recording") recorder.stopAndSend();
+    else recorder.start();
+  }
   // The refusal's reason at the thumb. Not in Type mode, and not beside the password notice, which
   // already says why at this spot. With an ask it stands beside the "Answer the dialog" word: a send
   // that came from a quick reply has no other place to be told.
@@ -1664,8 +1731,22 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const refusalScreen = sendRefusal?.screen === true && screen !== undefined && !screen.on;
   const refusalKeys = way.keysOpen && drawer !== "keys";
   // What the field's placeholder says: the facts first (a pane that is gone, a device that may not
-  // write, a box out of reach), then Type mode, then the ordinary reply or shell line. The placeholder
-  // names no other state: the notices, the Screen pill and the Send slot carry those.
+  // write, a box out of reach), then Type mode, then the shell line, then (M69) the Steer hint while a
+  // turn runs on a harness that can steer, then the ordinary reply line. The placeholder names no other
+  // state: the notices, the Screen pill and the Send slot carry those.
+  //
+  // THE STEER HINT LIVES HERE, NOT IN A ROW OF ITS OWN. It was a line above the box inside a Collapse,
+  // so it opened and closed with every turn and moved the belt and the field (Altan, 2026-10-25: a
+  // composer hint must not shift the layout). A placeholder takes no height of its own, and it goes
+  // when the first character is typed, which is when the operator no longer needs it.
+  // The hint is ONE short sentence so it never wraps at placeholder:text-xs; a wrapped placeholder grows a
+  // `field-sizing-content` field.
+  const steerWords =
+    way.state !== "gone" && way.state !== "readOnly" && way.state !== "unreachable" && !direct.active && !isShell && steerRow;
+  // A box the bridge proved stale (2026-10-25: the screen shows an input box that did not take keys)
+  // says so in the same place, before the Steer hint: a send probes the box first, so the person knows
+  // why a send may come back refused.
+  const staleWords = way.state !== "gone" && way.state !== "readOnly" && way.state !== "unreachable" && !direct.active && !isShell && surface.staleFrame === true;
   const placeholderWords =
     way.state === "gone"
       ? translate("composer.placeholder.gone")
@@ -1677,7 +1758,11 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             ? translate("composer.placeholder.direct")
             : isShell
               ? translate("composer.placeholder.shell")
-              : translate("composer.placeholder.reply");
+              : staleWords
+                ? translate("composer.stale.hint")
+                : steerWords
+                  ? translate("composer.steer.hint")
+                  : translate("composer.placeholder.reply");
 
   // Coalesce revalidations from a burst of key presses, LEADING edge first: the first press in a
   // burst refetches immediately, and only presses that arrive inside the window collapse into one
@@ -2533,14 +2618,6 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             {translate("composer.draft.holdsMask")}
           </p>
         </Collapse>
-        {/* M69: what the plain tap does, and where the other choice is, while a turn runs on a harness
-            that can steer. Only then: a pane without `canSteer` draws nothing here, and a closed
-            Collapse holds no height, so its layout does not move. */}
-        <Collapse open={steerRow && !direct.active}>
-          <p data-slot="composer-steer-hint" className="px-1 pb-1 text-xs leading-snug text-muted-foreground">
-            {translate("composer.steer.hint")}
-          </p>
-        </Collapse>
         {/* ── ONE BOX, ONE ROW: THE FIELD, ATTACH, THE PRIMARY ACTION ──────────────────────
             The field, the attach control and Send used to be three shapes on one line: a
             bordered field with a button tucked into its bottom-right corner, and a round primary
@@ -2715,6 +2792,11 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               // the field's right side takes no padding of its own, and the box's `gap-1` to attach
               // is what keeps the text off it.
               "min-w-0 flex-1 min-h-9 pl-2 py-1.5",
+              // The Steer hint is longer than the reply words, so it is drawn smaller. The FIELD'S HEIGHT
+              // does not change with it: `text-base` gives the field a unitless line-height, so the
+              // placeholder's line box can only shrink (12px x 1.33 against 14-16px x 1.5), and the empty
+              // field is already held at `min-h-9` above (at most 16px x 1.5 + 12px of padding = 36px).
+              (staleWords || steerWords) && "placeholder:text-xs",
               // Mirrored, the field's right side stands against the box's border, so it takes the
               // inset the left used to take from Attach.
               hand === "left" && "pr-2",
@@ -2781,6 +2863,26 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               <Paperclip className="size-4" />
             )}
           </Button>
+          {draftMicShown && (
+            // The second microphone (issue 573), beside Attach and so mirrored with it under
+            // `hand="left"`. It opens the same takeover, and the transcript lands at the caret
+            // through `insertTranscript`; a draft is never sent by voice (`acceptTranscript`).
+            <Button
+              data-slot="composer-mic-draft"
+              type="button"
+              variant="ghost"
+              size="icon"
+              className={cn(TOOLBAR_TAP_TARGET, "size-9 rounded-full text-muted-foreground")}
+              disabled={micDisabled}
+              aria-pressed={recorder.busy}
+              aria-label={micAriaLabel}
+              title={micAvailable ? undefined : stt?.reason}
+              onPointerDown={(e) => e.preventDefault()}
+              onClick={(e) => onMicClick(e, "draft")}
+            >
+              {micIcon}
+            </Button>
+          )}
           {/* The picker, anchored to the BOX so it opens above the whole shape rather than over
               the button that opened it (ui/anchored-menu.tsx carries the measurement, and the
               box's own `relative` is the anchor). It is not anchored to the attach button itself
@@ -2879,42 +2981,26 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             // moment there is anything to send. It used to be a second, permanent control tucked
             // inside the field beside the attach button — deliberately, to avoid a split primary
             // action. The v1 beta said that reads the workflow wrong: you either dictate a message
-            // or you type one, and nobody dictates into the middle of a draft. So the field paid
-            // 36px of its width, on every render, for a control that is only ever wanted on an empty
-            // box. An empty box has no Send either (`send` refuses a blank value), so this branch
-            // takes over a button that could do nothing anyway — it replaces no capability.
+            // or you type one. So the field paid 36px of its width, on every render, for a control
+            // that is mostly wanted on an empty box. An empty box has no Send either (`send` refuses
+            // a blank value), so this branch takes over a button that could do nothing anyway. It
+            // replaces no capability. A box that already holds a draft gets the small mic beside
+            // Attach instead (issue 573), because a second clip is how a person adds to it.
             <Button
               data-slot="composer-primary"
               size="icon"
               variant={recorder.busy ? "destructive" : "default"}
               className={cn(TOOLBAR_TAP_TARGET, "size-9 shrink-0 rounded-full")}
-              disabled={!micAvailable || locked || offline || sending || recorder.phase === "transcribing"}
+              disabled={micDisabled}
               aria-pressed={recorder.busy}
               // The bridge's own words when it cannot serve — the operator's next move is on the
               // host, so the button says what is wrong rather than just refusing.
-              aria-label={
-                !micAvailable
-                  ? (stt?.reason ?? translate("composer.mic.unavailable"))
-                  : recorder.phase === "recording"
-                    ? translate("composer.mic.stopAria")
-                    : translate("composer.mic.recordAria")
-              }
+              aria-label={micAriaLabel}
               title={micAvailable ? undefined : stt?.reason}
               onPointerDown={(e) => e.preventDefault()}
-              onClick={(e) => {
-                // `detail` is 0 for a click the keyboard made: the takeover then shows its focus mark.
-                openedByKeyboard.current = e.detail === 0;
-                if (recorder.phase === "recording") recorder.stopAndSend();
-                else recorder.start();
-              }}
+              onClick={(e) => onMicClick(e, "primary")}
             >
-              {recorder.phase === "transcribing" ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : recorder.phase === "recording" ? (
-                <Square className="size-4 fill-current" />
-              ) : (
-                <Mic className="size-4" />
-              )}
+              {micIcon}
             </Button>
           ) : (
             <Button

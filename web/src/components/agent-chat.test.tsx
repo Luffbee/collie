@@ -4281,6 +4281,31 @@ describe("AgentChat: a new agent pane draws Chat from the first frame", () => {
     swapsOnlyUnderCover(view.frames);
   });
 
+  it("(f) a question no screen reader lifts takes a readable session to the terminal while it asks", async () => {
+    // OpenClaw has a journal reader and no block grammar, as dsh-tui does: its dialogs are never cards.
+    const view = renderShell();
+    await handOver(view, agentOf("openclaw", "working", true));
+    await advance(view, 500);
+    expect(view.container.querySelector('[data-slot="session-stream"]')).not.toBeNull();
+    view.set(agentOf("openclaw", "blocked", true));
+    expect(view.container.querySelector('[data-slot="session-stream"]')).toBeNull();
+    expect(screen.getByText(/recent pane output/)).toBeInTheDocument();
+    view.set(agentOf("openclaw", "working", true));
+    await advance(view, 500);
+    expect(view.container.querySelector('[data-slot="session-stream"]')).not.toBeNull();
+    // The shell's terminal, then Chat, the question's terminal, and Chat again.
+    expect(bodies(view.frames)).toEqual(["terminal", "chat", "terminal", "chat"]);
+  });
+
+  it("(f) a question a screen reader lifts keeps a readable session on Chat", async () => {
+    const view = renderShell();
+    await handOver(view, agentOf("claude", "working", true));
+    await advance(view, 500);
+    view.set(agentOf("claude", "blocked", true));
+    expect(view.container.querySelector('[data-slot="session-stream"]')).not.toBeNull();
+    expect(bodies(view.frames)).toEqual(["terminal", "chat"]);
+  });
+
   it("(e) a device on the terminal sees the terminal throughout, and the cover still lifts once", async () => {
     localStorage.setItem("collie:dash-prefs:v1", JSON.stringify({ paneView: "terminal" }));
     const view = renderShell();
@@ -4599,6 +4624,21 @@ describe("AgentChat — the model label and a footer that already names it", () 
     expect(await screen.findByText("what changed today?")).toBeInTheDocument();
     expect(screen.getByText("[Opus 4.8] ~/webapp · main")).toBeInTheDocument();
     expect(tag(container)).toBeNull();
+  });
+
+  it("with a gauge to draw, the tag names the model beside the dots even while the screen names it", () => {
+    terminal();
+    const footer = pane("codex--v0157-idle.txt");
+    const usage = { context: 42, limits: [{ window: "5h" as const, used: 30 }] };
+    const { container } = renderChat({ text: footer, agent: on("codex", "gpt-6-luna", { effort: "low", usage }) });
+    expect(screen.getAllByText(/GPT-6-Luna low/).length).toBeGreaterThan(0); // the footer names it
+    const shown = tag(container);
+    expect(shown?.querySelector("[aria-hidden]")?.textContent).toContain("gpt-6-luna · low");
+    expect(shown?.querySelectorAll('[data-slot="usage-dots"]').length).toBe(2);
+    cleanup();
+    // No gauge: the model alone would repeat the footer, so there is no tag at all.
+    const bare = renderChat({ text: footer, agent: on("codex", "gpt-6-luna", { usage: {} }) });
+    expect(tag(bare.container)).toBeNull();
   });
 
   it("Chat body, a harness without a lifted footer: nothing on screen names the model, so the label stays", async () => {

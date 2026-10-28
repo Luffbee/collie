@@ -15,6 +15,7 @@ import {
   SEND_OUTCOMES,
   SEND_CAUSES,
   SEND_REASONS,
+  SEND_LATES,
   readSendCap,
   readSurfaceWords,
   RECEIPT_DETAIL_MAX,
@@ -28,7 +29,9 @@ import {
   type SendReceiptRow,
   type SendReceiptsAnswer,
   type SendStep,
+  STALE_SCREEN,
 } from "./surface/send";
+import type { ProfileStatus } from "./surface/profile";
 import { ASK_CHANNELS, type Ask, type AskOption, type Surface, type SurfaceComposer, type SurfaceModal, type SurfaceReason, type SurfaceTurn } from "./surface/surface";
 
 /** What the composer needs of an answer. The receipt's marks and gaps are for the log. */
@@ -50,6 +53,7 @@ export interface SendReply {
   readonly cause: SendCause | null;
 }
 
+const PROFILE_STATUSES: readonly ProfileStatus[] = ["verified", "provisional", "revoked"];
 const OFFERS: readonly SendOffer[] = ["append", "replace", "cancel", "submit", "discard", "commit", "keys"];
 const TURNS: readonly SurfaceTurn[] = ["idle", "running", "unknown"];
 const COMPOSERS: readonly SurfaceComposer[] = ["empty", "draft", "unreachable", "unknown"];
@@ -98,7 +102,9 @@ export function readSurface(value: JsonValue | undefined): Surface | null {
     modal = { ask };
   }
   const reason = pick(node.reason, REASONS);
-  return reason === null ? { revision, turn, modal, composer } : { revision, turn, modal, composer, reason };
+  const read: Surface = reason === null ? { revision, turn, modal, composer } : { revision, turn, modal, composer, reason };
+  // `staleFrame` (2026-10-25): only `true` is a word; anything else is dropped.
+  return node.staleFrame === true ? { ...read, staleFrame: true } : read;
 }
 
 /** The bridge's answer, field by field; null when it is not one (a proxy page, an old bridge). */
@@ -127,7 +133,7 @@ export function readSendReply(body: JsonValue | undefined): SendReply | null {
 /** A row of the list being built, field by field. */
 type RowDraft = { -readonly [K in keyof SendReceiptRow]: SendReceiptRow[K] };
 
-const STEPS: readonly SendStep[] = ["s0", "clear", "probe", "write", "s1", "commit", "s2"];
+const STEPS: readonly SendStep[] = ["profile", "settle", "s0", "proof", "clear", "probe", "write", "s1", "commandSettle", "commit", "s2"];
 
 /**
  * The session page's list of recent sends, row by row. A row that is not whole is left out. The wire
@@ -165,7 +171,13 @@ export function readSendReceipts(body: JsonValue | undefined): SendReceiptsAnswe
     const row: RowDraft = { requestId, at, mode, outcome, keys, gapsMs, harness, version: asJsonString(node.version) ?? null };
     if (reason !== null) row.reason = reason;
     if (cap !== null) row.cap = cap;
+    const profileId = asJsonString(node.profileId);
+    if (profileId !== undefined && profileId.length > 0) row.profileId = profileId;
+    const profileStatus = pick(node.profileStatus, PROFILE_STATUSES);
+    if (profileStatus !== null) row.profileStatus = profileStatus;
     if (node.queued === true) row.queued = true;
+    const late = pick(node.late, SEND_LATES);
+    if (late !== null) row.late = late;
     const detail = asJsonString(node.detail);
     if (detail !== undefined && detail.length > 0) row.detail = detail.slice(0, RECEIPT_DETAIL_MAX);
     const saw = readSurfaceWords(node.saw);
@@ -211,6 +223,8 @@ export type SendNote =
   | "unconfirmed"
   | "noticeKey"
   | "noticeKeyHeld"
+  | "staleScreen"
+  | "staleScreenProbe"
   | "capConfirm"
   | "unknown"
   | "busy"
@@ -393,9 +407,11 @@ export function receiptLabelKey(outcome: SendOutcome): "composer.protocol.discar
  */
 export function receiptSentence(
   row: SendReceiptRow,
-  say: (key: NoteKey | "sendReceipts.queued", vars?: Record<string, string>) => string,
+  say: (key: NoteKey | "sendReceipts.queued" | "sendReceipts.returned", vars?: Record<string, string>) => string,
 ): string | null {
   if (row.outcome === "discarded") return say("composer.protocol.discarded");
+  // Stop gave the queued text back to the box (ADR 0122): the row is still `sent`, but not waiting.
+  if (row.late === "returned") return say("sendReceipts.returned");
   if (row.queued === true) return say("sendReceipts.queued");
   if (row.reason === undefined) return null;
   if (row.outcome === "refused" && row.reason === "unconfirmed" && row.cap !== undefined) {
@@ -415,6 +431,9 @@ function noteAndOffers(reply: SendReply, offers: readonly SendOffer[]): Verdict 
   // A send of one of the digits a notice above the box printed: the sentence says the digit would answer it.
   // With no commit offered (a running turn, a Replace) it names the card and the turn's end, not Type here.
   if (reply.outcome === "refused" && reply.cause === "notice_key") return { clear: false, note: offers.includes("commit") ? "noticeKey" : "noticeKeyHeld", offers };
+  // A box that did not take the probe, and a second read of the same rows (2026-10-25). A line longer
+  // than the plain one says a probe character may remain in the live editor: that has its own sentence.
+  if (reply.outcome === "refused" && reply.cause === "stale_screen") return { clear: false, note: reply.detail === null || reply.detail === STALE_SCREEN ? "staleScreen" : "staleScreenProbe", offers };
   const note = sendNote(reply.outcome, reply.reason);
   // A discard has its own outcome: the box emptied, but nothing went to the agent, so the phone's draft stays.
   // A send queued behind the running turn went out all the same: it clears, and its sentence says it waits.
@@ -466,6 +485,7 @@ const PLAIN_NOT_FREE = "The input box is not free.";
 
 function ownSentence(reply: SendReply): boolean {
   if (reply.outcome !== "refused" || reply.reason === null) return false;
+  if (reply.cause === "stale_screen") return true;
   if (REPEATS_THE_NOTE.has(reply.reason)) return true;
   return reply.reason === "not_free" && reply.detail === PLAIN_NOT_FREE;
 }

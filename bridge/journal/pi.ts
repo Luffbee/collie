@@ -24,7 +24,8 @@ import { lstat, readdir } from "node:fs/promises";
 import type { CacheProbe } from "../cache/engine.ts";
 import type { JsonObject, JsonValue } from "../json.ts";
 import { basename, dirname, join } from "node:path";
-import { asRecord, asText, probeTail, tokenCount, walkBack } from "./cache-probe.ts";
+import { asRecord, asText, FileSum, probeTail, tokenCount, walkBack } from "./cache-probe.ts";
+import { type MeasuredContext, piAgentDirLookups, WindowCatalog } from "./model-window.ts";
 import {
   containedRealpath,
   containedRealpathIn,
@@ -489,8 +490,34 @@ const PI_KNOWN: KnownTypes = {
   parts: ["text", "thinking", "image", "toolCall"],
 };
 
-/** The statuses Gentle Shell writes when a subagent or a background job has ended. */
+/** The statuses Gentle Shell and Oh My Pi write when a subagent or a background job has ended. */
 const FINAL_WORK_STATUS: ReadonlySet<string> = new Set(["completed", "failed", "cancelled", "exited", "stopped"]);
+
+/** The statuses an Oh My Pi `task` start writes for a subagent that has not ended yet. */
+const OMP_RUNNING_STATUS: ReadonlySet<string> = new Set(["pending", "running"]);
+
+/** The objects of `details[key]` when it is a list, else none. */
+function detailRows(details: JsonValue | undefined, key: string): JsonObject[] {
+  if (details === null || details === undefined || typeof details !== "object" || Array.isArray(details)) return [];
+  const list = details[key];
+  if (!Array.isArray(list)) return [];
+  return list.filter((row): row is JsonObject => row !== null && typeof row === "object" && !Array.isArray(row));
+}
+
+/**
+ * The status an Oh My Pi `async-result` notice gives one job. The row's `details.jobs[]` carries no
+ * status (OMP 18.6.1); the notice's own text does, as `<task-result id="<job>" … status="<s>">`. A
+ * notice that names none is a delivered result, so `completed`.
+ */
+function asyncResultStatus(content: string, jobId: string): string {
+  for (const m of content.matchAll(/<task-result\b([^>]*)>/g)) {
+    const attrs = m[1] ?? "";
+    if (/\bid="([^"]*)"/.exec(attrs)?.[1] !== jobId) continue;
+    const status = /\bstatus="([^"]*)"/.exec(attrs)?.[1];
+    if (status !== undefined && status !== "") return status;
+  }
+  return "completed";
+}
 
 export function createPiReducer(): RowReducer {
   // toolCall id → the part awaiting its result and the turn it went out in, so a later `toolResult`
@@ -504,11 +531,85 @@ export function createPiReducer(): RowReducer {
   // `subagent_result`) can find it. Kept after the work ends: a result can be asked for later. Bounded
   // by `rememberPending`; what falls off is the oldest id, whose notice the window has long passed.
   const workCards = new Map<string, PendingTool>();
+  // An Oh My Pi job card → its progress names, the `label` an end row may name it by. Weak, so a card
+  // the window and `workCards` both let go of costs nothing here.
+  const jobLabels = new WeakMap<PendingTool, readonly string[]>();
+
+  /**
+   * Oh My Pi's `task` start (OMP 18.6.1, read off a real session on 2026-10-25). The result answers at
+   * once with `details.async: {state: "running", jobId}` and one `details.progress[]` row per subagent
+   * (`id`, `agent`, `status: "pending"`). The card is ongoing while the job runs, remembered under the
+   * job id and under each progress id, and carries the job id as `jobId`. A failed spawn (`isError`,
+   * no `async`) never reaches here. True when the details had this shape at all.
+   */
+  function startOmpJob(target: PendingTool, raw: JsonValue | undefined): boolean {
+    const call = target.part.call;
+    if (call?.kind !== "task") return false;
+    const job = detailsOf(raw, "async");
+    const progress = detailRows(raw, "progress");
+    if (job === undefined && progress.length === 0) return false;
+    const agent = progress.map((row) => field(row, "agent")).find((a) => a !== undefined);
+    if (call.agent === undefined && agent !== undefined) call.agent = agent;
+    const running =
+      field(job, "state") === "running" || progress.some((row) => OMP_RUNNING_STATUS.has(field(row, "status") ?? ""));
+    if (!running) return true;
+    // A second job of one name gets `<name>-2` as its job id while its progress id stays `<name>`, so
+    // a progress id an ongoing card already holds is left to that card. The job id is taken last and
+    // always: it is the name the end notice uses.
+    jobLabels.set(target, progress.flatMap((row) => field(row, "id") ?? []));
+    for (const row of progress) {
+      const id = field(row, "id");
+      const held = id === undefined ? undefined : workCards.get(id);
+      if (id !== undefined && (held === undefined || held.part.call?.kind !== "task" || held.part.call.ongoing !== true))
+        rememberPending(workCards, id, target);
+    }
+    const jobId = field(job, "jobId") ?? field(progress[0], "id");
+    if (jobId !== undefined) {
+      rememberPending(workCards, jobId, target);
+      call.jobId = jobId;
+    }
+    call.ongoing = true;
+    return true;
+  }
+
+  /**
+   * The one ongoing job card whose progress names include `label`, or undefined when none or several
+   * do. Two same-named jobs and a notice for an id neither holds: ending either could end the wrong
+   * one, so neither ends, and the quiet bound clears a count left too high.
+   */
+  function onlyOngoingByLabel(label: string): PendingTool | undefined {
+    const found = new Set<PendingTool>();
+    for (const card of workCards.values()) {
+      const call = card.part.call;
+      if (call?.kind === "task" && call.ongoing === true && jobLabels.get(card)?.includes(label) === true) found.add(card);
+    }
+    return found.size === 1 ? found.values().next().value : undefined;
+  }
+
+  /**
+   * Oh My Pi's end of a job: an `async-result` notice (`details.jobs[]`: `jobId`, `label`) or any tool
+   * result whose `details.jobs[]` rows carry a `status` (`wait`: `id`, `label`, `status`). A job is
+   * found by its id; an id no card holds falls back to its label only when exactly one ongoing card
+   * carries that label. Only a final status ends the card, the same set Gentle Shell's notices use.
+   */
+  function settleOmpJobs(rows: readonly JsonObject[], statusOf: (row: JsonObject, id: string) => string | undefined, changed: Set<string>): void {
+    for (const row of rows) {
+      const id = field(row, "jobId") ?? field(row, "id");
+      const label = field(row, "label");
+      const key = id ?? label;
+      const held = id === undefined ? undefined : workCards.get(id);
+      const card = held ?? (label === undefined ? undefined : onlyOngoingByLabel(label));
+      if (card === undefined || key === undefined) continue;
+      const status = statusOf(row, key);
+      if (status !== undefined) settle(card, { status }, changed);
+    }
+  }
 
   /** Mark a card ongoing and remember it by id, when its start result says the work is still running. */
   function startWork(target: PendingTool, raw: JsonValue | undefined): void {
     const call = target.part.call;
     if (call?.kind !== "task" && call?.kind !== "execute") return;
+    if (detailsOf(raw, "gentleAgents") === undefined && startOmpJob(target, raw)) return;
     const agents = call.kind === "task" ? detailsOf(raw, "gentleAgents") : undefined;
     const jobs = call.kind === "execute" ? detailsOf(raw, "gentleJobs") : undefined;
     const info = agents ?? jobs;
@@ -526,6 +627,11 @@ export function createPiReducer(): RowReducer {
   /** A `gentle-agents.result` / `gentle-jobs.notice` row: the work it names has ended. */
   function endNotice(row: PiRow, changed: Set<string>): void {
     const type = row.customType;
+    if (type === "async-result") {
+      const content = customText(row.content);
+      settleOmpJobs(detailRows(row.details, "jobs"), (job, id) => field(job, "status") ?? asyncResultStatus(content, id), changed);
+      return;
+    }
     if (type !== "gentle-agents.result" && type !== "gentle-jobs.notice") return;
     const agents = type === "gentle-agents.result";
     const info = detailsOf(row.details, agents ? "gentleAgents" : "gentleJobs");
@@ -658,6 +764,9 @@ export function createPiReducer(): RowReducer {
     noteBlockTypes(note, m.content);
 
     if (m.role === "toolResult") {
+      // Oh My Pi's `wait` (and any result that lists jobs with a status) settles the jobs it names,
+      // whether or not its own call is still held.
+      settleOmpJobs(detailRows(m.details, "jobs"), (job) => field(job, "status"), changed);
       const id = typeof m.toolCallId === "string" ? m.toolCallId : "";
       const target = pendingTools.get(id);
       const resultText = stripAnsi(textBlocks(m.content));
@@ -956,12 +1065,14 @@ export class PiTranscriptSource implements TranscriptSource {
 /** pi's journal adapter. `agent` matches the Herdr snapshot's `agent` string. */
 export function piJournal(roots: string | readonly string[]): JournalAdapter {
   const source = new PiTranscriptSource(roots);
+  const catalog = new WindowCatalog();
+  const costs = new FileSum('"cost"', piRowCost);
   return {
     agent: "pi",
     source,
     parse: parsePiTranscript,
     reducer: createPiReducer,
-    cacheProbe: (ref) => piCacheProbe(source, ref),
+    cacheProbe: (ref) => piCacheProbe(source, ref, catalog, costs),
   };
 }
 
@@ -982,8 +1093,87 @@ export function piJournal(roots: string | readonly string[]): JournalAdapter {
 //
 // Oh My Pi needs nothing here: `omp` is an alias of `pi` in registry.ts, so an omp pane resolves to
 // this adapter and to `pi.*` rules alike.
+//
+// THE CONTEXT (.adr/0115, amended 2026-10-25) is a turn row's `input + cacheRead + cacheWrite`: pi
+// counts the cache apart from `input`, so the three together are what the request carried. pi's own
+// footer adds the reply's `output` too; Collie counts what went in, as it does for Claude. A turn that
+// failed writes zeros and is passed over ({@link piContextOf}). A `compaction` row after the turn means
+// the next request carries less, and no turn has measured it yet, so the probe names no context then.
+// The log names no window (a `model_change` row names the model only), so the window comes from the
+// catalog in the agent dir ({@link piAgentDirOf}, bridge/journal/model-window.ts), and a model it does
+// not name has no context dot.
 
-async function piCacheProbe(source: PiTranscriptSource, ref: AgentSessionRef): Promise<CacheProbe | null> {
+/**
+ * The agent dir a session log belongs to: the parent of the nearest `sessions` folder above it. A
+ * session is `<agent>/sessions/<folder>/<file>.jsonl`, and Oh My Pi nests a subagent's log one level
+ * deeper, under a folder named after its parent session. A root set to some other folder names no
+ * agent dir, and then no catalog is read.
+ */
+export function piAgentDirOf(path: string): string | null {
+  let folder = dirname(path);
+  for (let depth = 0; depth < 3; depth++) {
+    folder = dirname(folder);
+    if (basename(folder) === "sessions") return dirname(folder);
+  }
+  return null;
+}
+
+/** The sum of a usage row's input-side counts, or undefined when the row names none of them. */
+function piContextTokens(usage: JsonObject): number | undefined {
+  const parts = [tokenCount(usage.input), tokenCount(usage.cacheRead), tokenCount(usage.cacheWrite)];
+  if (parts.every((n) => n === undefined)) return undefined;
+  const sum = parts.reduce<number>((total, n) => total + Math.max(0, n ?? 0), 0);
+  return sum > 0 ? sum : undefined;
+}
+
+/**
+ * The context the newest MEASURED turn carried, with its provider and model, or undefined. A turn
+ * that failed writes a usage row of zeros, and the context it would have sent is the one before it,
+ * so such a row is passed over. A `compaction` met first ends the search with no reading.
+ */
+export function piContextOf(lines: readonly string[]): MeasuredContext | undefined {
+  const found = walkBack(lines, (raw): MeasuredContext | null | undefined => {
+    const entry = asRecord(raw);
+    if (entry === null) return undefined;
+    if (entry.type === "compaction") return null;
+    if (entry.type !== "message") return undefined;
+    const message = asRecord(entry.message);
+    if (message === null || message.role !== "assistant") return undefined;
+    const usage = asRecord(message.usage);
+    const tokens = usage === null ? undefined : piContextTokens(usage);
+    if (tokens === undefined) return undefined;
+    const out: MeasuredContext = { tokens };
+    const provider = asText(message.provider);
+    const model = asText(message.model);
+    if (provider !== undefined) out.provider = provider;
+    if (model !== undefined) out.model = model;
+    return out;
+  });
+  return found ?? undefined;
+}
+
+/**
+ * THE SESSION COST (.adr/0115, amended 2026-10-25) is the sum of `message.usage.cost.total`, in US
+ * dollars, over every assistant row of the file; pi and Oh My Pi write the same shape (verified on pi
+ * logs and on Oh My Pi 18.6.1). An aborted turn writes zeros and adds nothing. Branches pi abandoned
+ * stay in the file and were paid for, so they count. A tail holds a handful of turns, so the sum runs
+ * over the whole file once and then over the appended bytes only ({@link FileSum}).
+ */
+export function piRowCost(raw: JsonValue): number | undefined {
+  const entry = asRecord(raw);
+  if (entry === null || entry.type !== "message") return undefined;
+  const message = asRecord(entry.message);
+  if (message === null || message.role !== "assistant") return undefined;
+  const total = tokenCount(asRecord(asRecord(message.usage)?.cost)?.total);
+  return total === undefined || total < 0 ? undefined : total;
+}
+
+async function piCacheProbe(
+  source: PiTranscriptSource,
+  ref: AgentSessionRef,
+  catalog?: WindowCatalog,
+  costs?: FileSum,
+): Promise<CacheProbe | null> {
   const tail = await probeTail(source, ref);
   if (tail === null) return null;
   // The thinking level is the NEWEST one the walk meets, whether a `thinking_level_change` row (written
@@ -1023,6 +1213,17 @@ async function piCacheProbe(source: PiTranscriptSource, ref: AgentSessionRef): P
     return probe;
   });
   if (found === undefined) return null;
+  const context = piContextOf(tail.lines);
+  if (context !== undefined) {
+    found.contextTokens = context.tokens;
+    const agentDir = piAgentDirOf(tail.path);
+    if (catalog !== undefined && agentDir !== null && context.provider !== undefined && context.model !== undefined) {
+      const window = await catalog.window(agentDir, piAgentDirLookups(agentDir), context.provider, context.model);
+      if (window !== undefined) found.contextWindow = window;
+    }
+  }
+  const summed = costs === undefined ? undefined : await costs.read(tail.path);
+  if (summed !== undefined && summed.sum > 0) found.costUsd = summed.sum;
   // A turn that carried no level of its own: the level row the session opened with, or the last
   // change before the turn, still stands. Only the level is looked for past the turn.
   effort ??= walkBack(tail.lines, (raw) => {

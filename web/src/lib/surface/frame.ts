@@ -13,8 +13,9 @@
 // comes from the profile. The same rows always give the same frame, and the screen width is read
 // from nothing but the rows.
 
-import { displayWidth } from "../text-width";
-import { insideList, listedBottom, ownListUnder } from "./command-list";
+import { displayWidth, widePieces } from "../text-width";
+import { anyListRow, insideList, listedBottom, openListUnder } from "./command-list";
+import { popupUnder } from "./popup";
 import { readAboveNotice } from "./notice";
 import type { FrameAnchor, Profile } from "./profile";
 
@@ -88,6 +89,12 @@ export interface Frame {
    * reads it as blank (cues.ts `readCuesFor`). Absent otherwise.
    */
   readonly ownPrompt?: { readonly row: number; readonly end: number };
+  /**
+   * The box stands at the height where its layout scrolls (`idle.frame.scroll`): it shows at least
+   * `scroll.rows` draft rows, so the head of the draft may be out of view and `interior.text` is only
+   * the tail. Absent on a box that shows its whole draft, and on every layout that does not scroll.
+   */
+  readonly scrolled?: true;
 }
 
 /** A row under the bottom edge that a named footer row of the profile matches. */
@@ -227,6 +234,16 @@ export function frameEdge(text: string, idle: IdleProfile): "prompt" | "bottom" 
 }
 
 /**
+ * The draft a row holds when it has the shape of the profile's prompt row (the prompt anchor matches it,
+ * in its column), trimmed; "" for a prompt row with nothing behind the glyph, null for any other row.
+ */
+export function promptDraft(text: string, idle: IdleProfile): string | null {
+  if (isBlank(text)) return null;
+  const match = anchored(text, compile(idle).prompt);
+  return match === null ? null : (match.groups?.draft ?? "").trim();
+}
+
+/**
  * Whether a row may stand inside a box whose edges are blank rows: a blank row, or a row indented at
  * least `continuationIndent` columns (a wrapped or later line of the draft). Text further left is the
  * transcript or a dialog, so the walk must stop there.
@@ -348,6 +365,19 @@ interface DraftPiece {
   readonly end: number;
 }
 
+/**
+ * Where the text of a row ends when the harness's pattern cut a right border off it and that cut was wrong:
+ * the end of the pattern's `border` group, or null when the cut stands. A box's own right border is the last
+ * cell of the row, so a row that still has white space after the glyph is the person's text that happens to
+ * end in one (a pasted box drawing, `│ x │`), and the glyph belongs to the draft. A row with no white space
+ * after it may be the border at the last cell, or a read with its trailing spaces cut: the cut stands.
+ */
+function keptBorder(text: string, match: RegExpExecArray): number | null {
+  const span = match.indices?.groups?.border;
+  if (span === undefined) return null;
+  return text.length > text.trimEnd().length ? span[1] : null;
+}
+
 /** The piece of `text` from `from` to `to`, trimmed at both ends, or null when it holds nothing visible. */
 function trimmedPiece(row: number, text: string, from: number, to: number): DraftPiece | null {
   const slice = text.slice(from, to);
@@ -415,18 +445,75 @@ function argumentHintStart(row: FrameRow, text: string, holeStart: number, holeE
   return entries.includes(text.slice(holeStart, last.at).trim()) ? last.at : null;
 }
 
+/** The last and the first whitespace-separated token of a text; the text itself when it holds none. */
+const lastToken = (text: string): string => text.slice(text.search(/\S+$/u));
+const firstToken = (text: string): string => text.slice(0, text.search(/\s|$/u));
+
+/** Whether a text ends, or starts, on a double-width cell (a CJK character, a wide emoji). */
+const endsWide = (text: string): boolean => widePieces(text).at(-1)?.wide === true;
+const startsWide = (text: string): boolean => widePieces(text)[0]?.wide === true;
+
+/** No terminal is narrower than this; a read of narrower rows is a hand-cut one. */
+const MIN_WRAP_WIDTH = 20;
+
 /**
- * The draft as one line: each piece's text joined with one space, with the profile's ghost text cut off
- * the end of the last piece ({@link hintStart}).
+ * What the rows of a soft-wrapped draft say about the screen they were drawn on: the width every row was
+ * padded to, and the cells in front of the draft on the narrowest row (the prompt glyph or the indent).
+ * Null when the draft's rows are not padded to the screen's width, so a hand-cut or trimmed read joins as it always did.
+ * Rows within two cells of the width count as full width, because a harness may measure a glyph one
+ * cell differently from {@link displayWidth}.
+ */
+function paddedRows(texts: readonly string[], pieces: readonly DraftPiece[]): { readonly width: number; readonly indent: number } | null {
+  if (pieces.length < 2) return null;
+  const widths = pieces.map((piece) => displayWidth(texts[piece.row]!));
+  // The screen's width is its widest row: a capture pads every row, the draft's too. Rows that are as
+  // short as the draft is long (a screen with its trailing spaces cut) say nothing about a full row.
+  const width = Math.max(...texts.map(displayWidth));
+  if (width < MIN_WRAP_WIDTH || widths.some((w) => w < width - 2)) return null;
+  return { width, indent: Math.min(...pieces.map((piece) => displayWidth(texts[piece.row]!.slice(0, piece.start)))) };
+}
+
+/**
+ * Whether the soft wrap between two rows of a draft broke inside a token, so the draft has no space there.
+ *
+ * A harness wraps a draft at a break and drops the break: a row that ends at a word ends short of the
+ * width, or exactly on it when the word fills it. It wraps inside a token in two cases, and each leaves a
+ * mark on the screen:
+ * - a token wider than a row (a URL, a long path) is cut where the row is full. The token's end on this
+ *   row and its start on the next are together wider than the room a row has. A row that is full where a
+ *   word ends has two short words at its edge, which are not;
+ * - a run with double-width cells (CJK text has no spaces) is cut at the last cell that fits, so the row
+ *   ends one cell short at most, and both sides of the cut are double-width cells. A newline typed
+ *   after a CJK line that fills the row to within a cell, ahead of a narrow glyph, keeps its space.
+ * The join adds a space unless one of these holds. A row's end counts as full against the width of the
+ * padded rows ({@link paddedRows}); a row with a right border or a margin is never full, and joins as
+ * before.
+ */
+function brokeToken(texts: readonly string[], rect: { readonly width: number; readonly indent: number }, before: DraftPiece, after: DraftPiece, left: string, right: string): boolean {
+  if (after.row !== before.row + 1) return false;
+  const slack = rect.width - displayWidth(texts[before.row]!.slice(0, before.end));
+  const end = lastToken(left);
+  const start = firstToken(right);
+  if (slack === 0 && displayWidth(end) + displayWidth(start) > rect.width - rect.indent) return true;
+  return slack <= 1 && endsWide(end) && startsWide(start);
+}
+
+/**
+ * The draft as one line: each piece's text joined with one space, unless the wrap between two rows broke
+ * inside a token ({@link brokeToken}), with the profile's ghost text cut off the end of the last piece
+ * ({@link hintStart}). A draft typed with newlines has rows that end short, and keeps a space for each.
  */
 function draftText(rows: readonly FrameRow[], texts: readonly string[], pieces: readonly DraftPiece[], hint: ReadonlySet<string> | null): string {
   const last = pieces[pieces.length - 1];
   const ghost = last === undefined || hint === null ? null : hintStart(rows[last.row]!, last, hint);
-  return pieces
-    .map((piece) => texts[piece.row]!.slice(piece.start, piece === last && ghost !== null ? ghost : piece.end).trim())
-    .filter((part) => part.length > 0)
-    .join(" ")
-    .trim();
+  const parts = pieces.map((piece) => ({ piece, text: texts[piece.row]!.slice(piece.start, piece === last && ghost !== null ? ghost : piece.end).trim() })).filter((part) => part.text.length > 0);
+  const rect = paddedRows(texts, parts.map((part) => part.piece));
+  let out = "";
+  for (const [i, part] of parts.entries()) {
+    const before = parts[i - 1];
+    out += before === undefined ? part.text : `${rect !== null && brokeToken(texts, rect, before.piece, part.piece, before.text, part.text) ? "" : " "}${part.text}`;
+  }
+  return out.trim();
 }
 
 /** The statusline run and the footer under the bottom edge (`Frame.volatile`). */
@@ -651,7 +738,8 @@ function interiorPiece(row: number, text: string, continuation: RegExp | null): 
   if (continuation === null) return trimmedPiece(row, text, 0, text.length);
   const hit = continuation.exec(text.trimEnd());
   const span = hit?.indices?.groups?.text;
-  return span === undefined ? null : trimmedPiece(row, text, span[0], span[1]);
+  if (hit === null || span === undefined) return null;
+  return trimmedPiece(row, text, span[0], keptBorder(text, hit) ?? span[1]);
 }
 
 /**
@@ -731,12 +819,12 @@ function interiorFrameAt(rows: readonly FrameRow[], bottom: number, idle: IdlePr
   const holeStart = promptMatch.indices?.groups?.draft?.[0] ?? texts[prompt]!.length;
   const pieces: DraftPiece[] = [];
   for (let j = top + 1; j <= last; j++) {
-    const piece = j === prompt ? trimmedPiece(j, texts[j]!, holeStart, holeStart + (hole ?? "").length) : interiorPiece(j, texts[j]!, c.interior.continuation);
+    const piece = j === prompt ? trimmedPiece(j, texts[j]!, holeStart, keptBorder(texts[j]!, promptMatch) ?? holeStart + (hole ?? "").length) : interiorPiece(j, texts[j]!, c.interior.continuation);
     if (piece !== null) pieces.push(piece);
   }
   const text = draftText(rows, texts, pieces, c.hint);
   // A list pushed the harness's own row down: only the typed command's own list may stand there.
-  if (listed && ownListUnder(texts, bottom, text, idle.volatile.below.commandList) === null) return null;
+  if (listed && openListUnder(texts, bottom, text, idle.volatile.below.commandList) === null) return null;
 
   const label = topMatch.groups?.label?.trim() ?? "";
   const anchorsHit: FrameAnchorHit[] = ["top"];
@@ -767,24 +855,44 @@ function interiorFrameAt(rows: readonly FrameRow[], bottom: number, idle: IdlePr
 
 const compiledOverlays = new WeakMap<IdleProfile, readonly RegExp[]>();
 
+function overlayPatterns(idle: IdleProfile): readonly RegExp[] {
+  const sources = idle.overlayRows;
+  if (sources === undefined || sources.length === 0) return [];
+  let patterns = compiledOverlays.get(idle);
+  if (patterns === undefined) {
+    patterns = sources.map((source) => new RegExp(source, "u"));
+    compiledOverlays.set(idle, patterns);
+  }
+  return patterns;
+}
+
 /**
  * Whether a dialog is drawn over the screen above the frame: a row above the top edge matches one of
  * the profile's `overlayRows`. The box stays on screen under such a dialog, so the frame alone would
  * read free. False for a profile with no such rows.
  */
 export function coveredFrame(rows: readonly FrameRow[], frame: Frame, idle: IdleProfile): boolean {
-  const sources = idle.overlayRows;
-  if (sources === undefined || sources.length === 0) return false;
-  let patterns = compiledOverlays.get(idle);
-  if (patterns === undefined) {
-    patterns = sources.map((source) => new RegExp(source, "u"));
-    compiledOverlays.set(idle, patterns);
-  }
+  const patterns = overlayPatterns(idle);
+  if (patterns.length === 0) return false;
   for (let i = 0; i < frame.top && i < rows.length; i++) {
     const text = rowText(rows[i]!).trimEnd();
     if (text.length > 0 && patterns.some((pattern) => pattern.test(text))) return true;
   }
   return false;
+}
+
+/**
+ * Whether one of `indices` (a screen with no frame: the tail cluster the modal cues read) matches a
+ * profile's `overlayRows`. A full-screen picker has no box at all, and its footer is the profile's
+ * strong word that a dialog holds the screen. False for a profile with no such rows.
+ */
+export function overlayInRows(rows: readonly FrameRow[], indices: readonly number[], idle: IdleProfile): boolean {
+  const patterns = overlayPatterns(idle);
+  if (patterns.length === 0) return false;
+  return indices.some((i) => {
+    const text = rowText(rows[i]!).trimEnd();
+    return text.length > 0 && patterns.some((pattern) => pattern.test(text));
+  });
 }
 
 /**
@@ -798,12 +906,25 @@ export function coveredFrame(rows: readonly FrameRow[], frame: Frame, idle: Idle
  */
 export function findInputFrame(rows: readonly FrameRow[], idle: IdleProfile): Frame | null {
   const found = findLayout(rows, idle);
-  if (found !== null || idle.frameAlternates === undefined) return found;
+  if (found !== null) return atScroll(rows, found, idle);
+  if (idle.frameAlternates === undefined) return null;
   for (const alternate of alternatesOf(idle)) {
     const hit = findLayout(rows, alternate);
-    if (hit !== null) return hit;
+    if (hit !== null) return atScroll(rows, hit, alternate);
   }
   return null;
+}
+
+/**
+ * The frame marked {@link Frame.scrolled} when its layout scrolls and it shows at least the layout's
+ * scroll height in draft rows: the non-blank rows from the prompt row down to the interior's last row.
+ */
+function atScroll(rows: readonly FrameRow[], frame: Frame, idle: IdleProfile): Frame {
+  const scroll = idle.frame.scroll;
+  if (scroll === undefined || frame.placeholder) return frame;
+  let drawn = 0;
+  for (let j = frame.interior.prompt; j <= frame.interior.last && j < rows.length; j++) if (!isBlank(rowText(rows[j]!))) drawn++;
+  return drawn >= scroll.rows ? { ...frame, scrolled: true } : frame;
 }
 
 const compiledAlternates = new WeakMap<IdleProfile, readonly IdleProfile[]>();
@@ -821,16 +942,44 @@ function alternatesOf(idle: IdleProfile): readonly IdleProfile[] {
  * The frame of an open box over the last non-blank row `end - 1`. Each row passed over on the way up
  * is blank or a row the profile's `rows` pattern does not accept: a row the box draws (an edge, a draft
  * row) is never passed, so a read cut inside the box still finds no frame.
+ *
+ * Under the box there are at most `maxTailRows` rows of anything. A profile that names `maxWidgetRows`
+ * (an extension may draw a widget of that many rows under the box) also finds the box past that reach,
+ * but only over a run of painted rows, no blank row among them, none of them a row of the command list
+ * ({@link widgetRun}). A welcome card higher up the screen is set apart by blank rows, and a list is read
+ * by {@link listedLayout}, which asks whose list it is.
  */
 function openFrame(rows: readonly FrameRow[], end: number, idle: IdleProfile): Frame | null {
   const under = compile(idle).interior.rows;
-  for (let b = end - 1; b >= 0 && end - 1 - b <= idle.frame.maxTailRows; b--) {
+  const reach = Math.max(idle.frame.maxTailRows, idle.frame.maxWidgetRows ?? 0);
+  for (let b = end - 1; b >= 0 && end - 1 - b <= reach; b--) {
     const frame = interiorFrameAt(rows, b, idle);
-    if (frame !== null) return frame;
+    if (frame !== null) return end - 1 - b <= idle.frame.maxTailRows || widgetRun(rows, b, end, idle) || popupRun(rows, frame, idle) ? frame : null;
     const text = rowText(rows[b]!);
     if (under === null || (!isBlank(text) && under.test(text.trimEnd()))) return null;
   }
   return null;
+}
+
+/**
+ * Whether the rows under an open box's last row `bottom` to the screen's last row `end - 1` are an
+ * extension's widget: painted rows all the way (no blank one), none of them an entry of the profile's
+ * command list. The caller has bounded their number by `maxWidgetRows`.
+ */
+function widgetRun(rows: readonly FrameRow[], bottom: number, end: number, idle: IdleProfile): boolean {
+  const texts = rows.map(rowText);
+  for (let i = bottom + 1; i < end; i++) if (isBlank(texts[i]!)) return false;
+  return !anyListRow(texts, bottom + 1, end - 1, idle.volatile.below.commandList);
+}
+
+/**
+ * Whether the rows under the open box's last row are the typeahead popup that the box's text opened
+ * ({@link popupUnder}). A popup may be as tall as a widget and its rows may read as entries of the command
+ * list (a label and a description column), which {@link widgetRun} refuses; the text that opened it is what
+ * tells them apart.
+ */
+function popupRun(rows: readonly FrameRow[], frame: Frame, idle: IdleProfile): boolean {
+  return popupUnder(rows.map(rowText), frame.bottom, frame.interior.text, idle.volatile.below.popups) !== null;
 }
 
 function findLayout(rows: readonly FrameRow[], idle: IdleProfile): Frame | null {
@@ -838,7 +987,8 @@ function findLayout(rows: readonly FrameRow[], idle: IdleProfile): Frame | null 
   let end = rows.length;
   while (end > 0 && isBlank(rowText(rows[end - 1]!))) end--;
   // An open box has no bottom edge: its last row is the last row of the screen, or a row at most
-  // `maxTailRows` above it when rows the box never draws stand under it (an extension's widget, #468).
+  // `maxTailRows` above it when rows the box never draws stand under it (an extension's widget, #468),
+  // or up to `maxWidgetRows` above it when those rows are one unbroken run of a widget ({@link openFrame}).
   if (c.bottom.open) return openFrame(rows, end, idle) ?? listedLayout(rows, end, idle);
   for (let b = end - 1; b >= 0 && end - 1 - b <= idle.frame.maxTailRows; b--) {
     if (anchored(rowText(rows[b]!), c.bottom) !== null) return frameAt(rows, b, idle);
@@ -853,8 +1003,10 @@ const LISTED_REACH = 64;
  * The box over the typed command's own list (`idle.volatile.below.commandList`), when the search at the
  * screen's end found none: a list taller than `maxTailRows` pushes the box's bottom edge, or an open
  * box's last row, out of that search's reach. The row right over the list is tried as that edge, and
- * the box found there is kept only when the list's pointer rests on exactly the box's text. A list that
- * points at another command, or at none, finds no box here.
+ * the box found there is kept only when the list is the box's own ({@link openListUnder}): its pointer
+ * rests on exactly the box's text, or the profile's `leadOpens` says the text opened it, whatever the
+ * pointer rests on. A list that points at another command on a profile with no `leadOpens`, or at none,
+ * finds no box here.
  */
 function listedLayout(rows: readonly FrameRow[], end: number, idle: IdleProfile): Frame | null {
   const list = idle.volatile.below.commandList;
@@ -865,5 +1017,5 @@ function listedLayout(rows: readonly FrameRow[], end: number, idle: IdleProfile)
   const c = compile(idle);
   const frame = c.bottom.open ? interiorFrameAt(rows, bottom, idle) : anchored(texts[bottom]!, c.bottom) === null ? null : frameAt(rows, bottom, idle);
   if (frame === null || frame.placeholder) return null;
-  return ownListUnder(texts, bottom, frame.interior.text, list) === null ? null : frame;
+  return openListUnder(texts, bottom, frame.interior.text, list) === null ? null : frame;
 }

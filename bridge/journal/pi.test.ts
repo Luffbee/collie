@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -1353,5 +1354,372 @@ describe("the pi probe — the thinking level", () => {
     const probe = await probeOf([header(), answer("a1")]);
     expect(probe?.model).toBe("anthropic:claude-opus-5-5");
     expect(probe?.effort).toBeUndefined();
+  });
+});
+
+// Oh My Pi 18.6.1's background `task` jobs: the row shapes below copy a real session read on
+// 2026-10-25 (key names exact; the words are the lab's). A spawn answers at once with
+// `details.async` and `details.progress[]`; the end is an `async-result` notice or a `wait` result.
+describe("parsePiTranscript — Oh My Pi's task jobs", () => {
+  const session = () => {
+    const rows: string[] = [];
+    let parent: string | null = null;
+    const add = (id: string, body: Record<string, JsonValue>) => {
+      rows.push(plain(id, parent, body));
+      parent = id;
+    };
+    return {
+      spawn(id: string, callId: string, intent = "Count the lab files") {
+        add(id, {
+          type: "message",
+          message: { role: "assistant", content: [{ type: "toolCall", id: callId, name: "task", arguments: { i: intent, context: "The lab.", tasks: [{ task: "count the files in the lab", name: "LabFix" }] } }] },
+        });
+        add(`${id}s`, { type: "custom", customType: "tool_execution_start", data: { toolCallId: callId, toolName: "task", startedAt: "2026-09-30T12:00:00.000Z", intent } });
+      },
+      started(id: string, callId: string, name: string, jobId = name) {
+        add(id, {
+          type: "message",
+          message: {
+            role: "toolResult",
+            toolCallId: callId,
+            toolName: "task",
+            content: [{ type: "text", text: `Spawned agent \`${name}\` (job \`${jobId}\`).` }],
+            details: {
+              projectAgentsDir: null,
+              results: [],
+              totalDurationMs: 1,
+              progress: [{ index: 0, id: name, agent: "task", agentSource: "bundled", status: "pending", task: "count the files in the lab", assignment: "count the files in the lab", recentTools: [], recentOutput: [], toolCount: 0, requests: 0, tokens: 0, cost: 0, durationMs: 0 }],
+              async: { state: "running", jobId, type: "task" },
+            },
+          },
+        });
+      },
+      failedSpawn(id: string, callId: string) {
+        add(id, {
+          type: "message",
+          message: { role: "toolResult", toolCallId: callId, toolName: "task", isError: true, content: [{ type: "text", text: "Missing `tasks`. Provide a `tasks` array." }], details: { projectAgentsDir: null, results: [], totalDurationMs: 0 } },
+        });
+      },
+      asyncResult(id: string, jobId: string, label: string, status = "completed") {
+        add(id, {
+          type: "custom_message",
+          customType: "async-result",
+          content: `<system-notice>\nBackground job ${jobId} has ${status}.\n<task-result id="${jobId}" agent="task" status="${status}" duration="9.6s">\n12 files.\n</task-result>\n</system-notice>`,
+          display: true,
+          details: { meta: { source: { type: "report", value: "background job delivery" } }, jobs: [{ jobId, type: "task", label, durationMs: 9638 }] },
+        });
+      },
+      wait(id: string, callId: string, jobs: { id: string; status: string; label: string }[]) {
+        add(id, { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: callId, name: "wait", arguments: { i: "Wait for the lab" } }] } });
+        add(`${id}r`, {
+          type: "message",
+          message: {
+            role: "toolResult",
+            toolCallId: callId,
+            toolName: "wait",
+            content: [{ type: "text", text: "## Completed (1)" }],
+            details: { op: "wait", meta: { source: { type: "report", value: "wait" } }, jobs: jobs.map((j) => ({ ...j, type: "task", durationMs: 55938, resultText: "<task-result>12 files.</task-result>" })) },
+          },
+        });
+      },
+      rows,
+    };
+  };
+  const tasks = (lines: string[]) =>
+    parsePiTranscript(lines.join("\n")).flatMap((e) => e.parts.flatMap((p) => (p.kind === "tool" && p.call?.kind === "task" ? [p] : [])));
+
+  test("a spawn is ongoing under its job id, named by the progress row's agent", () => {
+    const s = session();
+    s.spawn("a1", "c1");
+    s.started("r1", "c1", "LabFix");
+    const [card] = tasks(s.rows);
+    expect(card?.call).toEqual({ kind: "task", summary: "Count the lab files", agent: "task", jobId: "LabFix", ongoing: true });
+    expect(card?.result?.isError).toBeUndefined();
+  });
+
+  test("an async-result notice ends it, and the notice is still drawn", () => {
+    const s = session();
+    s.spawn("a1", "c1");
+    s.started("r1", "c1", "LabFix");
+    s.asyncResult("n1", "LabFix", "LabFix");
+    const entries = parsePiTranscript(s.rows.join("\n"));
+    const [card] = tasks(s.rows);
+    expect(card?.call).toEqual({ kind: "task", summary: "Count the lab files", agent: "task", jobId: "LabFix" });
+    expect(card?.result?.isError).toBeUndefined();
+    expect(entries.at(-1)?.role).toBe("note");
+  });
+
+  test("a wait result with a completed job ends it", () => {
+    const s = session();
+    s.spawn("a1", "c1");
+    s.started("r1", "c1", "LabFix");
+    s.wait("w1", "c2", [{ id: "LabFix", status: "completed", label: "LabFix" }]);
+    expect(tasks(s.rows)[0]?.call).toEqual({ kind: "task", summary: "Count the lab files", agent: "task", jobId: "LabFix" });
+  });
+
+  test("a wait that reports a job still running leaves the card ongoing", () => {
+    const s = session();
+    s.spawn("a1", "c1");
+    s.started("r1", "c1", "LabFix");
+    s.wait("w1", "c2", [{ id: "LabFix", status: "running", label: "LabFix" }]);
+    expect(tasks(s.rows)[0]?.call).toMatchObject({ ongoing: true });
+  });
+
+  test("a failed job marks the card's result as an error, from a wait or from the notice's own status", () => {
+    const viaWait = session();
+    viaWait.spawn("a1", "c1");
+    viaWait.started("r1", "c1", "LabFix");
+    viaWait.wait("w1", "c2", [{ id: "LabFix", status: "failed", label: "LabFix" }]);
+    const [waited] = tasks(viaWait.rows);
+    expect(waited?.call).not.toHaveProperty("ongoing");
+    expect(waited?.result?.isError).toBe(true);
+
+    const viaNotice = session();
+    viaNotice.spawn("a1", "c1");
+    viaNotice.started("r1", "c1", "LabFix");
+    viaNotice.asyncResult("n1", "LabFix", "LabFix", "failed");
+    const [noticed] = tasks(viaNotice.rows);
+    expect(noticed?.call).not.toHaveProperty("ongoing");
+    expect(noticed?.result?.isError).toBe(true);
+  });
+
+  test("a second job of one name settles by its `-2` job id, and leaves the first running", () => {
+    const s = session();
+    s.spawn("a1", "c1", "First lab count");
+    s.started("r1", "c1", "LabFix");
+    s.spawn("a2", "c2", "Second lab count");
+    s.started("r2", "c2", "LabFix", "LabFix-2");
+    s.asyncResult("n1", "LabFix-2", "LabFix");
+    const [first, second] = tasks(s.rows);
+    expect(first?.call).toMatchObject({ summary: "First lab count", jobId: "LabFix", ongoing: true });
+    expect(second?.call).toEqual({ kind: "task", summary: "Second lab count", agent: "task", jobId: "LabFix-2" });
+    s.asyncResult("n2", "LabFix", "LabFix");
+    expect(tasks(s.rows)[0]?.call).not.toHaveProperty("ongoing");
+  });
+
+  test("a notice whose job id is unknown settles the card by its label", () => {
+    const s = session();
+    s.spawn("a1", "c1");
+    s.started("r1", "c1", "LabFix", "lab-job-1");
+    s.asyncResult("n1", "lab-job-9", "LabFix");
+    expect(tasks(s.rows)[0]?.call).not.toHaveProperty("ongoing");
+  });
+
+  test("two same-named jobs ongoing: a notice for an unknown job id with their shared label ends neither", () => {
+    const s = session();
+    s.spawn("a1", "c1", "First lab count");
+    s.started("r1", "c1", "LabFix");
+    s.spawn("a2", "c2", "Second lab count");
+    s.started("r2", "c2", "LabFix", "LabFix-2");
+    s.asyncResult("n1", "LabFix-7", "LabFix");
+    s.wait("w1", "c3", [{ id: "LabFix-9", status: "completed", label: "LabFix" }]);
+    const [first, second] = tasks(s.rows);
+    expect(first?.call).toMatchObject({ jobId: "LabFix", ongoing: true });
+    expect(second?.call).toMatchObject({ jobId: "LabFix-2", ongoing: true });
+  });
+
+  test("a failed spawn (`isError`, no `async`) is never ongoing", () => {
+    const s = session();
+    s.spawn("a1", "c1");
+    s.failedSpawn("r1", "c1");
+    const [card] = tasks(s.rows);
+    expect(card?.call).toEqual({ kind: "task", summary: "Count the lab files" });
+    expect(card?.result?.isError).toBe(true);
+  });
+
+  test("the reducer names the card's turn when a later row ends it", () => {
+    const s = session();
+    s.spawn("a1", "c1");
+    s.started("r1", "c1", "LabFix");
+    const reducer = createPiReducer();
+    for (const line of s.rows) reducer.push(line);
+    const before = s.rows.length;
+    s.asyncResult("n1", "LabFix", "LabFix");
+    const reduction = reducer.push(s.rows[before]!);
+    expect([...reduction.changed]).toContain("a1");
+  });
+});
+
+// The context dot (.adr/0115, amended 2026-10-25). The tokens are the turn's own input-side counts;
+// the log names no window, so the window comes from the catalog in the agent dir above `sessions`:
+// pi's `models-store.json` or Oh My Pi's `models.db`. Lab names only.
+describe("the pi probe — the context", () => {
+  const SID = "019f1827-bf99-7927-9684-76318de905b5";
+  const answer = (id: string, usage: Record<string, JsonValue>) =>
+    row(id, {
+      role: "assistant",
+      content: [{ type: "text", text: "ok" }],
+      provider: "labrouter",
+      model: "lab/model-one",
+      usage,
+    });
+  const compaction = (id: string) =>
+    JSON.stringify({ type: "compaction", id, parentId: "p0", timestamp: "2026-07-29T10:05:00.000Z", summary: "…" });
+
+  async function probeOf(lines: readonly string[], catalog?: (agentDir: string) => Promise<void>) {
+    const created = `${tmpdir()}/collie-pi-context-${Math.floor(performance.now() * 1000)}`;
+    const root = join(created, "sessions");
+    const project = join(root, "--repo--");
+    await mkdir(project, { recursive: true });
+    if (catalog !== undefined) await catalog(created);
+    const log = join(project, `2026-07-29T10-00-00-000Z_${SID}.jsonl`);
+    await Bun.write(log, `${lines.join("\n")}\n`);
+    const probe = await piJournal(root).cacheProbe?.({ kind: "path", value: await realpath(log) });
+    await rm(created, { recursive: true, force: true });
+    return probe;
+  }
+
+  const store = (window: JsonValue) => async (agentDir: string) => {
+    await Bun.write(
+      join(agentDir, "models-store.json"),
+      JSON.stringify({ labrouter: { models: [{ id: "lab/other", contextWindow: 1 }, { id: "lab/model-one", contextWindow: window }] } }),
+    );
+  };
+
+  test("the tokens are input, cache read and cache write together", async () => {
+    const probe = await probeOf([header(), answer("a1", { input: 10, output: 5, cacheRead: 900, cacheWrite: 90 })]);
+    expect(probe?.contextTokens).toBe(1000);
+  });
+
+  test("with no catalog in the agent dir there is no window", async () => {
+    const probe = await probeOf([header(), answer("a1", { input: 10, cacheRead: 900, cacheWrite: 90 })]);
+    expect(probe?.contextTokens).toBe(1000);
+    expect(probe?.contextWindow).toBeUndefined();
+  });
+
+  test("pi's models-store.json names the window for the turn's provider and model", async () => {
+    const probe = await probeOf([header(), answer("a1", { input: 10, cacheRead: 900, cacheWrite: 90 })], store(400_000));
+    expect(probe?.contextWindow).toBe(400_000);
+  });
+
+  test("a window that is not a whole positive number is no window", async () => {
+    const probe = await probeOf([header(), answer("a1", { input: 10, cacheRead: 900 })], store("400000"));
+    expect(probe?.contextTokens).toBe(910);
+    expect(probe?.contextWindow).toBeUndefined();
+  });
+
+  test("Oh My Pi's models.db names the window from a variant row of the provider", async () => {
+    const probe = await probeOf([header(), answer("a1", { input: 3, cacheRead: 0, cacheWrite: 1997 })], async (agentDir) => {
+      const db = new Database(join(agentDir, "models.db"));
+      db.run("create table model_cache (provider_id text primary key, version integer, models text not null)");
+      db.run("insert into model_cache values (?, 1, ?)", ["labrouterx", JSON.stringify([{ id: "lab/model-one", contextWindow: 7 }])]);
+      db.run("insert into model_cache values (?, 1, ?)", [
+        "labrouter:pseudo-api",
+        JSON.stringify([{ id: "lab/model-one", provider: "labrouter", contextWindow: 262_144 }]),
+      ]);
+      db.close();
+    });
+    expect(probe?.contextTokens).toBe(2000);
+    expect(probe?.contextWindow).toBe(262_144);
+  });
+
+  test("a catalog that does not name the model gives no window", async () => {
+    const probe = await probeOf([header(), answer("a1", { input: 10, cacheRead: 900 })], async (agentDir) => {
+      await Bun.write(join(agentDir, "models-store.json"), JSON.stringify({ labrouter: { models: [{ id: "lab/other", contextWindow: 9 }] } }));
+    });
+    expect(probe?.contextWindow).toBeUndefined();
+  });
+
+  test("a compaction after the turn leaves the context unknown", async () => {
+    const probe = await probeOf([header(), answer("a1", { input: 10, cacheRead: 900 }), compaction("c1")], store(400_000));
+    expect(probe?.turnId).toBe("a1");
+    expect(probe?.contextTokens).toBeUndefined();
+  });
+
+  test("a turn after the compaction measures the new context", async () => {
+    const probe = await probeOf([header(), compaction("c1"), answer("a2", { input: 40, cacheRead: 0 })], store(400_000));
+    expect(probe?.contextTokens).toBe(40);
+    expect(probe?.contextWindow).toBe(400_000);
+  });
+
+  test("a failed turn's zeros are passed over for the turn before it", async () => {
+    const failed = answer("a2", { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+    const probe = await probeOf([header(), answer("a1", { input: 10, cacheRead: 900 }), failed], store(400_000));
+    expect(probe?.turnId).toBe("a2");
+    expect(probe?.contextTokens).toBe(910);
+    expect(probe?.contextWindow).toBe(400_000);
+  });
+
+  test("a usage row with no input-side counts names no context", async () => {
+    const probe = await probeOf([header(), answer("a1", { output: 5 })]);
+    expect(probe?.contextTokens).toBeUndefined();
+  });
+});
+
+// The session cost (PaneUsage.cost): the sum of message.usage.cost.total over every assistant row,
+// kept incrementally. The row shape is Oh My Pi 18.6.1's and pi's own.
+describe("the pi probe — the session cost", () => {
+  const SID = "019f1827-bf99-7927-9684-76318de905b5";
+  const cost = (total: number) => ({ input: 3e-7, output: 0.000175, cacheRead: 0.001, cacheWrite: 0.00002, total });
+  const answer = (id: string, total: number | null) => {
+    const counts = { input: 3, output: 350, cacheRead: 120_007, cacheWrite: 125 };
+    const usage = total === null ? counts : { ...counts, cost: cost(total) };
+    return row(id, { role: "assistant", content: [{ type: "text", text: "ok" }], provider: "labrouter", model: "lab/model-one", usage });
+  };
+  const user = (id: string) => row(id, { role: "user", content: [{ type: "text", text: "hi" }], usage: { cost: cost(99) } });
+
+  async function withLog<T>(run: (log: string, probe: () => Promise<number | undefined>) => Promise<T>): Promise<T> {
+    const created = await mkdtemp(join(tmpdir(), "collie-pi-cost-"));
+    try {
+      const root = join(created, "sessions");
+      const project = join(root, "--repo--");
+      await mkdir(project, { recursive: true });
+      const log = join(project, `2026-07-29T10-00-00-000Z_${SID}.jsonl`);
+      await Bun.write(log, "");
+      const journal = piJournal(root);
+      const real = await realpath(log);
+      return await run(real, async () => (await journal.cacheProbe?.({ kind: "path", value: real }))?.costUsd);
+    } finally {
+      await rm(created, { recursive: true, force: true });
+    }
+  }
+
+  test("sums two assistant rows and an aborted zero row, and ignores other roles", async () => {
+    await withLog(async (log, probe) => {
+      const aborted = row("a3", { role: "assistant", content: [], usage: { input: 0, output: 0, cost: cost(0) } });
+      await Bun.write(log, `${[header(), user("u1"), answer("a1", 0.001390995), answer("a2", 0.25), aborted].join("\n")}\n`);
+      expect(await probe()).toBeCloseTo(0.251390995, 9);
+    });
+  });
+
+  test("a log that states no cost, or only zeros, has no cost", async () => {
+    await withLog(async (log, probe) => {
+      await Bun.write(log, `${[header(), answer("a1", null)].join("\n")}\n`);
+      expect(await probe()).toBeUndefined();
+      await Bun.write(log, `${[header(), answer("a1", 0)].join("\n")}\n`);
+      expect(await probe()).toBeUndefined();
+    });
+  });
+
+  test("a new row adds to the sum, and a torn last line waits for its newline", async () => {
+    await withLog(async (log, probe) => {
+      await Bun.write(log, `${[header(), answer("a1", 0.5)].join("\n")}\n`);
+      expect(await probe()).toBeCloseTo(0.5, 9);
+      const next = answer("a2", 0.25);
+      const handle = Bun.file(log);
+      const before = await handle.text();
+      await Bun.write(log, before + next.slice(0, 40));
+      expect(await probe()).toBeCloseTo(0.5, 9);
+      await Bun.write(log, `${before}${next}\n`);
+      expect(await probe()).toBeCloseTo(0.75, 9);
+      expect(await probe()).toBeCloseTo(0.75, 9);
+    });
+  });
+
+  test("a file replaced by a shorter one starts the sum again", async () => {
+    await withLog(async (log, probe) => {
+      await Bun.write(log, `${[header(), answer("a1", 0.5), answer("a2", 0.5)].join("\n")}\n`);
+      expect(await probe()).toBeCloseTo(1, 9);
+      await Bun.write(log, `${[header(), answer("b1", 0.125)].join("\n")}\n`);
+      expect(await probe()).toBeCloseTo(0.125, 9);
+    });
+  });
+
+  test("reads a big log in one pass", async () => {
+    await withLog(async (log, probe) => {
+      const rows = Array.from({ length: 2000 }, (_, i) => answer(`a${i}`, 0.01));
+      await Bun.write(log, `${[header(), ...rows].join("\n")}\n`);
+      expect(await probe()).toBeCloseTo(20, 6);
+    });
   });
 });

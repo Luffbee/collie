@@ -164,6 +164,14 @@ describe("phases and receipts", () => {
     expect(new RequestStore(dir).get(ID)).toBeNull();
   });
 
+  test("a receipt's proof gap survives a restart (2026-10-25)", () => {
+    const first = new RequestStore(dir);
+    const { record } = first.accept(input());
+    const receipt: SendReceipt = { ...receiptFor(record), gapsMs: { s0: 120, proof: 640 } };
+    first.settle(ID, receipt);
+    expect(new RequestStore(dir).get(ID)?.receipt).toEqual(receipt);
+  });
+
   test("a detail and saw survive a restart; a future saw word drops only saw, a long detail is cut, a detail of the wrong type is dropped, and the receipt stays", () => {
     const first = new RequestStore(dir);
     const { record } = first.accept(input());
@@ -275,6 +283,52 @@ describe("phases and receipts", () => {
 });
 
 // Ask answers live in the same store (M56 spec 08), under their own file names.
+describe("a queued receipt whose text came back (ADR 0122)", () => {
+  test("a settled `sent` + `queued` takes `late: returned` once; outcome and queued stay; it survives a restart", () => {
+    const store = new RequestStore(dir);
+    const { record } = store.accept(input());
+    store.settle(ID, { ...receiptFor(record), queued: true });
+    expect(store.markReturned(ID)).toBe(true);
+    expect(store.markReturned(ID)).toBe(false);
+    expect(store.get(ID)?.receipt).toMatchObject({ outcome: "sent", queued: true, late: "returned" });
+    expect(new RequestStore(dir).get(ID)?.receipt?.late).toBe("returned");
+  });
+
+  test("a settled `steered` receipt takes it too, once, and keeps its outcome", () => {
+    const store = new RequestStore(dir);
+    const { record } = store.accept(input({ id: "req-steer-00001" }));
+    store.settle("req-steer-00001", receiptFor(record, "steered"));
+    expect(store.markReturned("req-steer-00001")).toBe(true);
+    expect(store.markReturned("req-steer-00001")).toBe(false);
+    expect(store.get("req-steer-00001")?.receipt).toMatchObject({ outcome: "steered", late: "returned" });
+  });
+
+  test("only a settled queued `sent` takes it: not a plain send, not an effective one, not an unsettled one", () => {
+    const store = new RequestStore(dir);
+    const plain = store.accept(input({ id: "req-plain-0001" })).record;
+    store.settle("req-plain-0001", receiptFor(plain));
+    expect(store.markReturned("req-plain-0001")).toBe(false);
+    const landed = store.accept(input({ id: "req-landed-001" })).record;
+    store.settle("req-landed-001", { ...receiptFor(landed, "effective"), queued: true });
+    expect(store.markReturned("req-landed-001")).toBe(false);
+    store.accept(input({ id: "req-open-00001" }));
+    expect(store.markReturned("req-open-00001")).toBe(false);
+    expect(store.markReturned("req-none-00001")).toBe(false);
+  });
+
+  test("a late word this build did not write is dropped, and the receipt stays", () => {
+    const store = new RequestStore(dir);
+    const { record } = store.accept(input());
+    store.settle(ID, { ...receiptFor(record), queued: true });
+    const path = join(dir, `${ID}.json`);
+    const raw = JSON.parse(readFileSync(path, "utf8"));
+    writeFileSync(path, JSON.stringify({ ...raw, receipt: { ...raw.receipt, late: "teleported" } }));
+    const read = store.get(ID)?.receipt;
+    expect(read).toMatchObject({ outcome: "sent", queued: true });
+    expect(read && "late" in read).toBe(false);
+  });
+});
+
 describe("ask answers in the same store", () => {
   const ASK = "ask-0123456789abcd";
   const askInput = { id: ASK, session: "main", paneId: "%1", paneGeneration: "g1", hash: "0abc12", optionId: "2" };

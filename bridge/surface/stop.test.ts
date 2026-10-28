@@ -347,6 +347,114 @@ describe("a stopped receipt is told to the fold", () => {
   });
 });
 
+describe("a queued message the Stop gives back to the box (ADR 0122)", () => {
+  // Tester 03's case 0 on OMP 18.6.1: `second message` waits under `After yield · 1`, Escape ends the
+  // turn and OMP moves the text back into its box (web/src/fixtures/panes/README.md).
+  const OMP_QUEUED = fx("omp--v18-6-1-queued-before-stop--w119.txt");
+  const OMP_RETURNED = fx("omp--v18-6-1-stop-returned--w119.txt");
+
+  function queuedRig(returned: (paneId: string, read: { readonly box: string | null; readonly at: number; readonly turn: string }) => readonly string[]) {
+    const pane = new ScriptPane(OMP_QUEUED);
+    const service = new StopService({
+      mux: pane,
+      gate: new KeyGate(pane),
+      profile: (harness) => Promise.resolve(profileFor(harness, "18.6.1", { log: () => undefined })),
+      sleep: () => Promise.resolve(),
+      now: () => 5_000,
+      returned,
+    });
+    pane.onKeys = (_keys, p) => void (p.screen = OMP_RETURNED);
+    return { pane, service };
+  }
+
+  test("each read-back's box goes to the Send Protocol, and what it says came back rides the receipt", async () => {
+    const boxes: (string | null)[] = [];
+    const { service } = queuedRig((paneId, read) => {
+      expect(paneId).toBe("%2");
+      expect(read.at).toBe(5_000);
+      // The turn the read-back showed goes along: the Send Protocol keeps a running turn's cards alive.
+      expect(read.turn).toBe("idle");
+      boxes.push(read.box);
+      return read.box === "second message" ? ["queued-0001"] : [];
+    });
+    const answer = await service.handle(ID, "%2", "omp");
+    expect(answer).toEqual({ kind: "receipt", replayed: false, receipt: { requestId: ID, outcome: "stopped", keys: ["Escape"], returned: ["queued-0001"] } });
+    // The two reads before the key are not handed over: only what the key left on screen counts.
+    expect(boxes).toEqual(["second message", "second message"]);
+  });
+
+  test("nothing back in the box: the receipt carries no `returned`, as before", async () => {
+    const { service } = queuedRig(() => []);
+    const answer = await service.handle(ID, "%2", "omp");
+    expect(answer).toEqual({ kind: "receipt", replayed: false, receipt: { requestId: ID, outcome: "stopped", keys: ["Escape"] } });
+  });
+
+  test("a Send Protocol that throws leaves the receipt as it was", async () => {
+    const { service } = queuedRig(() => {
+      throw new Error("the store is gone");
+    });
+    const answer = await service.handle(ID, "%2", "omp");
+    expect(answer).toMatchObject({ receipt: { outcome: "stopped" } });
+    expect(answer.kind === "receipt" && "returned" in answer.receipt).toBe(false);
+  });
+});
+
+describe("a Stop on omp's running local shell line (omp-gang three, tester 5, W3)", () => {
+  // `!sleep 25` runs in omp's own bash block: `⠋ Running… (⎋ to cancel)`, no model turn. The profile did not name the
+  // row, the Surface read the turn idle and the Stop was refused `turn_idle` for a command only Escape ends.
+  const SURFACE = join(import.meta.dir, "..", "..", "web", "src", "fixtures", "surface");
+  const sfx = (name: string): string => readFileSync(join(SURFACE, name), "utf8");
+  const SCREENS = [
+    ["18.6.1", "omp--v18-6-1-local-bash-running--w120.txt"],
+    ["18.12.6", "omp--v18-12-6-local-bash-running--w120.txt"],
+  ] as const;
+  /** The screen once Escape ended the command: the Running block's rows gone. */
+  const ended = (screen: string): string => screen.split("\n").filter((row) => !row.includes("Running…") && !row.includes("$ sleep")).join("\n");
+
+  for (const [version, name] of SCREENS) {
+    test(`${version}: the Stop presses Escape, the key the row names, and the command ending is \`stopped\``, async () => {
+      const screen = sfx(name);
+      const pane = new ScriptPane(screen);
+      pane.onKeys = (_keys, p) => void (p.screen = ended(screen));
+      const service = new StopService({
+        mux: pane,
+        gate: new KeyGate(pane),
+        profile: (harness) => Promise.resolve(profileFor(harness, version, { log: () => undefined })),
+        sleep: () => Promise.resolve(),
+      });
+      const answer = await service.handle(ID, "%2", "omp");
+      expect(answer).toEqual({ kind: "receipt", replayed: false, receipt: { requestId: ID, outcome: "stopped", keys: ["Escape"] } });
+      expect(pane.keysSeen).toEqual([["Escape"]]);
+    });
+
+    test(`${version}: a command that ignores the key ends \`pressed\`, one press, as a model turn does`, async () => {
+      const pane = new ScriptPane(sfx(name));
+      const service = new StopService({
+        mux: pane,
+        gate: new KeyGate(pane),
+        profile: (harness) => Promise.resolve(profileFor(harness, version, { log: () => undefined })),
+        sleep: () => Promise.resolve(),
+      });
+      const answer = await service.handle(ID, "%2", "omp");
+      expect(answer).toEqual({ kind: "receipt", replayed: false, receipt: { requestId: ID, outcome: "pressed", keys: ["Escape"] } });
+      expect(pane.keysSeen).toEqual([["Escape"]]);
+    });
+
+    test(`${version}: with the Running row gone the pane reads idle and the Stop is refused turn_idle, nothing pressed`, async () => {
+      const pane = new ScriptPane(ended(sfx(name)));
+      const service = new StopService({
+        mux: pane,
+        gate: new KeyGate(pane),
+        profile: (harness) => Promise.resolve(profileFor(harness, version, { log: () => undefined })),
+        sleep: () => Promise.resolve(),
+      });
+      const answer = await service.handle(ID, "%2", "omp");
+      expect(answer).toEqual({ kind: "receipt", replayed: false, receipt: { requestId: ID, outcome: "refused", reason: "turn_idle" } });
+      expect(pane.keysSeen).toEqual([]);
+    });
+  }
+});
+
 describe("the route's body", () => {
   test("no request id, a bad one, or a body that is no object is a 400; a pane the engine lacks is a 404", async () => {
     const { pane, stop } = rig(PI_RUNNING);

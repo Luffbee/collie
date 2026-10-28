@@ -109,6 +109,10 @@ const LIFTED = new Set([
   "omp--v18-4-ask-single.txt",
   "omp--v18-8-ask-single-described-moved.txt",
   "omp--v18-8-ask-single-described.txt",
+  // omp 18.12.6's Ask with option previews (omp/ask.ts, OPTION PREVIEWS).
+  "omp--v18-12-6-ask-previews--w120.txt",
+  // omp 18.12.6 in plan mode: the "Gather task for plan mode" Ask, four options with descriptions and previews.
+  "omp--v18-12-6-ask-plan-mode--w120.txt",
   "omp--v18-10-ask-single.txt",
   "omp--v18-10-ask-batch.txt",
   "omp--v18-10-ask-batch-moved.txt",
@@ -126,6 +130,14 @@ const LIFTED = new Set([
   "omp--v18-4-approval-write-long.txt",
   "omp--v18-4-approval-write-moved.txt",
   "omp--v18-4-approval-write.txt",
+  // omp 18.12.6's divided approval panel (approval.ts, the second shape): lifted for `bash`.
+  "omp--v18-12-6-approval-bash--w120.txt",
+  "omp--v18-12-6-approval-bash-later--w120.txt",
+  // omp 18.12.6's `Allow tool: task` (a summary tool) and its free-text-only Ask (`Other` alone), both lifted.
+  "omp--v18-12-6-approval-task--w120.txt",
+  "omp--v18-12-6-ask-freetext--w120.txt",
+  // omp 18.6.1's `Allow tool: goal`, a dialog with no body (approval.ts, BODYLESS_TOOLS).
+  "omp--v18-6-1-approval-goal--w120.txt",
   // The compact model picker's session state is DERIVED: every `omp--v18-4-switch*` capture except the
   // declined states listed in DECLINED_SWITCH. A new capture of it lifts by default, and the conformance
   // suite fails it loudly if it does not, which is the moment a person files it as declined with a reason.
@@ -162,6 +174,74 @@ const TALL_PALETTE_V18_11 = [
 
 // The one omp 18.12.2 palette taller than the bridge's tail window: a bare `/goal` typed in a goal turn.
 const TALL_PALETTE_V18_12 = ["omp--v18-12-2-goal-bare-typed--w119.txt"];
+
+// omp 18.6.1 and 18.12.6 (omp-gang testers, 2026-10-25): the fuzzy list under the open box for `/`, `/help`,
+// `/mo` and `/nothere`, up to ten rows pointed at a command that is not the typed one, and the one-row
+// shapes of 18.12.6: a list row under a typed `//comment`, and the same row left under the emptied box.
+// All are composers. The ten-row ones are taller than the bridge's tail window: no region bound.
+const FUZZY_LIST_TALL = [
+  "omp--v18-6-1-slash-help-unlisted--w120.txt",
+  "omp--v18-6-1-slash-mo-fuzzy--w120.txt",
+  "omp--v18-6-1-slash-nothere-fuzzy--w120.txt",
+  "omp--v18-6-1-slash-open-tall--w120.txt",
+  "omp--v18-12-6-slash-help-unlisted--w120.txt",
+  "omp--v18-12-6-slash-mo-fuzzy--w120.txt",
+  "omp--v18-12-6-slash-nothere-fuzzy--w120.txt",
+];
+const FUZZY_LIST_SHORT = ["omp--v18-12-6-slash-comment-loop-row--w120.txt", "omp--v18-12-6-stale-list-row-empty-box--w120.txt"];
+
+// omp 18.6.1 and 18.12.6 (omp-gang testers 05 and 12, 2026-10-25): a file path typed at the end of the box
+// (an upload path, `~/...`) draws omp's file popup under it, one `❯ name.png` row. All are composers.
+const PATH_POPUP = [
+  "omp--v18-6-1-path-popup--w120.txt",
+  "omp--v18-6-1-path-popup-tilde--w120.txt",
+  "omp--v18-12-6-path-popup--w120.txt",
+  "omp--v18-12-6-path-popup-two-paths--w120.txt",
+];
+
+// omp 18.6.1 (omp-gang tester 12, 2026-10-25): the `@` file popup and the `#` issue and pull request popup
+// under the box, and the `#` rows left under an emptied box. All are composers.
+// The eight-row emoji popup is as tall as a palette: the composer is ready, and no region can bind.
+const EMOJI_POPUP = ["omp--v18-12-6-emoji-popup--w120.txt", "omp--v18-6-1-emoji-popup--w120.txt", "omp--v18-12-6-hash-end-actions--w120.txt", "omp--v18-6-1-hash-end-actions--w120.txt"];
+const TYPEAHEAD_POPUP = [
+  "omp--v18-6-1-at-popup--w120.txt",
+  "omp--v18-6-1-at-popup-path--w120.txt",
+  "omp--v18-6-1-hash-popup--w120.txt",
+  "omp--v18-6-1-hash-popup-single--w120.txt",
+  "omp--v18-6-1-hash-popup-stale--w120.txt",
+  "omp--v18-12-6-emoji-popup--w120.txt",
+  "omp--v18-6-1-emoji-popup--w120.txt",
+  // omp-gang three, 2026-10-26: the seven-row editor-action list a trailing bare `#` opens.
+  "omp--v18-12-6-hash-end-actions--w120.txt",
+  "omp--v18-6-1-hash-end-actions--w120.txt",
+  "omp--v18-12-6-path-popup-partial--w120.txt",
+  "omp--v18-6-1-at-popup-stale--w120.txt",
+  "omp--v18-12-6-at-popup-two-files--w120.txt",
+];
+
+// omp 18.6.1 (omp-gang tester 12, 2026-10-25): a long prompt that quotes a permission dialog, typed in the box and
+// not sent. A composer: the quoted rows are the person's text.
+const QUOTED_DIALOG = ["omp--v18-6-1-quoted-dialog-draft--w120.txt"];
+
+// omp 18.6.1 and 18.12.6 (omp-gang 11-geometry, 2026-10-25): the box under a status row the profile did not read before,
+// the full preset at 80 columns (its gauge shrinks to ─5%─┃200K─) and the ascii preset. All are composers.
+const STATUS_ROWS = [
+  "omp--v18-12-6-status-ascii-draft--w80.txt",
+  "omp--v18-12-6-status-ascii-idle--w130.txt",
+  "omp--v18-12-6-status-full-slash-draft--w80.txt",
+  "omp--v18-12-6-status-full-slash-idle--w80.txt",
+  "omp--v18-6-1-status-ascii-idle--w80.txt",
+  "omp--v18-6-1-status-full-slash-idle--w80.txt",
+];
+
+// omp 18.6.1 and 18.12.6 with `symbolPreset: ascii` (omp-gang 11-geometry, 2026-10-25): `/session` typed, and the list under
+// the box draws its cursor as `>`. Composers, the list is composer chrome.
+// Drafts the box wraps by cutting a token (omp-gang 11-geometry W4): a CJK run at 80 columns and a URL wider than a row.
+// omp 18.12.6 with `composer.shape: field` (omp-gang 11-geometry W5): a borderless box of ▐ rows, empty and with two draft lines.
+// The Surface reads it (idle.frameAlternates); the older chrome walk of this adapter does not, so composerReady stays false here.
+const BORDERLESS_FIELD_COMPOSERS = ["omp--v18-12-6-composer-field-idle--w130.txt", "omp--v18-12-6-composer-field-two-lines--w130.txt"];
+const TOKEN_WRAPPED_DRAFTS = ["omp--v18-6-1-draft-cjk-wrapped--w80.txt", "omp--v18-12-6-draft-url-wrapped--w80.txt"];
+const ASCII_SYMBOL_LISTS = ["omp--v18-12-6-ascii-symbols-session-list--w130.txt", "omp--v18-6-1-ascii-symbols-session-list--w130.txt"];
 
 const DECLINED = new Set([
   // — Composer states. An input box is chrome, never a dialog; stripChrome peels it, the statusline
@@ -223,13 +303,21 @@ const DECLINED = new Set([
   "omp--v18-6-queue-after-now--w120.txt",
   "omp--v18-6-queue-done--w120.txt",
   "omp--v18-6-queue-typed--w120.txt",
+  "omp--v18-6-skill-chip--w120.txt",
   "omp--v18-6-steer-after--w120.txt",
   "omp--v18-6-steer-after-now--w120.txt",
   "omp--v18-6-steer-done--w120.txt",
   "omp--v18-6-steer-over-queued--w120.txt",
   "omp--v18-6-steer-pending-block--w120.txt",
   "omp--v18-6-steer-typed--w120.txt",
+  // omp 18.6.1: a line queued with Ctrl+Q under `After yield · 1`, then Stop gave it back to the box (ADR 0122).
+  "omp--v18-6-1-queued-before-stop--w119.txt",
+  "omp--v18-6-1-stop-returned--w119.txt",
+  // omp 18.6.1 under Herdr (2026-10-25): a stale bottom frame below the live editor; it reads as a draft.
+  "omp--v18-6-1-stale-frame-below-live--w120.txt",
   // omp 18.12.1's default `band` composer under the nerd preset, and one unicode control (issue 505).
+  "omp--v18-12-6-image-chip--w120.txt",
+  "omp--v18-12-6-skill-chip--w120.txt",
   "omp--v18-12-band-idle--w130.txt",
   "omp--v18-12-nerd-band-done--w130.txt",
   "omp--v18-12-nerd-band-done--w80.txt",
@@ -333,6 +421,20 @@ const DECLINED = new Set([
   // omp 18.6.1 (lab, 2026-10-17): the slash palette under the box for `/model`, `/settings` and `/mod`,
   // a composer, and the Models picker and settings screen those commands open, two modals. Nothing to lift.
   ...ALL_V18_6,
+  // omp 18.6.1 and 18.12.6 (2026-10-25): the fuzzy list under the box, and the row left under an emptied box.
+  ...FUZZY_LIST_TALL,
+  ...FUZZY_LIST_SHORT,
+  // omp 18.6.1 and 18.12.6 (2026-10-25): the file popup under a path typed in the box, a composer.
+  ...PATH_POPUP,
+  ...TYPEAHEAD_POPUP,
+  ...QUOTED_DIALOG,
+  // omp 18.6.1 and 18.12.6 (2026-10-25): the rewind picker (Esc Esc), a full-screen modal with no box. Nothing to lift.
+  "omp--v18-6-1-rewind-picker--w120.txt",
+  "omp--v18-12-6-rewind-picker--w120.txt",
+  ...STATUS_ROWS,
+  ...ASCII_SYMBOL_LISTS,
+  ...TOKEN_WRAPPED_DRAFTS,
+  ...BORDERLESS_FIELD_COMPOSERS,
 ]);
 
 // The own cohort is the lifted captures, so every conformance leg that needs one runs on them
@@ -354,7 +456,9 @@ describeAdapterConformance(ompAdapter, {
   // changed while clearing it" (pi-shape.ts `piComposerPrompt`). Null means an unbound write, exactly
   // as the boxed shape answers for the same palette sitting under its own composer (chrome.ts).
   // omp 18.6.1 draws a ten-row palette under its open box for `/model` and `/mod` (lab, 2026-10-17): the same trade.
-  unboundComposerFixtures: ["omp--v18-8-slash-palette.txt", "omp--v18-8-slash-palette-w48.txt", ...TALL_PALETTE_V18_6, ...TALL_PALETTE_V18_11, ...TALL_PALETTE_V18_12],
+  // `Allow tool: goal` has no body: every row of its region is fixed text, so a changed row stops the lift.
+  fixedRegionFixtures: ["omp--v18-6-1-approval-goal--w120.txt"],
+  unboundComposerFixtures: ["omp--v18-8-slash-palette.txt", "omp--v18-8-slash-palette-w48.txt", ...TALL_PALETTE_V18_6, ...TALL_PALETTE_V18_11, ...TALL_PALETTE_V18_12, ...FUZZY_LIST_TALL, ...QUOTED_DIALOG, ...ASCII_SYMBOL_LISTS, ...EMOJI_POPUP],
 });
 
 // The corpus pin (mirroring claude/chrome.test.ts's): a newly-captured omp fixture must be filed into
@@ -447,6 +551,34 @@ describe("the omp corpus", () => {
     "omp--v18-12-2-goal-resume-typed--w119.txt",
     "omp--v18-12-2-goal-turn-running--w119.txt",
     "omp--v18-12-2-goal-turn-running-probe--w119.txt",
+    "omp--v18-12-6-approval-bash--w120.txt",
+    "omp--v18-12-6-approval-bash-later--w120.txt",
+    "omp--v18-12-6-approval-task--w120.txt",
+    "omp--v18-12-6-ascii-symbols-session-list--w130.txt",
+    "omp--v18-12-6-ask-freetext--w120.txt",
+    "omp--v18-12-6-ask-plan-mode--w120.txt",
+    "omp--v18-12-6-ask-previews--w120.txt",
+    "omp--v18-12-6-at-popup-two-files--w120.txt",
+    "omp--v18-12-6-composer-field-idle--w130.txt",
+    "omp--v18-12-6-composer-field-two-lines--w130.txt",
+    "omp--v18-12-6-draft-url-wrapped--w80.txt",
+    "omp--v18-12-6-emoji-popup--w120.txt",
+    "omp--v18-12-6-hash-end-actions--w120.txt",
+    "omp--v18-12-6-image-chip--w120.txt",
+    "omp--v18-12-6-path-popup--w120.txt",
+    "omp--v18-12-6-path-popup-partial--w120.txt",
+    "omp--v18-12-6-path-popup-two-paths--w120.txt",
+    "omp--v18-12-6-rewind-picker--w120.txt",
+    "omp--v18-12-6-skill-chip--w120.txt",
+    "omp--v18-12-6-slash-comment-loop-row--w120.txt",
+    "omp--v18-12-6-slash-help-unlisted--w120.txt",
+    "omp--v18-12-6-slash-mo-fuzzy--w120.txt",
+    "omp--v18-12-6-slash-nothere-fuzzy--w120.txt",
+    "omp--v18-12-6-stale-list-row-empty-box--w120.txt",
+    "omp--v18-12-6-status-ascii-draft--w80.txt",
+    "omp--v18-12-6-status-ascii-idle--w130.txt",
+    "omp--v18-12-6-status-full-slash-draft--w80.txt",
+    "omp--v18-12-6-status-full-slash-idle--w80.txt",
     "omp--v18-12-band-idle--w130.txt",
     "omp--v18-12-nerd-band-done--w130.txt",
     "omp--v18-12-nerd-band-done--w80.txt",
@@ -517,12 +649,37 @@ describe("the omp corpus", () => {
     "omp--v18-4-switch-wrapped.txt",
     "omp--v18-4-switch.txt",
     "omp--v18-4-tree.txt",
+    "omp--v18-6-1-approval-goal--w120.txt",
+    "omp--v18-6-1-ascii-symbols-session-list--w130.txt",
+    "omp--v18-6-1-at-popup--w120.txt",
+    "omp--v18-6-1-at-popup-path--w120.txt",
+    "omp--v18-6-1-at-popup-stale--w120.txt",
+    "omp--v18-6-1-draft-cjk-wrapped--w80.txt",
+    "omp--v18-6-1-emoji-popup--w120.txt",
+    "omp--v18-6-1-hash-end-actions--w120.txt",
+    "omp--v18-6-1-hash-popup--w120.txt",
+    "omp--v18-6-1-hash-popup-single--w120.txt",
+    "omp--v18-6-1-hash-popup-stale--w120.txt",
+    "omp--v18-6-1-path-popup--w120.txt",
+    "omp--v18-6-1-path-popup-tilde--w120.txt",
+    "omp--v18-6-1-queued-before-stop--w119.txt",
+    "omp--v18-6-1-quoted-dialog-draft--w120.txt",
+    "omp--v18-6-1-rewind-picker--w120.txt",
+    "omp--v18-6-1-slash-help-unlisted--w120.txt",
+    "omp--v18-6-1-slash-mo-fuzzy--w120.txt",
+    "omp--v18-6-1-slash-nothere-fuzzy--w120.txt",
+    "omp--v18-6-1-slash-open-tall--w120.txt",
+    "omp--v18-6-1-stale-frame-below-live--w120.txt",
+    "omp--v18-6-1-status-ascii-idle--w80.txt",
+    "omp--v18-6-1-status-full-slash-idle--w80.txt",
+    "omp--v18-6-1-stop-returned--w119.txt",
     "omp--v18-6-model-selector-empty--w120.txt",
     "omp--v18-6-queue-after--w120.txt",
     "omp--v18-6-queue-after-now--w120.txt",
     "omp--v18-6-queue-done--w120.txt",
     "omp--v18-6-queue-typed--w120.txt",
     "omp--v18-6-settings-screen--w120.txt",
+    "omp--v18-6-skill-chip--w120.txt",
     "omp--v18-6-slash-mod-partial--w120.txt",
     "omp--v18-6-slash-model-list--w120.txt",
     "omp--v18-6-slash-model-list--w80.txt",
@@ -602,6 +759,7 @@ describe("ompBuildBlocks emits nothing but raw, bar the four lifted screens", ()
         "cancelKey", // the unread-dialog card's one key, a declaration (.adr/0053, .adr/0076)
         "composerPrompt", // the row a destructive write BINDS to; it sends nothing itself
         "composerReady", // the pre-flight's refusal
+        "dialogDetectors", // names for the card's report, read only (ADR 0123 amendment 2026-10-28)
         "modalOnScreen", // positive evidence a modal is up: the card's fifth condition
         "replyChunks", // lossless transport plan, not a dialog action
         "draftIsOpaque", // never take over an opaque paste chip as literal text
@@ -708,13 +866,21 @@ const COMPOSER_FIXTURES = [
   "omp--v18-6-queue-after-now--w120.txt",
   "omp--v18-6-queue-done--w120.txt",
   "omp--v18-6-queue-typed--w120.txt",
+  "omp--v18-6-skill-chip--w120.txt",
   "omp--v18-6-steer-after--w120.txt",
   "omp--v18-6-steer-after-now--w120.txt",
   "omp--v18-6-steer-done--w120.txt",
   "omp--v18-6-steer-over-queued--w120.txt",
   "omp--v18-6-steer-pending-block--w120.txt",
   "omp--v18-6-steer-typed--w120.txt",
+  // omp 18.6.1: a line queued with Ctrl+Q under `After yield · 1`, then Stop gave it back to the box (ADR 0122).
+  "omp--v18-6-1-queued-before-stop--w119.txt",
+  "omp--v18-6-1-stop-returned--w119.txt",
+  // omp 18.6.1 under Herdr (2026-10-25): a stale bottom frame below the live editor; it reads as a draft.
+  "omp--v18-6-1-stale-frame-below-live--w120.txt",
   // omp 18.12.1's default `band` composer under the nerd preset, and one unicode control (issue 505).
+  "omp--v18-12-6-image-chip--w120.txt",
+  "omp--v18-12-6-skill-chip--w120.txt",
   "omp--v18-12-band-idle--w130.txt",
   "omp--v18-12-nerd-band-done--w130.txt",
   "omp--v18-12-nerd-band-done--w80.txt",
@@ -743,6 +909,16 @@ const COMPOSER_FIXTURES = [
   "omp--v18-6-slash-model-list--w80.txt",
   "omp--v18-6-slash-settings-list--w120.txt",
   "omp--v18-6-slash-settings-list--w80.txt",
+  // omp 18.6.1 and 18.12.6 (2026-10-25): the fuzzy list under the open box and the row left under an emptied box.
+  ...FUZZY_LIST_TALL,
+  ...FUZZY_LIST_SHORT,
+  // omp 18.6.1 and 18.12.6 (2026-10-25): the file popup under a path typed in the box.
+  ...PATH_POPUP,
+  ...TYPEAHEAD_POPUP,
+  ...QUOTED_DIALOG,
+  ...STATUS_ROWS,
+  ...ASCII_SYMBOL_LISTS,
+  ...TOKEN_WRAPPED_DRAFTS,
 ];
 
 describe("composerReady — the gate the reply path pre-flights on", () => {

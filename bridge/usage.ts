@@ -14,6 +14,13 @@
 // come first from the vendor's usage endpoint with the operator's own login (bridge/account-windows.ts,
 // .adr/0118); a wrapped statusLine is the second road.
 //
+// OTHER HARNESSES WRITE NO FILE, so since 2026-10-25 their context comes from the journal: the cache
+// probe that already reads the session log for the prompt-cache chip also names the tokens the last
+// turn carried and, where it can, the model's window (bridge/cache/tracker.ts § context). Codex's log
+// names the window itself; pi, Oh My Pi and OpenCode take it from the harness's own model catalog on
+// disk (bridge/journal/model-window.ts). No window, no context: a model no catalog names has no
+// context dot, and the model label still draws. A usage file's context, where one exists, wins.
+//
 // ONE FILE PER SESSION, named by a digest of the harness session id, never by the pane: the pane
 // already knows its session (`agentSession`, from Herdr or the beacon), and a session id cannot be
 // renumbered under it the way a pane id can. `/clear` starts a new session and therefore a new file;
@@ -77,6 +84,14 @@ export interface PaneUsage {
   context?: number;
   /** The windows still running, in {@link USAGE_WINDOWS} order. Absent rather than empty. */
   limits?: UsageLimit[];
+  /**
+   * The running total of what the session this pane shows has cost, in US dollars (never a count of
+   * tokens; Collie prices nothing itself). Claude Code reports it in the statusLine document
+   * (`cost.total_cost_usd`); pi, Oh My Pi and OpenCode write it on every assistant message in their
+   * logs, and the journal sums those (`CacheProbe.costUsd`); Codex's log carries none. ABSENT, NEVER A
+   * PLACEHOLDER: no `0` for "unknown". A usage file's cost wins over the journal's, as the context does.
+   */
+  cost?: number;
 }
 
 /**
@@ -113,10 +128,21 @@ export function usageFileName(session: string): string {
   return `${createHash("sha256").update(session).digest("hex").slice(0, 32)}.json`;
 }
 
+/** The share of a window `tokens` fill, floored to one decimal so a window that is not full never reads as 100. */
+export function contextPercent(tokens: number, window: number): number {
+  return Math.floor(Math.min(100, (tokens / window) * 100) * 10) / 10;
+}
+
 /** A percentage as the phone may draw it, or undefined for anything that is not a finite number. */
 export function asPercent(value: JsonValue | undefined): number | undefined {
   const n = asJsonNumber(value);
   return n === undefined || !Number.isFinite(n) ? undefined : Math.min(100, Math.max(0, n));
+}
+
+/** A cost as the phone may draw it: a finite number of dollars, zero or more. Anything else is no reading. */
+export function asCost(value: JsonValue | undefined): number | undefined {
+  const n = asJsonNumber(value);
+  return n === undefined || !Number.isFinite(n) || n < 0 ? undefined : n;
 }
 
 function asEpochMs(value: JsonValue | undefined): number | undefined {
@@ -138,6 +164,8 @@ export function parseUsageRecord(text: string): UsageRecord | null {
   const record: UsageRecord = { schemaVersion: USAGE_SCHEMA_VERSION, harness: harness.slice(0, 32), at };
   const context = asPercent(root.context);
   if (context !== undefined) record.context = context;
+  const cost = asCost(root.cost);
+  if (cost !== undefined) record.cost = cost;
   const size = asJsonNumber(root.window);
   if (size !== undefined && Number.isInteger(size) && size > 0 && size <= WINDOW_MAX) record.window = size;
   const rows = Array.isArray(root.limits) ? root.limits.map(asJsonObject) : [];
@@ -162,7 +190,8 @@ export function usageAt(record: UsageRecord, now: number): PaneUsage | undefined
   if (record.context !== undefined) usage.context = record.context;
   const limits = (record.limits ?? []).filter((limit) => limit.resetsAt === undefined || limit.resetsAt > now);
   if (limits.length > 0) usage.limits = limits;
-  return usage.context === undefined && usage.limits === undefined ? undefined : usage;
+  if (record.cost !== undefined) usage.cost = record.cost;
+  return usage.context === undefined && usage.limits === undefined && usage.cost === undefined ? undefined : usage;
 }
 
 /** The disk, as the tracker needs it. A seam, so the rules are testable with no temp files. */
@@ -215,6 +244,16 @@ export interface AccountLimits {
   limits(harness: string): UsageLimit[] | undefined;
 }
 
+/**
+ * The context the journal read for a session (bridge/cache/tracker.ts): synchronous, memory only,
+ * keyed by the pane's `agentSession` value as the cache chip is.
+ */
+export interface JournalContext {
+  context(sessionKey: string): { tokens: number; window?: number } | undefined;
+  /** The session's cost in US dollars that the journal summed, or undefined (`CacheTracker.cost`). */
+  cost?(sessionKey: string): number | undefined;
+}
+
 /** How often the directory is swept for old files. */
 const PRUNE_EVERY_MS = 60 * 60 * 1000;
 
@@ -238,6 +277,7 @@ export class UsageTracker {
     private readonly files: UsageFiles,
     private readonly now: () => number = Date.now,
     private readonly account?: AccountLimits,
+    private readonly journal?: JournalContext,
   ) {}
 
   /** The session id a pane's usage is keyed by, or null for a pane with no id-kind session. */
@@ -286,20 +326,52 @@ export class UsageTracker {
    * reported through a wrapped statusLine: a session that last spoke an hour ago shows what a busier
    * one learned since. On that road only a session that reported windows of its own gets them, so an
    * API-key session beside a subscription one stays without.
+   *
+   * The context comes from the session's usage file when that holds one (Claude's beacon or wrapped
+   * statusLine), else from the journal's reading of the same session when it knows both the tokens
+   * and the window (pi, OMP, Codex, OpenCode; .adr/0115 amended 2026-10-25). The cost follows the
+   * same rule: the file's (Claude's statusLine), else the journal's sum (pi, OMP, OpenCode).
    */
   get(pane: AgentView): PaneUsage | undefined {
     const session = UsageTracker.sessionOf(pane);
     const record = session === null ? null : (this.held.get(session)?.record ?? null);
     const now = this.now();
     const harness = pane.kind === "shell" ? undefined : pane.agent || record?.harness;
+    // The journal fills what the usage file leaves out: the file's own context and cost win.
+    const overlay: PaneUsage = {};
+    const journalContext = record?.context === undefined ? this.journalContext(pane) : undefined;
+    if (journalContext !== undefined) overlay.context = journalContext;
+    const journalCost = record?.cost === undefined ? this.journalCost(pane) : undefined;
+    if (journalCost !== undefined) overlay.cost = journalCost;
     const account = harness === undefined || harness === "" ? undefined : this.account?.limits(harness);
     if (account !== undefined && account.length > 0) {
       const base: UsageRecord = record ?? { schemaVersion: USAGE_SCHEMA_VERSION, harness: harness ?? "", at: now };
-      return usageAt({ ...base, limits: account }, now);
+      return usageAt({ ...base, ...overlay, limits: account }, now);
     }
-    if (record === null) return undefined;
-    if (record.limits === undefined) return usageAt(record, now);
-    return usageAt({ ...record, limits: this.newestLimits(record.harness, now) }, now);
+    if (record === null) return overlay.context === undefined && overlay.cost === undefined ? undefined : overlay;
+    const held = record.limits === undefined ? record : { ...record, limits: this.newestLimits(record.harness, now) };
+    return usageAt({ ...held, ...overlay }, now);
+  }
+
+  /**
+   * The pane's context from the journal, as a percentage, or undefined: no reading, no window, or a
+   * shell pane. Keyed by the session ref's value of either kind, as the cache chip is.
+   */
+  private journalContext(pane: AgentView): number | undefined {
+    if (this.journal === undefined || pane.kind === "shell") return undefined;
+    const key = pane.agentSession?.value;
+    if (key === undefined || key === "") return undefined;
+    const reading = this.journal.context(key);
+    if (reading?.window === undefined || reading.window <= 0) return undefined;
+    return contextPercent(reading.tokens, reading.window);
+  }
+
+  /** The pane's session cost from the journal, in dollars, or undefined: none summed, or a shell pane. */
+  private journalCost(pane: AgentView): number | undefined {
+    if (this.journal?.cost === undefined || pane.kind === "shell") return undefined;
+    const key = pane.agentSession?.value;
+    if (key === undefined || key === "") return undefined;
+    return this.journal.cost(key);
   }
 
   /** Per window, the limit from the newest held record of `harness` that carries it unexpired. */

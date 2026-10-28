@@ -38,8 +38,9 @@
 // Pure: the same rows always give the same answer.
 
 import { displayWidth } from "../text-width";
-import { commandListNear, pointsAt, type CommandListRead } from "./command-list";
-import { rowText, type Frame, type FrameRow, type IdleProfile } from "./frame";
+import { commandListNear, openedByText, pointsAt, type CommandListRead } from "./command-list";
+import { popupUnder, type PopupRead } from "./popup";
+import { promptDraft, rowText, type Frame, type FrameRow, type IdleProfile } from "./frame";
 import { isSingleKeyRow } from "./key-row";
 import { readAboveNotice, type AboveNotice } from "./notice";
 import type { CommandListRows } from "./profile";
@@ -423,6 +424,15 @@ function cuesIn(texts: readonly string[], cluster: readonly number[], readOverla
  * side holds one.
  */
 export function commandListAt(texts: readonly string[], frame: Frame, list: CommandListRows | undefined, rows?: readonly FrameRow[]): CommandListRead | null {
+  return commandListNear(texts, frame.top, frame.bottom, list, rows, frame.interior.prompt, frame.interior.text);
+}
+
+/**
+ * The profile's command list at a frame whatever the box's text is: {@link commandListAt} without the profile's
+ * `notForText`, which keeps a path's popup rows out of the Surface's and the cues' reads. The Send Protocol asks
+ * this one before Enter, so a list drawn under such a text is never pressed over unseen.
+ */
+export function commandListAnyText(texts: readonly string[], frame: Frame, list: CommandListRows | undefined, rows?: readonly FrameRow[]): CommandListRead | null {
   return commandListNear(texts, frame.top, frame.bottom, list, rows, frame.interior.prompt);
 }
 
@@ -430,20 +440,75 @@ export function commandListAt(texts: readonly string[], frame: Frame, list: Comm
  * The typeahead of the command the box holds, or null: the profile's command list on either side of
  * a found frame, its pointer on an entry whose command is the box's text ({@link pointsAt}: `/model` is
  * pointed at by `❯ /model`, never by `❯ /models`). Enter there picks the command that is already typed,
- * so the list is no dialog and its rows are read for no cue. A list that points at another command, or
- * at none, is read as before.
+ * so the list is no dialog and its rows are read for no cue. So is a list the text opened on a profile
+ * that names `leadOpens` ({@link openedByText}), whatever it points at: the harness's fuzzy list for a
+ * half-typed command. Any other list that points at another command, or at none, is read as before.
  */
 export function ownCommandList(texts: readonly string[], frame: Frame | null, idle: IdleProfile | null, styled?: readonly FrameRow[]): CommandListRead | null {
   if (frame === null || idle === null || frame.placeholder) return null;
   const rows = idle.volatile.below.commandList;
   const list = commandListAt(texts, frame, rows, styled);
-  return list !== null && pointsAt(list, frame.interior.text, rows) ? list : null;
+  return list !== null && (pointsAt(list, frame.interior.text, rows) || openedByText(list, frame.interior.text, rows)) ? list : null;
 }
 
 /** The rows with the rows `first` to `last` read as blank. */
 function withoutSpan(rows: readonly FrameRow[], span: { readonly first: number; readonly last: number } | null): readonly FrameRow[] {
   if (span === null) return rows;
   return rows.map((row, i) => (i >= span.first && i <= span.last ? { segments: [] } : row));
+}
+
+/** Whether a row is an option row: a numbered item or a checkbox item, a pointer glyph in front allowed. */
+function isOptionRow(text: string): boolean {
+  const row = unboxed(text);
+  return numberOf(row) !== null || CHECKBOX_ITEM.test(row);
+}
+
+/**
+ * The rows with the transcript's echoes of sent prompts above a found frame read as blank, for a profile
+ * whose transcript echoes each prompt in its prompt row's shape (`idle.promptEchoes`). An echo is a row
+ * the prompt anchor matches with text behind the glyph ({@link promptDraft}), then the rows under it
+ * indented at least `frame.continuationIndent` columns, ended by a blank row or the frame's top edge.
+ * A long prompt wraps into rows that line up like a pointed list under the glyph, and the whole-screen
+ * read took them for one (Claude Code 2.1.309 and 2.1.310, live 2026-10-25). A run whose first row is an
+ * option row ({@link isOptionRow}, `❯ 1. Yes`, `❯ [ ] Cheese`) is left as it is: a list puts its pointer
+ * on an option, whoever drew it. Option rows under the first row do not count: a sent text's own list
+ * (`❯ Please do these:` over `  1. reply D`) stands there, and before 2026-10-26 such a queued message read
+ * as an unreadable modal at S2. Every other row, and every row of any other profile, stays as it is. Both the bridge's frameless read and the
+ * framed read ({@link readCuesFor}) take it: Claude Code's queued message over the box has the same
+ * shape, `❯ ` and its text with its wrapped rows and the `ctrl+enter to send now` hint under it.
+ */
+export function withoutPromptEchoes(rows: readonly FrameRow[], frame: Frame | null, idle: IdleProfile | null): readonly FrameRow[] {
+  if (frame === null || idle?.promptEchoes !== true) return rows;
+  const texts = rows.map(rowText);
+  const echoes: { first: number; last: number }[] = [];
+  for (let i = 0; i < frame.top; i++) {
+    const draft = promptDraft(texts[i]!, idle);
+    if (draft === null || draft.length === 0) continue;
+    let last = i;
+    while (last + 1 < frame.top && !isBlank(texts[last + 1]!) && startCol(texts[last + 1]!) >= idle.frame.continuationIndent) last++;
+    const ended = last + 1 === frame.top || isBlank(texts[last + 1]!);
+    // Only the pointer row decides: a list puts its pointer on an option (`❯ 1. Yes`), while a text's
+    // own numbered or checkbox lines stand under its first line.
+    if (ended && !isOptionRow(texts[i]!)) echoes.push({ first: i, last });
+    i = last;
+  }
+  if (echoes.length === 0) return rows;
+  return rows.map((row, i) => (echoes.some((echo) => i >= echo.first && i <= echo.last) ? { segments: [] } : row));
+}
+
+/**
+ * The typeahead popup under a found frame that the box's text opened (`idle.volatile.below.popups`,
+ * {@link popupUnder}), or null: with no frame, or on a profile that names none. A box showing its
+ * placeholder holds no text.
+ */
+export function popupAt(texts: readonly string[], frame: Frame | null, idle: IdleProfile | null): PopupRead | null {
+  if (frame === null || idle === null) return null;
+  return popupUnder(texts, frame.bottom, frame.placeholder ? "" : frame.interior.text, idle.volatile.below.popups);
+}
+
+/** The rows with a typeahead popup's rows read as blank. */
+export function withoutPopup(rows: readonly FrameRow[], popup: PopupRead | null): readonly FrameRow[] {
+  return withoutSpan(rows, popup);
 }
 
 /** The rows with a command list's rows read as blank. */
@@ -479,13 +544,16 @@ export function noticeOver(texts: readonly string[], frame: Frame | null, idle: 
  * The cues of a screen read under a profile: the frame's own cues, or, when the profile draws its
  * dialogs where the box stands (`idle.dialogsInBox`), the cues of the rows from the box's top edge down,
  * the box rows included. The typed command's own list on either side of the box ({@link ownCommandList})
- * and a notice over the box ({@link noticeOver}) are left out of both. The second also reads the box's
+ * and a notice over the box ({@link noticeOver}) are left out of both, and so are the prompt-shaped runs
+ * over the box of a profile whose transcript echoes prompts ({@link withoutPromptEchoes}): Claude Code
+ * draws a queued message there in that shape, and its wrapped rows and send-now hint under the `❯ ` row
+ * are no pointed list. The second also reads the box's
  * own prompt glyph ({@link withoutOwnPrompt}) as blank, and the prompt glyph over a soft-wrapped draft
  * ({@link draftWrap}); a draft-shaped box cut by an ellipsis reads as no cue at all, flagged `cutWrap`.
  */
 export function readCuesFor(allRows: readonly FrameRow[], frame: Frame | null, idle: IdleProfile | null): CueRead {
   const texts = allRows.map(rowText);
-  const rows = withoutCommandList(allRows, frame === null ? null : ownCommandList(texts, frame, idle, allRows));
+  const rows = withoutPromptEchoes(withoutPopup(withoutCommandList(allRows, frame === null ? null : ownCommandList(texts, frame, idle, allRows)), popupAt(texts, frame, idle)), frame, idle);
   const plain = readCues(rows, frame, noticeOver(texts, frame, idle));
   if (idle?.dialogsInBox !== true || frame === null) return plain;
   // From the top edge down: a dialog in the box's place lies there, and the transcript above is no part of it.
@@ -495,10 +563,23 @@ export function readCuesFor(allRows: readonly FrameRow[], frame: Frame | null, i
   if (plain.strength !== "strong" && wrapUnderGlyph(withoutOwnPrompt(rows, frame).map(rowText), frame) === "cut") {
     return { ...plain, cues: [], strength: "none", cutWrap: true };
   }
-  const down = readCues(withoutPromptGlyph(withoutOwnPrompt(rows, frame), frame).slice(at), null, null);
+  const down = readCues(withoutDraftContinuation(withoutPromptGlyph(withoutOwnPrompt(rows, frame), frame), frame, idle).slice(at), null, null);
   // A weak shape inside the box is the box's own hint row (OMP draws "to change thinking effort" there).
   if (down.strength !== "strong" || plain.strength === "strong") return plain;
   return { ...down, cluster: down.cluster.map((i) => i + at), cues: down.cues.map((cue) => ({ kind: cue.kind, row: cue.row + at })) };
+}
+
+/**
+ * The rows with the draft's continuation rows read as blank, for a profile that names `frame.draftIndent`:
+ * the rows under the prompt row inside the box that start with that many spaces. A dialog the person quoted
+ * in a long draft (a permission box in a prompt about permission boxes) draws at that indent and is no
+ * dialog; one the harness draws in the box's place starts at the box's own column and stays.
+ */
+function withoutDraftContinuation(rows: readonly FrameRow[], frame: Frame, idle: IdleProfile): readonly FrameRow[] {
+  const indent = idle.frame.draftIndent;
+  if (indent === undefined) return rows;
+  const lead = " ".repeat(indent);
+  return rows.map((row, i) => (i > frame.interior.prompt && i <= frame.interior.last && rowText(row).startsWith(lead) ? { segments: [] } : row));
 }
 
 /**

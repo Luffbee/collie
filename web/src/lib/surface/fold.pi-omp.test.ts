@@ -3,7 +3,9 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { agentOf, fixtureRows, idleFor, PANES_DIR, readScreen, rowsOf } from "../../test/surface-corpus";
+import type { StyledLine } from "../blocks";
+import { agentOf, fixtureRows, idleFor, PANES_DIR, readScreen, rowsOf, SURFACE_FIXTURES_DIR } from "../../test/surface-corpus";
+import { pointsAt } from "./command-list";
 import { commandListAt, ownCommandList, runningSign } from "./cues";
 import { findInputFrame, rowText } from "./frame";
 import { askOf, isFree } from "./surface";
@@ -46,6 +48,9 @@ describe("the typed command's own list under pi's and omp's box (field case 2026
     ["omp--v18-6-slash-model-list--w80.txt", "/model"],
     ["omp--v18-6-slash-settings-list--w120.txt", "/settings"],
     ["omp--v18-6-slash-settings-list--w80.txt", "/settings"],
+    // symbolPreset ascii draws the list cursor as `>` (omp-gang 11-geometry, 2026-10-25).
+    ["omp--v18-6-1-ascii-symbols-session-list--w130.txt", "/session"],
+    ["omp--v18-12-6-ascii-symbols-session-list--w130.txt", "/session"],
     // The older captures of the same state: OmO on pi, omp 18.8's pi-shaped box (commit 9acc1502) and an older omp box.
     ["pi--omo-v5130-slash-model.txt", "/model"],
     ["pi--omo-v5130-slash-compact.txt", "/compact"],
@@ -64,11 +69,11 @@ describe("the typed command's own list under pi's and omp's box (field case 2026
     });
   }
 
-  // A list that points at another command (`/mod` typed, `model` pointed), the selector `/model` opens
-  // and the settings screen `/settings` opens all stay dialogs.
+  // On pi a list that points at another command (`/mod` typed, `model` pointed), the selector `/model`
+  // opens and the settings screen `/settings` opens all stay dialogs. omp names `leadOpens`: its fuzzy
+  // list under a box that starts with `/` is that text's own popup whatever it points at (below).
   for (const name of [
     "pi--v130-slash-mod-partial--w120.txt",
-    "omp--v18-6-slash-mod-partial--w120.txt",
     "pi--v130-model-selector-empty--w120.txt",
     "pi--v0871-model-selector-empty--w120.txt",
     "omp--v18-6-model-selector-empty--w120.txt",
@@ -76,7 +81,6 @@ describe("the typed command's own list under pi's and omp's box (field case 2026
     "omp--v18-6-settings-screen--w120.txt",
     "pi--v110-slash-palette.txt",
     "pi--v120-slash-palette-padded.txt",
-    "omp--slash-palette.txt",
   ]) {
     it(`${name}: still reads as a dialog`, () => {
       const read = own(name);
@@ -86,19 +90,34 @@ describe("the typed command's own list under pi's and omp's box (field case 2026
     });
   }
 
-  it("a list that points at another command finds no own list, on either profile", () => {
-    for (const [name, harness] of [
-      ["pi--v130-slash-mod-partial--w120.txt", "pi"],
-      ["omp--v18-6-slash-mod-partial--w120.txt", "omp"],
-    ] as const) {
-      const rows = fixtureRows(name);
-      const idle = idleFor(harness)!;
-      const frame = findInputFrame(rows, idle);
-      const texts = rows.map(rowText);
-      expect(frame === null ? null : ownCommandList(texts, frame, idle), name).toBeNull();
-      if (frame !== null) expect(commandListAt(texts, frame, idle.volatile.below.commandList)?.pointed, name).toBe("/model");
-    }
+  it("on pi a list that points at another command finds no own list", () => {
+    const name = "pi--v130-slash-mod-partial--w120.txt";
+    const rows = fixtureRows(name);
+    const idle = idleFor("pi")!;
+    const frame = findInputFrame(rows, idle);
+    const texts = rows.map(rowText);
+    expect(frame === null ? null : ownCommandList(texts, frame, idle), name).toBeNull();
+    if (frame !== null) expect(commandListAt(texts, frame, idle.volatile.below.commandList)?.pointed, name).toBe("/model");
   });
+
+  // omp's list is a fuzzy one: `/mod` lists ten commands that match it in part, the pointer on `model`
+  // (`leadOpens`). The box is found past the whole list, the list is read, and it is the text's own popup;
+  // that Enter would run `model` and not `/mod` is the protocol's question, answered by `pointsAt`.
+  for (const name of ["omp--v18-6-slash-mod-partial--w120.txt", "omp--slash-palette.txt"]) {
+    it(`${name}: omp's fuzzy list is the typed text's popup, pointed at another command or not`, () => {
+      const read = own(name);
+      expect(read.frame).not.toBeNull();
+      expect(read.surface).toMatchObject({ turn: "idle", modal: "none", composer: "draft" });
+      expect(read.cues?.strength).toBe("none");
+      expect(labelOf(name).state).toBe("popup");
+      const idle = idleFor("omp")!;
+      const rows = fixtureRows(name);
+      const texts = rows.map(rowText);
+      const list = commandListAt(texts, read.frame!, idle.volatile.below.commandList);
+      expect(list?.side, name).toBe("under");
+      expect(pointsAt(list!, read.frame!.interior.text, idle.volatile.below.commandList), name).toBe(false);
+    });
+  }
 });
 
 describe("omp's default band composer under the nerd preset (omp 18.12.1, issue 505)", () => {
@@ -514,5 +533,470 @@ describe("the reporter's idle captures under pi-powerline-footer (issue 544)", (
     expect(read.surface).toMatchObject({ turn: "idle", modal: "none", composer: "draft" });
     expect(read.frame!.interior.text).toBe("Collie test draft line one Collie test draft line two");
     expect(isFree(read.surface)).toBe(false);
+  });
+});
+
+// omp 18.6.1 and 18.12.6 (omp-gang testers, 2026-10-25). The fuzzy list under the box is up to ten rows
+// tall and points at a command that is not the typed one. Until 1.24.1 the box past it was found only for a
+// list that pointed at the typed text, so these screens read `unreadable/torn` and the phone's `/help`,
+// `/mo` and `/nothere` ended `typed_not_submitted (modal_cue)` with the generic detail. The profile's
+// `leadOpens` makes the list the typed text's own popup: the Surface reads a draft and no modal, and
+// the Send Protocol alone decides, from the pointer, whether Enter runs what is typed.
+describe("omp's fuzzy command list under the box (18.6.1 and 18.12.6)", () => {
+  const FUZZY: readonly [string, string, string][] = [
+    ["omp--v18-6-1-slash-open-tall--w120.txt", "/", "/skill:"],
+    ["omp--v18-6-1-slash-help-unlisted--w120.txt", "/help", "/plan-review"],
+    ["omp--v18-6-1-slash-mo-fuzzy--w120.txt", "/mo", "/model"],
+    ["omp--v18-6-1-slash-nothere-fuzzy--w120.txt", "/nothere", "/skills"],
+    ["omp--v18-12-6-slash-help-unlisted--w120.txt", "/help", "/plan-review"],
+    ["omp--v18-12-6-slash-mo-fuzzy--w120.txt", "/mo", "/model"],
+    ["omp--v18-12-6-slash-nothere-fuzzy--w120.txt", "/nothere", "/skills"],
+    ["omp--v18-12-6-slash-comment-loop-row--w120.txt", "//comment", "/loop"],
+  ];
+
+  for (const [name, typed, pointed] of FUZZY) {
+    it(`${name}: a draft with no modal and the list read, pointed at ${pointed}`, () => {
+      const read = own(name);
+      expect(read.frame?.interior.text).toBe(typed);
+      expect(read.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "draft" });
+      expect(read.cues?.strength).toBe("none");
+      expect(labelOf(name).state).toBe("popup");
+      const idle = idleFor("omp")!;
+      const texts = fixtureRows(name).map(rowText);
+      const list = commandListAt(texts, read.frame!, idle.volatile.below.commandList);
+      expect(list?.pointed, name).toBe(pointed);
+      expect(pointsAt(list!, typed, idle.volatile.below.commandList), name).toBe(false);
+    });
+  }
+
+  // The 18.12.6 row that stays under the box after a cancelled `//comment`: the Surface already read it free.
+  it("omp--v18-12-6-stale-list-row-empty-box--w120.txt: an empty box and no modal, with the stale row still read as a list", () => {
+    const name = "omp--v18-12-6-stale-list-row-empty-box--w120.txt";
+    const read = own(name);
+    expect(read.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "empty" });
+    expect(labelOf(name).state).toBe("idle");
+    const texts = fixtureRows(name).map(rowText);
+    expect(commandListAt(texts, read.frame!, idleFor("omp")!.volatile.below.commandList)?.pointed).toBe("/loop");
+  });
+
+  // A list the profile does not call fuzzy stays what it was: a dialog until the pointer rests on the text.
+  it("pi's list that points at another command is still a dialog", () => {
+    const read = own("pi--v130-slash-mod-partial--w120.txt");
+    expect(read.surface.modal).toBe("unreadable");
+    expect(isFree(read.surface)).toBe(false);
+  });
+});
+
+// omp 18.6.1 and 18.12.6 (omp-gang testers 05 and 12, 2026-10-25). A file path at the start of the box makes
+// omp draw its file popup under it, one `❯ name.png` row. The profile's patterns took that row for a command
+// list pointing at another command, and the phone's send of an upload path ended `typed_not_submitted
+// (modal_cue)` with nothing wrong. `commandList.notForText` says such a text opens no command list: the
+// Surface still reads a draft and no modal, and no list is read.
+describe("omp's file popup under a path typed in the box (18.6.1 and 18.12.6)", () => {
+  const POPUPS: readonly [string, string][] = [
+    ["omp--v18-6-1-path-popup--w120.txt", "/home/demo/lab1/.cache/collie-lab/omp-gang/05-images/state/rig/state/uploads/w2_p1-mvo3m20o-6e1a9e71.png"],
+    ["omp--v18-6-1-path-popup-tilde--w120.txt", "~/.cache/collie-lab/omp-gang/12-pickers/state/harness/omp/project/x.png"],
+    ["omp--v18-12-6-path-popup--w120.txt", "/home/demo/lab1/.cache/collie-lab/omp-gang/05-images/state/rig/state/uploads/w2_p1-mvo44h6i-fd050f5a.png"],
+    // Two upload paths on two rows: the draft's rows join into one text that starts with a path.
+    ["omp--v18-12-6-path-popup-two-paths--w120.txt", ""],
+  ];
+
+  for (const [name, typed] of POPUPS) {
+    it(`${name}: a draft with no modal, no cue and no command list`, () => {
+      const read = own(name);
+      if (typed !== "") expect(read.frame?.interior.text).toBe(typed);
+      else expect(read.frame?.interior.text).toMatch(/^\/home\/demo\/lab1\/.*\.png\s*\/home\/demo\/lab1\/.*\.png$/u);
+      expect(read.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "draft" });
+      expect(read.cues?.strength).toBe("none");
+      expect(labelOf(name).state).toBe("popup");
+      const idle = idleFor("omp")!;
+      const texts = fixtureRows(name).map(rowText);
+      expect(commandListAt(texts, read.frame!, idle.volatile.below.commandList), name).toBeNull();
+    });
+  }
+});
+
+// The ascii symbol preset draws every cursor as `>` (omp-gang 11-geometry, W3). The pointer pattern reads that glyph in a
+// command list, and a popup row under a typed path must still be no command list: `notForText` decides on the text.
+describe("omp's file popup with the ascii cursor under a typed path is still no command list", () => {
+  for (const name of ["omp--v18-6-1-path-popup--w120.txt", "omp--v18-12-6-path-popup--w120.txt", "omp--v18-6-1-path-popup-tilde--w120.txt"]) {
+    it(`${name}: the popup row drawn with > reads a draft, no cue, no command list`, () => {
+      const rows = rowsOf(fixtureRows(name).map(rowText).map((text) => text.replace(/^❯ /u, "> ")).join("\n"));
+      const read = readScreen(rows, "omp", idleFor("omp"));
+      expect(read.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "draft" });
+      expect(read.cues?.strength).toBe("none");
+      const texts = rows.map(rowText);
+      expect(texts.some((text) => text.startsWith("> ")), name).toBe(true);
+      expect(commandListAt(texts, read.frame!, idleFor("omp")!.volatile.below.commandList), name).toBeNull();
+    });
+  }
+});
+
+describe("omp's status row pattern leaves the rows under a command list alone", () => {
+  // The rows an extension draws under a list (`commandList.footer`) and the popup rows are under the box. Neither may read
+  // as the status row over a box, or a box above them would be found a second time from there.
+  it("no row under the box of the status-row palettes and the popups is a status row", () => {
+    const top = new RegExp(idleFor("omp")!.frame.top.pattern, "u");
+    for (const name of ["omp--v18-12-6-status-row-palette-4.txt", "omp--v18-6-1-status-row-palette-4.txt", "omp--v18-12-6-status-row-palette-10.txt", "omp--v18-6-1-at-popup--w120.txt", "omp--v18-6-1-hash-popup--w120.txt", "omp--v18-6-1-path-popup--w120.txt"]) {
+      const rows = fixtureRows(name, name.includes("status-row") ? SURFACE_FIXTURES_DIR : PANES_DIR);
+      const frame = findInputFrame(rows, idleFor("omp")!)!;
+      const under = rows.map(rowText).slice(frame.bottom + 1).filter((text) => text.trim() !== "");
+      expect(under.length, name).toBeGreaterThan(0);
+      for (const text of under) expect(top.test(text), `${name}: ${text}`).toBe(false);
+    }
+  });
+});
+
+describe("omp's rewind picker (Esc Esc) is a modal, not an unknown screen (18.6.1 and 18.12.6)", () => {
+  const PICKERS = ["omp--v18-6-1-rewind-picker--w120.txt", "omp--v18-12-6-rewind-picker--w120.txt"];
+
+  for (const name of PICKERS) {
+    it(`${name}: no frame, modal unreadable from the footer the profile names`, () => {
+      const read = own(name);
+      expect(read.frame).toBeNull();
+      expect(read.cues?.strength).toBe("weak");
+      expect(read.surface).toEqual({ revision: 1, turn: "unknown", modal: "unreadable", composer: "unknown" });
+    });
+
+    it(`${name}: without the footer row the same screen stays unknown, so the footer is the cue`, () => {
+      const rows = fixtureRows(name);
+      const footer = rows.findIndex((row) => /rewind/.test(rowText(row)));
+      expect(footer).toBeGreaterThan(0);
+      const changed = rows.map((row, i) => (i === footer ? { segments: [{ text: " 29/29  ↑/↓ step  ←/→ user turns  f filter  ⏎ go  Ctrl+O expand  ⎋ cancel" }] } : row));
+      // SAFETY: `changed` is `rows` with one row replaced by a one-segment row of the same shape.
+      expect(readScreen(changed as typeof rows, agentOf("omp"), idleFor("omp")).surface.modal).toBe("unknown");
+    });
+  }
+});
+
+describe("omp's typeahead popups under the box read as a draft (18.6.1, omp-gang tester 12)", () => {
+  const DRAFTS: readonly [string, string][] = [
+    ["omp--v18-6-1-at-popup--w120.txt", "please read @READ"],
+    ["omp--v18-6-1-at-popup-path--w120.txt", "@/tmp/x.png"],
+    ["omp--v18-6-1-hash-popup--w120.txt", "fix item #1"],
+    ["omp--v18-6-1-hash-popup-single--w120.txt", "see PR #12"],
+    // omp-gang 04-readers (2026-10-26): the first real captures of the emoji popup (one space after the glyph)
+    // and of the one-row popup under a partial path.
+    ["omp--v18-12-6-emoji-popup--w120.txt", "hello :smi"],
+    ["omp--v18-6-1-emoji-popup--w120.txt", "hello :smi"],
+    // omp-gang three (2026-10-26): a text ending in a bare `#` draws omp's seven-row editor-action list.
+    ["omp--v18-12-6-hash-end-actions--w120.txt", "ends with hash #"],
+    ["omp--v18-6-1-hash-end-actions--w120.txt", "ends with hash #"],
+    ["omp--v18-12-6-path-popup-partial--w120.txt", "~/.cache/collie-lab/omp-gang/gang3/04-readers/state/harness/omp/project/src/ma"],
+  ];
+
+  for (const [name, typed] of DRAFTS) {
+    it(`${name}: a draft with no modal and no cue`, () => {
+      const read = own(name);
+      expect(read.frame?.interior.text).toBe(typed);
+      expect(read.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "draft" });
+      expect(read.cues?.strength).toBe("none");
+      expect(labelOf(name).state).toBe("popup");
+    });
+  }
+
+  it("the `#` popup is two rows with a pointer, the weak cue that read `modal: unknown` before the profile named it", () => {
+    const name = "omp--v18-6-1-hash-popup--w120.txt";
+    const idle = idleFor("omp")!;
+    const { popups, ...below } = idle.volatile.below;
+    void popups;
+    const without = readScreen(fixtureRows(name), agentOf("omp"), { ...idle, volatile: { ...idle.volatile, below } });
+    expect(without.cues?.strength).toBe("weak");
+    expect(without.surface.modal).toBe("unknown");
+  });
+
+  it("omp--v18-6-1-hash-popup-stale--w120.txt: the `#` rows left under an emptied box are a stale popup, an empty box", () => {
+    const read = own("omp--v18-6-1-hash-popup-stale--w120.txt");
+    expect(read.frame?.interior.text).toBe("");
+    expect(read.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "empty" });
+    expect(read.cues?.strength).toBe("none");
+  });
+
+  it("omp--v18-6-1-at-popup-stale--w120.txt: the `@` rows left under an emptied box are a stale popup, an empty box (the file rule names staleWhenEmpty)", () => {
+    const name = "omp--v18-6-1-at-popup-stale--w120.txt";
+    const read = own(name);
+    expect(read.frame?.interior.text).toBe("");
+    expect(read.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "empty" });
+    expect(read.cues?.strength).toBe("none");
+    expect(labelOf(name).state).toBe("popup");
+  });
+
+  it("the emoji popup with the old two-space row pattern is no popup: the eight rows read as a pointer list, unreadable", () => {
+    const name = "omp--v18-12-6-emoji-popup--w120.txt";
+    const idle = idleFor("omp")!;
+    const popups = idle.volatile.below.popups!;
+    const rules = popups.rules.map((rule) => (rule.name === "emoji" ? { ...rule, rows: rule.rows.replace(" {1,2}", " {2}") } : rule));
+    const read = readScreen(fixtureRows(name), agentOf("omp"), { ...idle, volatile: { ...idle.volatile, below: { ...idle.volatile.below, popups: { ...popups, rules } } } });
+    expect(read.cues?.strength).toBe("strong");
+    expect(read.surface.modal).toBe("unreadable");
+  });
+
+  it("the editor-action list stands under a box only while the text ends in a bare `#`: seven rows are a popup of that word and nothing else", () => {
+    const name = "omp--v18-6-1-hash-end-actions--w120.txt";
+    const texts = fixtureRows(name).map((row) => rowText(row));
+    const typed = (text: string): string => texts.map((row) => (row.startsWith("╰─") ? `╰─ ${text}` : row)).join("\n");
+    const open = readScreen(rowsOf(typed("ends with hash #")), agentOf("omp"), idleFor("omp"));
+    expect(open.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "draft" });
+    expect(open.cues?.strength).toBe("none");
+    for (const text of ["ends with a word", "ends with hash # and more"]) {
+      const closed = readScreen(rowsOf(typed(text)), agentOf("omp"), idleFor("omp"));
+      expect(closed.surface.modal, text).not.toBe("none");
+    }
+  });
+
+  it("a dialog drawn under the box is not a popup: the same box over a permission row stays a modal", () => {
+    const name = "omp--v18-6-1-hash-popup--w120.txt";
+    const rows = fixtureRows(name);
+    const dialog = [...rows, ...rowsOf("  Allow tool: bash\n  ❯ Approve\n    Deny")];
+    const read = readScreen(dialog, agentOf("omp"), idleFor("omp"));
+    expect(read.surface.modal).not.toBe("none");
+  });
+});
+
+// omp-gang three, 01-regression W1 (2026-10-26), omp 18.6.1 and 18.12.6: a draft that holds a pasted box drawing
+// (`│ ❯ Approve   │`). omp's box has no right border here, but the profile cut a trailing `│` or `╯` off every
+// row, so the read text lacked the glyphs that closed the quoted rows. A glyph with padding after it is the
+// person's text; a glyph at the row's last cell is the box's own border (the nerd-box captures at 80 columns).
+describe("a pasted box drawing in the draft keeps the glyphs that close its rows (omp-gang three W1)", () => {
+  const NAMES = ["omp--v18-6-1-quoted-box-draft--w120.txt", "omp--v18-12-6-quoted-box-draft--w120.txt"];
+  const TYPED = "Here is what omp showed me: ╭─ Allow tool: bash ───────────╮ │ ❯ Approve                    │ │   Deny                       │ ╰──────────────────────────────╯ why did it ask?";
+  const read = (name: string, rows?: StyledLine[]) => readScreen(rows ?? fixtureRows(name, SURFACE_FIXTURES_DIR), agentOf("omp"), idleFor("omp"));
+
+  it.each(NAMES)("%s: the box text is the typed text, to the last glyph, and the screen reads a draft", (name) => {
+    const r = read(name);
+    expect(r.frame?.interior.text).toBe(TYPED);
+    expect(r.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "draft" });
+    expect(r.cues?.strength).toBe("none");
+  });
+
+  it("a read that cut the trailing spaces cannot tell a border from the person's glyph, and cuts it as before", () => {
+    const rows = rowsOf(fixtureRows(NAMES[0]!, SURFACE_FIXTURES_DIR).map((row) => rowText(row).trimEnd()).join("\n"));
+    expect(read(NAMES[0]!, rows).frame?.interior.text).toBe("Here is what omp showed me: ╭─ Allow tool: bash ───────────╮ │ ❯ Approve │   Deny ╰───────────────────────────── why did it ask?");
+  });
+
+  it("the box's own right border at the last cell is still no part of the draft (omp's nerd box at 80 columns)", () => {
+    const r = readScreen(fixtureRows("omp--v18-11-nerd-box-two-lines--w80.txt"), agentOf("omp"), idleFor("omp"));
+    expect(r.frame?.interior.text).toBe("First line of a two-line draft. Second line of the same draft.");
+  });
+});
+
+describe("a dialog quoted inside the person's own draft is the draft's text (omp 18.6.1, omp-gang tester 12)", () => {
+  const NAME = "omp--v18-6-1-quoted-dialog-draft--w120.txt";
+
+  it("a nine-row prompt that prints a permission box inside a code fence reads a draft, no cue", () => {
+    const read = own(NAME);
+    expect(read.frame?.interior.text).toContain("╭─ Allow tool: bash ───────────╮ │ ❯ Approve");
+    expect(read.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "draft" });
+    expect(read.cues?.strength).toBe("none");
+    expect(labelOf(NAME).state).toBe("draft");
+  });
+
+  it("the profile's draftIndent is what says so: without it the same screen is a modal nobody can read", () => {
+    const idle = idleFor("omp")!;
+    const { draftIndent, ...frame } = idle.frame;
+    void draftIndent;
+    const read = readScreen(fixtureRows(NAME), agentOf("omp"), { ...idle, frame });
+    expect(read.cues?.strength).toBe("strong");
+    expect(read.surface.modal).toBe("unreadable");
+  });
+
+  it("the same rows at the box's own column are a dialog drawn in the box's place, and stay one", () => {
+    const rows = fixtureRows(NAME).map((row) => rowText(row));
+    const outdented = rows.map((text) => (/^ {3}[╭│╰]/u.test(text) ? text.slice(3) : text)).join("\n");
+    const read = readScreen(rowsOf(outdented), agentOf("omp"), idleFor("omp"));
+    expect(read.surface.modal).toBe("unreadable");
+  });
+});
+
+const STATUS_ROW_FIXTURES = [
+  "omp--v18-12-6-status-ascii-draft--w80.txt",
+  "omp--v18-12-6-status-ascii-idle--w130.txt",
+  "omp--v18-12-6-status-full-slash-draft--w80.txt",
+  "omp--v18-12-6-status-full-slash-idle--w80.txt",
+  "omp--v18-6-1-status-ascii-idle--w80.txt",
+  "omp--v18-6-1-status-full-slash-idle--w80.txt",
+];
+
+describe("omp's status row above the box, in every shape its presets draw (omp-gang 11-geometry, 2026-10-25)", () => {
+  // Rows rendered by OMP 18.12.6's own status line (pi-tui status-line, the gallery's fake session) across the presets
+  // default, minimal, compact, full, nerd and ascii, the separators and the symbol presets, at widths from 20 to 130.
+  // Until 1.24.1 the profile asked for a run of three rule glyphs, so the full preset at 80 columns (its gauge shrinks
+  // to ─5%─┃200K─) and the ascii preset (first token [high], [M] or [T]) read as no box: unknown, and a send refused.
+  const STATUS_ROW_SAMPLES: readonly (readonly [string, string])[] = [
+  ["percentage and tick gauge, 130 columns", " π > ⬢ test-model > 🗑 geo2-render > ◫ 0.8%/200K ⟲ > $0.02 ▶───────────────────────────────────────────────────────────────────────"],
+  ["full preset, embedded gauge down to its percent label", " π / 🖥 example / ⬢ test-model / 🗑 geo2-render ─0.8%────200K─ 💾 20.00% / ⤵ 1.2K "],
+  ["full preset, powerline caps, labels kept", " π ▶ 🖥 example ▶ ⬢ test-model ▶ 🗑 geo2-render ▶──30%───200K─"],
+  ["minimal preset, the path first", " 🗑 geo2-render ─────────30%──────────────────200K─"],
+  ["compact preset, pipe separator, plain rule", " ⬢ test-model ─────────────────────── $0.02 │ ◫ 0.0%/200K ⟲ "],
+  ["overflow: window label before the percent", " π ▶ 🗑 …ender ▶──────200K─125%"],
+  ["ascii symbols, percent label between dashes", " pi > [T] …der >-----95%-200K-"],
+  ["ascii preset, [M] first", " [M] test-model > [T] geo2-render -0.8%-------------------200K- tok: 2K < $0.02 "],
+  ["ascii compact, a short rule", " [M] test-model >---"],
+  ["ascii minimal, [T] path first", " [T] geo2-render >-----------------------------------------< ctx: 0.0%/200K [A] "],
+  ["nerd full preset, labels kept", " \u{F0D57} \u{E0B0} \u{F109} example \u{E0B0} \u{EC19} test-model \u{E0B0} \u{F014} geo2-render \u{E0B0}─0.8%───200K─\u{E0B2} \u{F1C0} 20.00% \u{E0B2} \u{F090} 1.2K "],
+  ["nerd preset", " \u{F0D57} \u{E0B0} \u{F109} example \u{E0B0} \u{EC19} test-model \u{E0B0} \u{F014} geo2-render \u{E0B0} \u{F0051} new \u{E0B0}────────────\u{E0B2} \u{F090} 1.2K \u{E0B2} \u{F08B} 800 \u{E0B2} \u{F1C0} 300 \u{E0B2} $0.02 "],
+  ["block separator", " 🗑 geo2-render ──────────────────── ◫ 0.0%/200K ⟲ "],
+  ["two rule glyphs at the end, powerline caps", " π ▶ ⬢ test-model ▶ 🗑 geo2-render ▶ ◫ 0.0%/200K ⟲ ▶ $0.02 ──"],
+  ["one rule glyph after a cap", " π ▶ ⬢ test-model ▶ 🗑 …ender ▶─"],
+  ["ascii, one rule glyph after a cap", " pi > [M] test-model > [T] geo2-render > ctx: 0.0%/200K [A] > $0.02 >-"],
+  ["one rule glyph set apart by spaces", " ⬢ test-model ─ $0.02 ◀ ◫ 125.0%/200K ⟲ "],
+  ["a named profile on the brand", " π-work ▶ ⬢ test-model ▶ 🗑 geo2-render ▶──30%───200K─"],
+  ];
+  const screen = (status: string, box: string): StyledLine[] => rowsOf(["", status, `╰─ ${box}`.trimEnd()].join("\n"));
+  const idle = idleFor("omp");
+
+  for (const [label, row] of STATUS_ROW_SAMPLES) {
+    it(`${label}: an empty box and a draft are read`, () => {
+      expect(readScreen(screen(row, ""), "omp", idle).surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "empty" });
+      const draft = readScreen(screen(row, "abc"), "omp", idle);
+      expect(draft.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "draft" });
+      expect(draft.frame?.interior.text).toBe("abc");
+    });
+  }
+
+  // While a turn runs the brand glyph is the spinner and the turn timer; the ascii preset spins - \\ | /.
+  const RUNNING: readonly (readonly [string, string])[] = [
+    ["unicode spinner", " ⠼ 4s ▶ ⬢ test-model ▶ 🗑 geo2-render ▶──30%───200K─"],
+    ["unicode spinner, slash separator, short gauge", " ⠼ 4s / ⬢ test-model / 🗑 geo2-render ─30%─200K─"],
+    ["ascii spinner", " \\ 4s > [M] test-model > [T] geo2-render >-----95%-200K-"],
+    ["ascii spinner, a minute", " | 1m > [M] test-model >---"],
+  ];
+  for (const [label, row] of RUNNING) {
+    it(`${label}: a running turn is read`, () => {
+      expect(readScreen(screen(row, ""), "omp", idle).surface).toEqual({ revision: 1, turn: "running", modal: "none", composer: "empty" });
+    });
+  }
+
+  // Prose that holds three dashes is not a status row: with no status row over the box there is no box.
+  it("a transcript line with dashes over the box is no status row", () => {
+    for (const line of ["Use --- as a rule", "See the list ─── below", "Note: 5% then 200K - done"]) {
+      const read = readScreen(rowsOf([line, "", "╰─ abc"].join("\n")), "omp", idle);
+      expect(read.frame, line).toBeNull();
+      expect(isFree(read.surface), line).toBe(false);
+    }
+  });
+
+  for (const name of STATUS_ROW_FIXTURES) {
+    it(`${name}: the captured screen reads ${labelOf(name).state}`, () => {
+      const read = own(name);
+      const want = labelOf(name).state === "draft" ? { composer: "draft", text: "abc" } : { composer: "empty", text: "" };
+      expect(read.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: want.composer });
+      expect(read.frame?.interior.text).toBe(want.text);
+      expect(read.cues?.strength).toBe("none");
+    });
+  }
+});
+
+// omp 18.12.6 draws the editor in one of eight `composer.shape` forms (omp-gang 11-geometry W5, 2026-10-25):
+// band, borderless, claude, field, pi, rail, rule and the default box. The profile lists the box and the shapes
+// `frameAlternates` already held (claude rules, pi's blank row); `field` is a borderless run of ▐ rows closed by ▌.
+describe("omp's composer.shape field (18.12.6)", () => {
+  const FIELD = ["omp--v18-12-6-composer-field-idle--w130.txt", "omp--v18-12-6-composer-field-two-lines--w130.txt"];
+  const idle = idleFor("omp");
+
+  it("the empty field box reads an idle, empty composer, and the hint inside it is no draft", () => {
+    const read = readScreen(fixtureRows(FIELD[0]!), "omp", idle);
+    expect(read.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "empty" });
+    expect(read.frame?.interior.text).toBe("");
+    expect(read.cues?.strength).toBe("none");
+    expect(labelOf(FIELD[0]!).state).toBe("idle");
+  });
+
+  it("a two-line draft reads as the two lines joined, with no modal", () => {
+    const read = readScreen(fixtureRows(FIELD[1]!), "omp", idle);
+    expect(read.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "draft" });
+    expect(read.frame?.interior.text).toBe("draft line 1: the quick brown fox jumps over the lazy dog 1 draft line 2: the quick brown fox jumps over the lazy dog 2");
+    expect(labelOf(FIELD[1]!).state).toBe("draft");
+  });
+
+  it("a transcript line that opens with the block glyph is no field box without a blank row above it", () => {
+    const rows = rowsOf(["some output", "▐ quoted text ▌", "", " π · ◒ Haiku 4.5 · 📁 ~/work · ◫ 4.7%/200K ⟲ "].join("\n"));
+    expect(readScreen(rows, "omp", idle).surface.composer).not.toBe("draft");
+  });
+
+  // `composer.shape: claude` draws the Claude Code frame (rule, `❯`, rule) under a status row. A one-line draft
+  // and the empty box read. A two-line draft does not: the prompt row and the indented row under it are a
+  // pointer row on a listed row between two rules, which the cue reader takes for a dialog (cues, `pointer-row`).
+  // `idle.dialogsInBox`'s answer for a harness is `ownPrompt`, but it is only safe on the interior walk with a
+  // `rows` pattern naming every row a box may hold, and this alternate walks the edges: with `ownPrompt` any
+  // `❯` list between two rules would read as a draft. A fix needs a walk that names the rows (rule, `❯` row,
+  // two-space rows, status row), which collides with Claude Code's own `❯` pickers on the same screens.
+  const CLAUDE_TWO_LINES = [
+    "──────────────────────────────────────────────────────────────────────────────",
+    "❯ draft line 1: the quick brown fox jumps over the lazy dog 1",
+    "  draft line 2: the quick brown fox jumps over the lazy dog 2",
+    "──────────────────────────────────────────────────────────────────────────────",
+    " π · ◒ Haiku 4.5 · 📁 ~/work · ◫ 4.7%/200K ⟲ ",
+  ];
+  it.todo("composer.shape claude: a two-line draft reads as a draft, not an unreadable modal (see the note above)");
+  it.fails("composer.shape claude, two-line draft: the wanted read, which the cue reader still refuses", () => {
+    const read = readScreen(rowsOf(CLAUDE_TWO_LINES.join("\n")), "omp", idle);
+    expect(read.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "draft" });
+  });
+});
+
+// omp 18.6.1 and 18.12.6 (omp-gang three, tester 5, 2026-10-26, W3): a local shell line typed with `!`
+// (`!sleep 25`) runs in omp's own bash block, `$ sleep 25` and `⠋ Running… (⎋ to cancel)` between two rules,
+// and no model turn is on. The profile's running rows knew only `Working…`, so the Surface read the turn idle
+// and the phone's Stop was refused `turn_idle` for a command that only Escape ends. The row says Escape on
+// its face (`⎋ to cancel`), the profile's interrupt key.
+describe("omp's local shell line that is running (18.6.1 and 18.12.6)", () => {
+  const RUNNING = ["omp--v18-6-1-local-bash-running--w120.txt", "omp--v18-12-6-local-bash-running--w120.txt"] as const;
+
+  for (const name of RUNNING) {
+    it(`${name}: the turn reads running, the box empty and no modal`, () => {
+      const rows = fixtureRows(name, SURFACE_FIXTURES_DIR);
+      const read = readScreen(rows, "omp", idleFor("omp"));
+      expect(read.surface).toEqual({ revision: 1, turn: "running", modal: "none", composer: "empty" });
+      expect(runningSign(rows, read.frame!, idleFor("omp")!.runningRows)).toBe(true);
+    });
+
+    it(`${name}: without the Running row the same screen reads idle`, () => {
+      const rows = fixtureRows(name, SURFACE_FIXTURES_DIR).map((row) => (rowText(row).includes("Running…") ? { segments: [] } : row));
+      expect(readScreen(rows, "omp", idleFor("omp")).surface.turn).toBe("idle");
+    });
+  }
+
+  it("the row's pattern is the spinner and the cancel hint, not the word Running alone", () => {
+    const idle = idleFor("omp")!;
+    const sign = (text: string): boolean => idle.runningRows!.some((source) => new RegExp(source, "u").test(text));
+    expect(sign(" ⠋ Running… (⎋ to cancel)")).toBe(true);
+    expect(sign(" ⠴ Running… (⎋ to cancel)  ")).toBe(true);
+    for (const text of [" Running… (⎋ to cancel)", " ⠋ Running tests", " Running… done", "⠋ Running… (⎋ to cancel) and more", " the Running… (⎋ to cancel)"]) {
+      expect(sign(text), text).toBe(false);
+    }
+  });
+});
+
+// omp 18.6.1 and 18.12.6 (omp-gang three, tester 5, 2026-10-26, W4): a draft typed at the desk with omp's queue
+// prefix (`-> text` or `=> text`) shows omp's `Queueing ➤` label on the box's first row and the body under it. The
+// tester's view said `empty` for several seconds. These captures read `draft` as they stand: the label row and the body
+// are the box's draft display, the label painted in the grey the profile names for the empty box's ghost hint
+// (`inlineHint`, rgb(107,114,128)) included. An idle pane's view is read every `pollIdleMs` (12 s), so a desk edit
+// shows late; the screen itself reads draft.
+describe("omp's queue-prefix draft (Queueing ➤) reads as a draft (18.6.1 and 18.12.6)", () => {
+  const DRAFTS: readonly [string, string][] = [
+    ["omp--v18-6-1-draft-queueing-painted--w120.txt", "Queueing ➤ hello queue draft"],
+    ["omp--draft-queueing-body--v18.12.6.txt", "Queueing ➤ then do this"],
+    ["omp--draft-queueing-label--v18.12.6.txt", "Queueing ➤"],
+  ];
+
+  for (const [name, text] of DRAFTS) {
+    it(`${name}: composer draft, the label part of the box's text, no placeholder`, () => {
+      const read = readScreen(fixtureRows(name, SURFACE_FIXTURES_DIR), "omp", idleFor("omp"));
+      expect(read.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "draft" });
+      expect(read.frame?.interior.text).toBe(text);
+      expect(read.frame?.placeholder).toBe(false);
+    });
+  }
+
+  it("the painted capture keeps its label colour: the hint colour is the profile's, and the draft still reads", () => {
+    const rows = fixtureRows("omp--v18-6-1-draft-queueing-painted--w120.txt", SURFACE_FIXTURES_DIR);
+    expect(rows.some((row) => row.segments.some((segment) => segment.text.includes("Queueing ➤") && JSON.stringify(segment.style).includes("107,114,128")))).toBe(true);
+    expect(idleFor("omp")!.inlineHint?.fg).toContain("rgb(107,114,128)");
+  });
+
+  it("the empty box with its ghost hint beside it is still empty", () => {
+    expect(readScreen(fixtureRows("omp--box-empty--v18.12.6.txt", SURFACE_FIXTURES_DIR), "omp", idleFor("omp")).surface.composer).toBe("empty");
   });
 });

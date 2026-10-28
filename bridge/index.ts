@@ -7,7 +7,7 @@ import { classifyInstall, probeInstall } from "../cli/install-kind.ts";
 import { realLinkFs } from "../cli/link.ts";
 import { packageCommand } from "../cli/package-command.ts";
 import { realExec, realFiles } from "../cli/sys.ts";
-import { collieBinary as collieBinaryOf, HOST } from "./host.ts";
+import { collieBinary as collieBinaryOf, HOST, surfacePlatform } from "./host.ts";
 import { ActivityLedger } from "./activity.ts";
 import { trackActivity } from "./activity-tracking.ts";
 import { CacheTracker } from "./cache/tracker.ts";
@@ -73,6 +73,8 @@ import { FolderStore } from "./folders.ts";
 import { WorktreeBaseStore } from "./worktree-bases.ts";
 import { WorktreeReceiptStore } from "./worktree-receipts.ts";
 import { LaunchReceiptStore } from "./launch-receipts.ts";
+import { LaunchWindow, foregroundHarnessOf } from "./launch-window.ts";
+import { createPaneProfile, procProbe, sharedForegroundRead } from "./pane-binary.ts";
 import { StarterReceiptStore } from "./starter-launch.ts";
 import { AnswerReceiptStore } from "./durable/answer.ts";
 import { ControlReceiptStore } from "./durable/control.ts";
@@ -241,7 +243,7 @@ import { AskAnswerer, AskBook } from "./surface/ask.ts";
 import { ClearService } from "./surface/clear.ts";
 import { StopService, type StopDeps } from "./surface/stop.ts";
 import { gateFor } from "./surface/key-gate.ts";
-import { RowRing, SendProtocol, SessionLocks } from "./surface/protocol.ts";
+import { RowRing, SendProtocol, SessionLocks, type PaneProfileMatch } from "./surface/protocol.ts";
 import { ProgramDriver, type ProgramPort } from "./surface/durable-driver.ts";
 import { RequestStore } from "./surface/requests.ts";
 import { HoldStore } from "./surface/holds.ts";
@@ -250,7 +252,7 @@ import { deliverEdge, EdgeRouter, type EdgeTarget } from "./surface/edges.ts";
 import { counterWordOf, HoldBook, HoldServer, takeHold, type HoldTarget } from "./surface/hold.ts";
 import { holdSocketPath } from "./beacon/paths.ts";
 import { VersionCache } from "./surface/binary-version.ts";
-import { findProfile, loadProfiles, profileForPlatform, type ProfileMatch } from "../web/src/lib/surface/profile.ts";
+import { findProfile, loadProfiles } from "../web/src/lib/surface/profile.ts";
 import { labelOf } from "./walky/address.ts";
 import {
   crewSkipped,
@@ -789,7 +791,7 @@ await activity.load();
 // adapters' memoised path caches. Null when `COLLIE_TRANSCRIPT` is off: no journal means no probe, and
 // every pane then reads exactly as it did before this feature existed.
 const journals = cfg.transcript
-  ? buildJournalRegistry({ ...cfg.journalRoots, durable: [durableLogDir(cfg.stateDir)] })
+  ? buildJournalRegistry({ ...cfg.journalRoots, durable: [durableLogDir(cfg.stateDir)] }, cfg.modelCatalogs)
   : null;
 // The name the operator gave a Muse session, for the engines' pane naming (journal/muse.ts).
 // It reads the same logs the journal does, so it lives and dies with the same switch: with
@@ -818,9 +820,10 @@ const accountWindows = new AccountWindows({
   log: (line) => console.log(line),
 });
 // Each pane's context use and subscription windows (bridge/usage.ts), from the files the statusLine
-// wrapper and the beacon write, joined with the account windows above. No journal needed: the pane's
-// session id is the key.
-const usage = new UsageTracker(usageDir(cfg.stateDir), diskUsageFiles, Date.now, accountWindows);
+// wrapper and the beacon write, joined with the account windows above. The pane's session id is the
+// key. A harness whose hooks write no file takes its context from the cache probe's reading of its
+// journal (.adr/0115, amended 2026-10-25); with transcripts off there is none.
+const usage = new UsageTracker(usageDir(cfg.stateDir), diskUsageFiles, Date.now, accountWindows, paneCache ?? undefined);
 
 // Which branch each pane's folder is on (bridge/git-head.ts). One for the whole bridge: every
 // session's poll feeds it its folders, and the server reads it from memory at serialise time.
@@ -852,6 +855,14 @@ await worktreeBases.load();
 // One receipt per launch the phone tagged with a request id, so a retried Start never opens a second
 // pane (ADR 0091, bridge/launch-receipts.ts). Loading writes nothing.
 const launchReceipts = new LaunchReceiptStore(cfg.stateDir);
+// The panes where an agent is starting and has drawn no input box yet: launched by the bridge, a known
+// harness binary in the foreground, or newly named by the multiplexer (bridge/launch-window.ts). The
+// Send Protocol reads them with that agent's profile and types nothing until its box is on screen.
+const launchWindow = new LaunchWindow(undefined, (harness) => findProfile(loadProfiles(), harness)?.id ?? harness);
+/** Each profile's binary (lower case) to its harness id: what a foreground process is matched against. */
+let profileBinaries: ReadonlyMap<string, string> | null = null;
+const harnessBinaries = (): ReadonlyMap<string, string> =>
+  (profileBinaries ??= new Map([...loadProfiles().values()].map((profile) => [profile.identity.binary.toLowerCase(), profile.id])));
 await launchReceipts.load();
 
 // One receipt per starter run (ADR 0102, bridge/starter-launch.ts). Loading writes nothing.
@@ -1154,6 +1165,7 @@ const startDetachedUpdate = (a: {
     runId: a.runId,
     toTag: a.toTag ?? null,
     mirror: mirrorValue(process.env),
+    env: process.env,
   });
   // THE RUNNER'S OWN OUTPUT IS KEPT (#283): a runner that dies before it writes a run record used to
   // leave nothing behind at all.
@@ -1474,12 +1486,23 @@ const holdServer =
         },
       });
 const sendVersions = new VersionCache();
-/** A harness's profile at its binary's version, for the send path. Null when the harness has none. */
-async function sendProfile(harness: string): Promise<ProfileMatch | null> {
-  const profile = findProfile(loadProfiles(), harness);
-  if (profile === undefined) return null;
-  return profileForPlatform(profile.id, await sendVersions.versionOf(profile), HOST.platform);
-}
+/** The platform the harness profiles pick their keys by: `process.platform`, or `wsl` under WSL. Decided once, here. */
+const SURFACE_PLATFORM = surfacePlatform({
+  platform: HOST.platform,
+  env: process.env,
+  readProcVersion: () => {
+    try {
+      return readFileSync("/proc/version", "utf8");
+    } catch {
+      return null;
+    }
+  },
+});
+/**
+ * A harness's profile at its version, for the send path: of the pane's own program when the pane's
+ * foreground read shows it, else of the PATH binary (bridge/pane-binary.ts, ADR 0124).
+ */
+const sendProfile = createPaneProfile({ versions: sendVersions, binaries: harnessBinaries, probe: procProbe(), platform: SURFACE_PLATFORM });
 
 const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
   const built = endpoint.kind === "program" ? programAdapter(endpoint.source) : terminalAdapter(endpoint.socketPath);
@@ -1623,7 +1646,22 @@ const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
   // `send` is declared below; the poll's first update comes after `engine.start()`.
   if (surface !== undefined) {
     engine.onUpdate((s) => {
-      void surface.observe(s.agents).then(() => send?.tickHolds(name, (paneId) => surface.surfaceOf(paneId)));
+      void surface.observe(s.agents).then(() => {
+        // A pane where an agent is starting: once the poll's read finds its input box, the launch window
+        // ends, unless a send's probe already went unseen in that box (it is drawn but reads no keys).
+        for (const agent of s.agents) {
+          if (launchWindow.expecting(name, agent.paneId) === null) continue;
+          if ((surface.boxOf(agent.paneId)?.box ?? null) !== null) launchWindow.drawn(name, agent.paneId, agent.agent);
+        }
+        // A queued send whose text a read shows back in the box (ADR 0122): its card says so.
+        send?.tickQueued(name, (paneId) => surface.boxOf(paneId));
+        // The box text rides along: a box that holds only Collie's own probe characters is no draft.
+        return send?.tickHolds(
+          name,
+          (paneId) => surface.surfaceOf(paneId),
+          (paneId) => surface.boxOf(paneId)?.box ?? null,
+        );
+      });
     });
   }
   // One protocol per terminal session: its own locks, the adapter's one key gate, the bridge's one
@@ -1631,6 +1669,11 @@ const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
   // never run on one pane at once and every key leaves through the one gate.
   const locks = new SessionLocks();
   const ring = new RowRing();
+  // The pane's foreground read, bounded and shared by the reads of one send (the launch window's and the
+  // profile's version read); absent where the multiplexer has none (tmux, zellij, tuios).
+  const foregroundRead = sharedForegroundRead(herdr.foregroundProcesses?.bind(herdr));
+  const foregroundHarness = foregroundHarnessOf(foregroundRead, harnessBinaries);
+  const paneProfile = (harness: string, paneId?: string): Promise<PaneProfileMatch | null> => sendProfile(harness, paneId, foregroundRead);
   const send =
     sends && sendStore !== null && askBook !== undefined
       ? new SendProtocol({
@@ -1640,18 +1683,34 @@ const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
           locks,
           ring,
           ledger: surfaceLedger ?? undefined,
-          profile: (harness) => sendProfile(harness),
+          profile: paneProfile,
+          starting: (paneId, named) => launchWindow.starting(name, paneId, named, foregroundHarness?.(paneId)),
+          framed: (paneId, harness) => launchWindow.framed(name, paneId, harness),
+          deaf: (paneId, harness, typedAt) => launchWindow.deaf(name, paneId, harness, typedAt),
+          pending: (paneId) => launchWindow.pending(name, paneId),
           generation: generationOf,
           asks: askBook,
           holds: holdStore ?? undefined,
           releaseCheck: (requestId, session, paneId) => walkyReleaseCheck?.(requestId, session, paneId) ?? true,
           // A blind send on one of this session's shell panes joins Sent (ADR 0107); any other pane is left out.
           blindSent: sentRecorder(sentStore, () => engine.current().shellPanes),
+          // A box proven stale (a probe that missed it, and a second read of the same rows): the Surface says so until the rows change.
+          staleFrame: (paneId, frame) => surface?.markStale(paneId, frame),
         })
       : undefined;
+  // Each poll tells the launch window which panes the multiplexer names an agent on now: a newly named
+  // one opens a window, a gone one is forgotten. The poll's Surface ends a window above.
+  if (send !== undefined) {
+    engine.onUpdate((s) => {
+      launchWindow.observe(name, [
+        ...s.agents.map((agent) => ({ paneId: agent.paneId, agent: agent.kind === "shell" ? null : agent.agent })),
+        ...s.shellPanes.map((shell) => ({ paneId: shell.paneId, agent: null })),
+      ]);
+    });
+  }
   const asks =
     sends && sendStore !== null && askBook !== undefined
-      ? new AskAnswerer({ mux: herdr, gate: gateFor(herdr), store: sendStore, locks, ring, book: askBook, profile: (harness) => sendProfile(harness), generation: generationOf })
+      ? new AskAnswerer({ mux: herdr, gate: gateFor(herdr), store: sendStore, locks, ring, book: askBook, profile: paneProfile, generation: generationOf })
       : undefined;
   // The structured driver (M56 spec 14): a program session's Surface, Send and Ask from its structured
   // state, with the Send Protocol on. It is the one driver of its session; no screen fold runs beside it.
@@ -1752,11 +1811,13 @@ const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
   // request store nor the Send Protocol flag: a terminal session always has it.
   // Its `stopped` receipt is the stop edge the harness may not send (Claude Code fires no Stop hook on Escape).
   const stopped = surface === undefined ? undefined : (paneId: string): void => void surface.stopSeen(paneId);
-  const stopDeps: StopDeps = { mux: herdr, gate: gateFor(herdr), profile: (harness) => sendProfile(harness) };
+  // Each read-back's box goes to the Send Protocol: a queued send the Stop gave back rides the receipt (ADR 0122).
+  const stopBase: StopDeps = { mux: herdr, gate: gateFor(herdr), profile: paneProfile };
+  const stopDeps: StopDeps = send === undefined ? stopBase : { ...stopBase, returned: (paneId, read) => send.boxRead(name, paneId, { ...read, poll: false }) };
   const stop = endpoint.kind === "terminal" ? new StopService(stopped === undefined ? stopDeps : { ...stopDeps, stopped }) : undefined;
   const withStop = stop === undefined ? withHold : { ...withHold, stop };
   // A Clear of the harness's box (ADR 0116, the Clear paragraph): the same mux, key gate and profile as the Stop.
-  const clear = endpoint.kind === "terminal" ? new ClearService({ mux: herdr, gate: gateFor(herdr), profile: (harness) => sendProfile(harness) }) : undefined;
+  const clear = endpoint.kind === "terminal" ? new ClearService({ mux: herdr, gate: gateFor(herdr), profile: paneProfile, staleFrame: (paneId, frame) => surface?.markStale(paneId, frame) }) : undefined;
   const withClear = clear === undefined ? withStop : { ...withStop, clear };
   return driver === undefined ? withClear : { ...withClear, driver };
 };
@@ -2858,6 +2919,7 @@ const server = startServer({
   worktreeReceipts,
   worktreeBases,
   launchReceipts,
+  launchWindow,
   starterReceipts,
   answerReceipts,
   controlReceipts,

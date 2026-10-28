@@ -103,6 +103,11 @@ const BOX_COMPOSER_FIXTURES = [
   "omp--v18-12-2-goal-resume-typed--w119.txt",
   "omp--v18-12-2-goal-turn-running--w119.txt",
   "omp--v18-12-2-goal-turn-running-probe--w119.txt",
+  // omp 18.12.6 (and 18.6.1) with a skill chip `✦ name arg…` or a pasted image chip `📷 #1` in the band's prompt row
+  // (omp gang 02 and 05, 2026-10-25): cut to the band and the prompt row, the image card over them whole.
+  "omp--v18-12-6-image-chip--w120.txt",
+  "omp--v18-12-6-skill-chip--w120.txt",
+  "omp--v18-6-skill-chip--w120.txt",
   // omp 18.12.1's default `band` composer under the nerd preset, and one unicode control (issue 505).
   "omp--v18-12-band-idle--w130.txt",
   "omp--v18-12-nerd-band-done--w130.txt",
@@ -139,6 +144,42 @@ const BOX_COMPOSER_FIXTURES = [
   "omp--v18-6-steer-over-queued--w120.txt",
   "omp--v18-6-steer-pending-block--w120.txt",
   "omp--v18-6-steer-typed--w120.txt",
+  // omp 18.12.6, `//comment` typed in command mode: one list row under the box (omp-gang testers, 2026-10-25).
+  "omp--v18-12-6-slash-comment-loop-row--w120.txt",
+  // omp 18.12.6 after a cancelled `//comment`: the box is empty and the last list row stays under it.
+  "omp--v18-12-6-stale-list-row-empty-box--w120.txt",
+  // omp 18.6.1 and 18.12.6 under the full preset at 80 columns and the ascii preset (omp-gang 11-geometry, 2026-10-25).
+  "omp--v18-12-6-status-ascii-draft--w80.txt",
+  "omp--v18-12-6-status-ascii-idle--w130.txt",
+  "omp--v18-12-6-status-full-slash-draft--w80.txt",
+  "omp--v18-12-6-status-full-slash-idle--w80.txt",
+  "omp--v18-6-1-status-ascii-idle--w80.txt",
+  "omp--v18-6-1-status-full-slash-idle--w80.txt",
+  // Drafts the box wraps by cutting a token: a CJK run (18.6.1) and a URL wider than a row (18.12.6), 80 columns.
+  "omp--v18-6-1-draft-cjk-wrapped--w80.txt",
+  "omp--v18-12-6-draft-url-wrapped--w80.txt",
+  // omp 18.6.1: a queued line under `After yield · 1`, then Stop gave it back to the box (ADR 0122).
+  "omp--v18-6-1-queued-before-stop--w119.txt",
+  "omp--v18-6-1-stop-returned--w119.txt",
+  // omp 18.6.1 under Herdr (Altan's pane, 2026-10-25): a stale bottom frame of an earlier layout; the live
+  // editor is drawn higher up. The reader finds the stale box, which is why the Send Protocol probes a draft.
+  "omp--v18-6-1-stale-frame-below-live--w120.txt",
+  // omp 18.6.1 and 18.12.6, a file path typed in the box: omp's file popup is one `❯ name.png` row under it
+  // (omp-gang testers 05 and 12, 2026-10-25).
+  "omp--v18-6-1-path-popup--w120.txt",
+  "omp--v18-6-1-path-popup-tilde--w120.txt",
+  "omp--v18-12-6-path-popup--w120.txt",
+  "omp--v18-12-6-path-popup-two-paths--w120.txt",
+  // omp 18.6.1, the `@` file popup and the `#` issue popup under the box, and the `#` rows left under an
+  // emptied box (omp-gang tester 12, 2026-10-25).
+  "omp--v18-6-1-at-popup--w120.txt",
+  "omp--v18-6-1-at-popup-path--w120.txt",
+  "omp--v18-6-1-hash-popup--w120.txt",
+  "omp--v18-6-1-hash-popup-single--w120.txt",
+  "omp--v18-6-1-hash-popup-stale--w120.txt",
+  "omp--v18-12-6-path-popup-partial--w120.txt",
+  "omp--v18-6-1-at-popup-stale--w120.txt",
+  "omp--v18-12-6-at-popup-two-files--w120.txt",
 ];
 
 // omp 18.6.1 with `/model` or `/mod` typed (lab, 2026-10-17): a ten-row palette under the open box. The
@@ -154,13 +195,36 @@ const TALL_PALETTE_FIXTURES = [
   "omp--v18-11-nerd-slash-model--w80.txt",
   // omp 18.12.2, a bare `/goal` typed in a goal turn: the ten-row command list under the box (lab, 2026-10-22).
   "omp--v18-12-2-goal-bare-typed--w119.txt",
+  // omp 18.6.1 and 18.12.6, a fuzzy list of up to ten rows under the box for `/`, `/help`, `/mo` and `/nothere`
+  // (omp-gang testers, 2026-10-25).
+  "omp--v18-6-1-slash-help-unlisted--w120.txt",
+  "omp--v18-6-1-slash-mo-fuzzy--w120.txt",
+  "omp--v18-6-1-slash-nothere-fuzzy--w120.txt",
+  "omp--v18-12-6-slash-help-unlisted--w120.txt",
+  "omp--v18-12-6-slash-mo-fuzzy--w120.txt",
+  "omp--v18-12-6-slash-nothere-fuzzy--w120.txt",
+  "omp--v18-6-1-slash-open-tall--w120.txt",
+  // omp 18.6.1 and 18.12.6 with symbolPreset ascii, `/session` typed: the list cursor is `>` (omp-gang 11-geometry, 2026-10-25).
+  "omp--v18-12-6-ascii-symbols-session-list--w130.txt",
+  "omp--v18-6-1-ascii-symbols-session-list--w130.txt",
+  // omp 18.6.1 and 18.12.6, `:smi` typed: the eight-row emoji popup under the box (omp-gang 04-readers, 2026-10-26).
+  "omp--v18-12-6-emoji-popup--w120.txt",
+  "omp--v18-6-1-emoji-popup--w120.txt",
+  // omp 18.6.1 and 18.12.6, a text ending in a bare `#`: the seven-row editor-action list (omp-gang three, 2026-10-26).
+  "omp--v18-12-6-hash-end-actions--w120.txt",
+  "omp--v18-6-1-hash-end-actions--w120.txt",
 ];
+
+// omp 18.6.1, a nine-row draft that quotes a permission dialog (omp-gang tester 12, 2026-10-25). The composer is
+// ready and its draft is read, but the draft rows stand under the prompt row, past the bridge's tail window,
+// so no region is named (the sweep goes out unbound, as under the tall palettes).
+const TALL_DRAFT_FIXTURES = ["omp--v18-6-1-quoted-dialog-draft--w120.txt"];
 
 const ALL_OMP_FIXTURES = readdirSync(PANES_DIR)
   .filter((f) => f.startsWith("omp--") && f.endsWith(".txt"))
   .toSorted();
 
-const NON_BOX_COMPOSER_FIXTURES = ALL_OMP_FIXTURES.filter((f) => !BOX_COMPOSER_FIXTURES.includes(f) && !TALL_PALETTE_FIXTURES.includes(f));
+const NON_BOX_COMPOSER_FIXTURES = ALL_OMP_FIXTURES.filter((f) => !BOX_COMPOSER_FIXTURES.includes(f) && !TALL_PALETTE_FIXTURES.includes(f) && !TALL_DRAFT_FIXTURES.includes(f));
 
 describe("locateComposer — the real corpus, pinned so any change to the walk shows up as a diff", () => {
   const PINNED: { fixture: string; top: number; bottom: number; suggestEnd: number; draftEnd?: number }[] = [
@@ -237,6 +301,10 @@ describe("locateComposer — the real corpus, pinned so any change to the walk s
     { fixture: "omp--v18-12-2-goal-resume-typed--w119.txt", top: 22, bottom: 23, suggestEnd: 25 },
     { fixture: "omp--v18-12-2-goal-turn-running--w119.txt", top: 19, bottom: 20, suggestEnd: 21 },
     { fixture: "omp--v18-12-2-goal-turn-running-probe--w119.txt", top: 19, bottom: 20, suggestEnd: 21 },
+    // The chips of omp 18.12.6 and 18.6.1 (omp gang 02 and 05): the band is the top row, the chip the prompt row.
+    { fixture: "omp--v18-12-6-image-chip--w120.txt", top: 7, bottom: 8, suggestEnd: 9 },
+    { fixture: "omp--v18-12-6-skill-chip--w120.txt", top: 0, bottom: 1, suggestEnd: 2 },
+    { fixture: "omp--v18-6-skill-chip--w120.txt", top: 0, bottom: 1, suggestEnd: 2 },
     // omp 18.12.1's default `band` composer (issue 505): the status band is the top row, `╰─` the prompt.
     { fixture: "omp--v18-12-band-idle--w130.txt", top: 10, bottom: 11, suggestEnd: 12 },
     { fixture: "omp--v18-12-nerd-band-done--w130.txt", top: 38, bottom: 39, suggestEnd: 40 },
@@ -271,6 +339,32 @@ describe("locateComposer — the real corpus, pinned so any change to the walk s
     { fixture: "omp--v18-6-steer-pending-block--w120.txt", top: 38, bottom: 39, suggestEnd: 40 },
     { fixture: "omp--v18-6-steer-done--w120.txt", top: 37, bottom: 38, suggestEnd: 39 },
     { fixture: "omp--v18-6-steer-typed--w120.txt", top: 38, bottom: 39, suggestEnd: 40 },
+    { fixture: "omp--v18-12-6-slash-comment-loop-row--w120.txt", top: 11, bottom: 12, suggestEnd: 14 },
+    { fixture: "omp--v18-12-6-stale-list-row-empty-box--w120.txt", top: 11, bottom: 12, suggestEnd: 14 },
+    { fixture: "omp--v18-12-6-status-ascii-draft--w80.txt", top: 3, bottom: 4, suggestEnd: 5 },
+    { fixture: "omp--v18-12-6-status-ascii-idle--w130.txt", top: 3, bottom: 4, suggestEnd: 5 },
+    { fixture: "omp--v18-12-6-status-full-slash-draft--w80.txt", top: 3, bottom: 4, suggestEnd: 5 },
+    { fixture: "omp--v18-12-6-status-full-slash-idle--w80.txt", top: 3, bottom: 4, suggestEnd: 5 },
+    { fixture: "omp--v18-6-1-status-ascii-idle--w80.txt", top: 6, bottom: 7, suggestEnd: 8 },
+    { fixture: "omp--v18-6-1-status-full-slash-idle--w80.txt", top: 6, bottom: 7, suggestEnd: 8 },
+    { fixture: "omp--v18-6-1-draft-cjk-wrapped--w80.txt", top: 1, bottom: 2, suggestEnd: 4, draftEnd: 4 },
+    { fixture: "omp--v18-12-6-draft-url-wrapped--w80.txt", top: 1, bottom: 2, suggestEnd: 4, draftEnd: 4 },
+    // omp 18.6.1, a queued line and Stop giving it back (ADR 0122): a short screen, the box on its last row.
+    { fixture: "omp--v18-6-1-queued-before-stop--w119.txt", top: 16, bottom: 17, suggestEnd: 18 },
+    { fixture: "omp--v18-6-1-stop-returned--w119.txt", top: 16, bottom: 17, suggestEnd: 18 },
+    { fixture: "omp--v18-6-1-stale-frame-below-live--w120.txt", top: 38, bottom: 39, suggestEnd: 40 },
+    { fixture: "omp--v18-6-1-path-popup--w120.txt", top: 13, bottom: 14, suggestEnd: 16 },
+    { fixture: "omp--v18-6-1-path-popup-tilde--w120.txt", top: 9, bottom: 10, suggestEnd: 12 },
+    { fixture: "omp--v18-12-6-path-popup--w120.txt", top: 13, bottom: 14, suggestEnd: 16 },
+    { fixture: "omp--v18-12-6-path-popup-two-paths--w120.txt", top: 12, bottom: 13, suggestEnd: 16 },
+    { fixture: "omp--v18-6-1-at-popup--w120.txt", top: 11, bottom: 12, suggestEnd: 14 },
+    { fixture: "omp--v18-6-1-at-popup-path--w120.txt", top: 11, bottom: 12, suggestEnd: 14 },
+    { fixture: "omp--v18-6-1-hash-popup--w120.txt", top: 10, bottom: 11, suggestEnd: 14 },
+    { fixture: "omp--v18-6-1-hash-popup-single--w120.txt", top: 11, bottom: 12, suggestEnd: 14 },
+    { fixture: "omp--v18-6-1-hash-popup-stale--w120.txt", top: 10, bottom: 11, suggestEnd: 14 },
+    { fixture: "omp--v18-12-6-path-popup-partial--w120.txt", top: 9, bottom: 10, suggestEnd: 12 },
+    { fixture: "omp--v18-6-1-at-popup-stale--w120.txt", top: 10, bottom: 11, suggestEnd: 14 },
+    { fixture: "omp--v18-12-6-at-popup-two-files--w120.txt", top: 8, bottom: 9, suggestEnd: 12 },
   ];
 
   // These eleven indices are byte-identical to the ones the width-gated scanner produced. That is
@@ -323,6 +417,11 @@ describe("extractInputDraft", () => {
         "inside the dot git directory, and finally print the total count of files at the very bottom " +
         "of the answer so it is easy to check the result quickly against a manual count taken by hand",
     },
+    // The chips omp draws in the box: the skill chip `✦ name arg…` (18.6.1 and 18.12.6, omp gang 02) and the
+    // pasted image chip (`📷 #1` on 18.12.6, omp gang 05). The draft is the chip as it stands, a draft like any other.
+    { fixture: "omp--v18-12-6-skill-chip--w120.txt", draft: "✦ darius-work-plan reply with the single word OK and call no tools" },
+    { fixture: "omp--v18-6-skill-chip--w120.txt", draft: "✦ darius-work-plan reply with the single word OK and call no tools" },
+    { fixture: "omp--v18-12-6-image-chip--w120.txt", draft: "📷 #1" },
     // A slash command mid-typing is a draft like any other — the palette below the box is chrome.
     { fixture: "omp--slash-palette.txt", draft: "/" },
     { fixture: "omp--slash-palette--filtered.txt", draft: "/new" },
@@ -331,6 +430,37 @@ describe("extractInputDraft", () => {
     { fixture: "omp--v18-6-slash-model-list--w120.txt", draft: "/model" },
     { fixture: "omp--v18-6-slash-model-list--w80.txt", draft: "/model" },
     { fixture: "omp--v18-6-slash-mod-partial--w120.txt", draft: "/mod" },
+    { fixture: "omp--v18-6-1-slash-help-unlisted--w120.txt", draft: "/help" },
+    { fixture: "omp--v18-6-1-slash-mo-fuzzy--w120.txt", draft: "/mo" },
+    { fixture: "omp--v18-6-1-slash-nothere-fuzzy--w120.txt", draft: "/nothere" },
+    { fixture: "omp--v18-12-6-slash-help-unlisted--w120.txt", draft: "/help" },
+    { fixture: "omp--v18-12-6-slash-mo-fuzzy--w120.txt", draft: "/mo" },
+    { fixture: "omp--v18-12-6-slash-nothere-fuzzy--w120.txt", draft: "/nothere" },
+    { fixture: "omp--v18-6-1-slash-open-tall--w120.txt", draft: "/" },
+    { fixture: "omp--v18-12-6-slash-comment-loop-row--w120.txt", draft: "//comment" },
+    // The file popup under a path draft is no list, and no part of the draft.
+    { fixture: "omp--v18-6-1-path-popup--w120.txt", draft: "/home/demo/lab1/.cache/collie-lab/omp-gang/05-images/state/rig/state/uploads/w2_p1-mvo3m20o-6e1a9e71.png" },
+    { fixture: "omp--v18-6-1-path-popup-tilde--w120.txt", draft: "~/.cache/collie-lab/omp-gang/12-pickers/state/harness/omp/project/x.png" },
+    { fixture: "omp--v18-12-6-path-popup--w120.txt", draft: "/home/demo/lab1/.cache/collie-lab/omp-gang/05-images/state/rig/state/uploads/w2_p1-mvo44h6i-fd050f5a.png" },
+    // The `@` and `#` typeahead popups are no part of the draft either, and the rows left under an emptied box hold none.
+    { fixture: "omp--v18-6-1-at-popup--w120.txt", draft: "please read @READ" },
+    { fixture: "omp--v18-6-1-at-popup-path--w120.txt", draft: "@/tmp/x.png" },
+    { fixture: "omp--v18-6-1-hash-popup--w120.txt", draft: "fix item #1" },
+    { fixture: "omp--v18-6-1-hash-popup-single--w120.txt", draft: "see PR #12" },
+    { fixture: "omp--v18-6-1-hash-popup-stale--w120.txt", draft: null },
+    { fixture: "omp--v18-12-6-emoji-popup--w120.txt", draft: "hello :smi" },
+    { fixture: "omp--v18-6-1-emoji-popup--w120.txt", draft: "hello :smi" },
+    { fixture: "omp--v18-12-6-hash-end-actions--w120.txt", draft: "ends with hash #" },
+    { fixture: "omp--v18-6-1-hash-end-actions--w120.txt", draft: "ends with hash #" },
+    { fixture: "omp--v18-12-6-path-popup-partial--w120.txt", draft: "~/.cache/collie-lab/omp-gang/gang3/04-readers/state/harness/omp/project/src/ma" },
+    { fixture: "omp--v18-6-1-at-popup-stale--w120.txt", draft: null },
+    { fixture: "omp--v18-12-6-at-popup-two-files--w120.txt", draft: "please read @READ" },
+    // The person's own prompt quotes a permission dialog: all of it is the draft.
+    {
+      fixture: "omp--v18-6-1-quoted-dialog-draft--w120.txt",
+      draft:
+        'Follow these steps in order without commenting. Step 1: call the ask tool once with the question "First pick?" and the options Alpha, Beta, Gamma. Step 2: when I answer, call the ask tool once more with the question "Second pick?" and the options Red, Green, Blue. Step 3: print this block exactly, inside a code fence, with nothing else: ╭─ Allow tool: bash ───────────╮ │ ❯ Approve                    │ │   Deny                       │ │ ↑/↓ navigate  ⏎ select  ⎋ cancel │ ╰──────────────────────────────╯ Step 4: write the numbers 1 to 200, one per line.my notes',
+    },
     // Empty composers. omp 17/18.1 painted nothing in an empty box; omp 18.4 paints a right-aligned
     // key hint there (`⇧⇥ to change thinking effort`), which is placeholder text, not a draft.
     // Reading it as one showed "Draft in terminal" on every fresh session (markers.ts
@@ -352,6 +482,11 @@ describe("extractInputDraft", () => {
     { fixture: "omp--v18-6-queue-typed--w120.txt", draft: "also say hello at the end" },
     { fixture: "omp--v18-6-queue-after-now--w120.txt", draft: "also say hello at the end" },
     { fixture: "omp--v18-6-queue-after--w120.txt", draft: null },
+    // Stop gave the queued line back (ADR 0122): the box holds it as a draft, the queue block is gone.
+    { fixture: "omp--v18-6-1-queued-before-stop--w119.txt", draft: null },
+    { fixture: "omp--v18-6-1-stop-returned--w119.txt", draft: "second message" },
+    // The stale frame's old text, not the live editor's: a reading the probe has to prove.
+    { fixture: "omp--v18-6-1-stale-frame-below-live--w120.txt", draft: "and what about the design" },
   ];
 
   it.each(DRAFTS)("$fixture reads its draft", ({ fixture, draft }) => {
@@ -363,13 +498,29 @@ describe("extractInputDraft", () => {
   });
 });
 
+// The omp gang's rig reads a pane as plain text: these captures carry no SGR, so the band is one segment.
+const PLAIN_READ_FIXTURES = [
+  "omp--v18-12-6-image-chip--w120.txt",
+  "omp--v18-12-6-skill-chip--w120.txt",
+  "omp--v18-6-1-queued-before-stop--w119.txt",
+  "omp--v18-6-1-stop-returned--w119.txt",
+  "omp--v18-6-skill-chip--w120.txt",
+];
+
 describe("extractStatusLines", () => {
-  it.each(BOX_COMPOSER_FIXTURES)("%s: re-surfaces exactly one styled row", (name) => {
+  it.each(PLAIN_READ_FIXTURES)("%s: a plain read re-surfaces the band as one row", (name) => {
+    const rows = extractStatusLines(fixtureLines(name));
+    expect(rows).toHaveLength(1);
+    expect(lineText(rows[0]!)).toContain("Haiku 4.5");
+  });
+
+  it.each(BOX_COMPOSER_FIXTURES.filter((name) => !PLAIN_READ_FIXTURES.includes(name)))("%s: re-surfaces exactly one styled row", (name) => {
     const rows = extractStatusLines(fixtureLines(name));
     expect(rows).toHaveLength(1);
     // STYLED, not flattened: omp colours each powerline field separately, and that is what makes the
-    // strip readable at a glance once the mirror can no longer show it.
-    expect(rows[0]!.segments.length).toBeGreaterThan(1);
+    // strip readable at a glance once the mirror can no longer show it. A capture with no SGR bytes at all
+    // (the omp-gang testers' plain reads, 2026-10-25) has nothing to keep apart.
+    if (readFileSync(join(PANES_DIR, name), "utf8").includes("\u001b[")) expect(rows[0]!.segments.length).toBeGreaterThan(1);
   });
 
   // The two omp 18.4 hint captures carry the capturing operator's own statusline template, not
@@ -903,6 +1054,13 @@ describe("composerPrompt — the region a destructive write is bound to", () => 
     expect(composerPrompt(withPalette(20))).toBeNull();
   });
 
+  it("declines the region under a nine-row draft that quotes a dialog, and still finds the box and its whole draft", () => {
+    const buffer = fixtureLines(TALL_DRAFT_FIXTURES[0]!);
+    expect(locateComposer(buffer)).toEqual({ top: 2, firstDraftRow: 3, bottom: 3, suggestEnd: 12, draftEnd: 12 });
+    expect(hasComposer(buffer)).toBe(true);
+    expect(composerPrompt(buffer)).toBeNull();
+  });
+
   it("declines the region on omp 18.6.1's ten-row palette, and still finds the box and its one status row", () => {
     const PINNED_TALL = [
       { fixture: "omp--v18-6-slash-mod-partial--w120.txt", top: 17, bottom: 18, suggestEnd: 29 },
@@ -912,6 +1070,19 @@ describe("composerPrompt — the region a destructive write is bound to", () => 
       { fixture: "omp--v18-11-nerd-slash-model--w130.txt", top: 14, bottom: 15, suggestEnd: 26 },
       { fixture: "omp--v18-11-nerd-slash-model--w80.txt", top: 15, bottom: 16, suggestEnd: 27 },
       { fixture: "omp--v18-12-2-goal-bare-typed--w119.txt", top: 23, bottom: 24, suggestEnd: 35 },
+      { fixture: "omp--v18-6-1-slash-help-unlisted--w120.txt", top: 4, bottom: 5, suggestEnd: 16 },
+      { fixture: "omp--v18-6-1-slash-mo-fuzzy--w120.txt", top: 4, bottom: 5, suggestEnd: 16 },
+      { fixture: "omp--v18-6-1-slash-nothere-fuzzy--w120.txt", top: 5, bottom: 6, suggestEnd: 16 },
+      { fixture: "omp--v18-12-6-slash-help-unlisted--w120.txt", top: 4, bottom: 5, suggestEnd: 16 },
+      { fixture: "omp--v18-12-6-slash-mo-fuzzy--w120.txt", top: 4, bottom: 5, suggestEnd: 16 },
+      { fixture: "omp--v18-12-6-slash-nothere-fuzzy--w120.txt", top: 5, bottom: 6, suggestEnd: 16 },
+      { fixture: "omp--v18-6-1-slash-open-tall--w120.txt", top: 15, bottom: 16, suggestEnd: 27 },
+      { fixture: "omp--v18-12-6-ascii-symbols-session-list--w130.txt", top: 1, bottom: 2, suggestEnd: 13 },
+      { fixture: "omp--v18-6-1-ascii-symbols-session-list--w130.txt", top: 1, bottom: 2, suggestEnd: 13 },
+      { fixture: "omp--v18-12-6-emoji-popup--w120.txt", top: 4, bottom: 5, suggestEnd: 14 },
+      { fixture: "omp--v18-6-1-emoji-popup--w120.txt", top: 4, bottom: 5, suggestEnd: 14 },
+      { fixture: "omp--v18-12-6-hash-end-actions--w120.txt", top: 1, bottom: 2, suggestEnd: 10 },
+      { fixture: "omp--v18-6-1-hash-end-actions--w120.txt", top: 2, bottom: 3, suggestEnd: 11 },
     ];
     expect(PINNED_TALL.map((p) => p.fixture)).toEqual(TALL_PALETTE_FIXTURES);
     for (const { fixture, top, bottom, suggestEnd } of PINNED_TALL) {

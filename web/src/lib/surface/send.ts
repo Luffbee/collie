@@ -170,8 +170,17 @@ export interface ReadMark {
   readonly hash: string;
 }
 
-/** The steps whose time a receipt measures. */
-export type SendStep = "s0" | "clear" | "probe" | "write" | "s1" | "commit" | "s2";
+/**
+ * The steps whose time a receipt measures. `profile` is the wait for the harness's profile and binary
+ * version before S0 (#594): the send's bound starts after it, so it is measured and never counted.
+ * `proof`: the probe of a draft S0 read, with its second S0 read where it needed one (2026-10-25); S0's gap leaves it out.
+ * `settle`: an S0 whose screen geometry was in flux (a resize between its reads, or a torn read), and the
+ * pause before the one more S0 that was judged (2026-10-26); S0's gap leaves it out too.
+ * `commandSettle`: a command on a harness with a command list, from the S1 read that first passed to the
+ * read at least the settle interval later that agreed with it on the rows under the box (2026-10-26); S1's
+ * gap ends at the first of the two.
+ */
+export type SendStep = "profile" | "settle" | "s0" | "proof" | "clear" | "probe" | "write" | "s1" | "commandSettle" | "commit" | "s2";
 
 /**
  * The receipt, a closed list of fields. It is written to disk, so it holds no screen text and no
@@ -183,9 +192,18 @@ export interface SendReceipt {
   readonly paneId: string;
   readonly paneGeneration: string;
   readonly harness: string;
+  /** The harness's version: of the pane's own program when the bridge could see it ({@link binary}), else of the binary on its PATH. */
   readonly version: string | null;
   readonly profileId: string | null;
   readonly profileStatus: ProfileStatus | null;
+  /**
+   * The file whose version was read, when the read ran the pane's own program (its foreground process,
+   * ADR 0124): an absolute path, a local fact. A pane whose argv[0] is a bare `omp` carries it too, by
+   * its executable, which may be the same file the PATH holds. Absent when the bridge's PATH lookup
+   * answered (no pane, no foreground read, a file it could not stat, a pane over its read limit). The
+   * recent-sends rows, and so a problem report, do not carry it.
+   */
+  readonly binary?: string;
   readonly textHash: string;
   readonly textLength: number;
   readonly s0: ReadMark | null;
@@ -203,6 +221,13 @@ export interface SendReceipt {
    * profile says Enter queues while running). Absent on every other receipt.
    */
   readonly queued?: true;
+  /**
+   * Set later on a `queued` or `steered` receipt whose text came back: the harness put it back into its
+   * input box (a Stop ended the turn and the harness returned its queue and its steers to the box), and
+   * it never became a prompt. The receipt keeps its outcome and `queued`, which were true when it
+   * settled; this says what happened after (ADR 0122). Absent on every other receipt.
+   */
+  readonly late?: SendLate;
   /**
    * Set on a send a program session took (M56 spec 14): the request id the program acknowledged.
    * The driver passes the request id to the program unchanged, so it equals `requestId`. Absent on
@@ -222,6 +247,16 @@ export interface SendReceipt {
    */
   readonly saw?: SurfaceWords;
 }
+
+/** What may happen to a settled receipt later (see {@link SendReceipt.late}). One word today. */
+export const SEND_LATES = ["returned"] as const;
+
+/**
+ * The receipt detail when Discard on a returned queued card (ADR 0122) found the box changed: nothing
+ * was pressed and only the card went. The bridge writes it; the phone reads it to say so in its own words.
+ */
+export const RETURNED_CARD_DROPPED = "The box no longer holds this message. Collie removed its card and pressed nothing.";
+export type SendLate = (typeof SEND_LATES)[number];
 
 /** The longest {@link SendReceipt.detail} a receipt keeps. */
 export const RECEIPT_DETAIL_MAX = 240;
@@ -280,10 +315,18 @@ export interface SendReceiptRow {
   readonly gapsMs: Readonly<Partial<Record<SendStep, number>>>;
   readonly harness: string;
   readonly version: string | null;
+  /**
+   * The reader profile the bridge used for this send and its status, when it had one (ADR 0123: the
+   * setup block of a report names them). Absent on a pane with no profile and from a bridge before 1.24.1.
+   */
+  readonly profileId?: string;
+  readonly profileStatus?: ProfileStatus;
   /** The cap's numbers, on the cap's refusal only (see {@link SendReceipt.cap}). */
   readonly cap?: SendCap;
   /** Set when the send was queued behind a running turn (see {@link SendReceipt.queued}). */
   readonly queued?: true;
+  /** Set when a queued send came back to the box and never became a prompt (see {@link SendReceipt.late}). */
+  readonly late?: SendLate;
   /** The line of a refusal or a `typed_not_submitted` (see {@link SendReceipt.detail}). */
   readonly detail?: string;
   /** What the bridge saw at that end, four words (see {@link SendReceipt.saw}). */
@@ -305,6 +348,14 @@ export type HeldState = "held" | "running" | "ended";
  * (`expired`, `refused`, `typed_not_submitted`, `unknown`); its text stays for a Resend until the
  * person dismisses it. A request that went out, or that the person cancelled, has no row.
  */
+/**
+ * What holds a held request now: the refusal it was held from (a running turn, something open at the
+ * box, a box that did not read twice the same in time, a probe that found the box not free, a draft).
+ * The phone picks the row's sentence by it.
+ */
+export const HELD_CAUSES = ["turn_running", "not_free", "bound", "draft_present", "probe_failed"] as const;
+export type HeldCause = (typeof HELD_CAUSES)[number];
+
 export interface HeldRow {
   readonly requestId: string;
   readonly mode: SendMode;
@@ -317,6 +368,13 @@ export interface HeldRow {
   /** On an `ended` row: how it closed. */
   readonly outcome?: SendOutcome;
   readonly reason?: SendReason;
+  /** What holds it ({@link HeldCause}); absent on a row a bridge before 1.24.1 held. */
+  readonly cause?: HeldCause;
+  /**
+   * Held for a running turn only because Collie could not read the harness's version (#594): the
+   * profile would take a message in a turn, but not on a version it cannot name. `collie doctor` says why.
+   */
+  readonly versionUnread?: true;
 }
 
 /** What `DELETE /api/send/<id>` answers (M56 spec 15): a held request cancelled, or an ended row dismissed. */
@@ -361,10 +419,18 @@ export interface SendAnswer {
 
 /**
  * The rules an answer may name beside its reason. `notice_key`: the send's whole text is one of the
- * keys a notice above the box printed, which a box holding it alone would answer.
+ * keys a notice above the box printed, which a box holding it alone would answer. `stale_screen`: the
+ * input box on the screen does not take keys (a probe character landed elsewhere or nowhere) and a
+ * second S0 read showed the same rows, so the screen is a stale image (2026-10-25).
  */
-export const SEND_CAUSES = ["notice_key"] as const;
+export const SEND_CAUSES = ["notice_key", "stale_screen"] as const;
 export type SendCause = (typeof SEND_CAUSES)[number];
+
+/**
+ * The bridge's line for a `stale_screen` refusal (2026-10-25). The phone says it in its own words; a
+ * line that adds to it (a probe character that may remain in the box) gets its own sentence too.
+ */
+export const STALE_SCREEN = "The screen shows an input box that does not take keys. The pane may need a redraw; focus it on the desktop or resize it.";
 
 /**
  * The offers that go with an outcome and reason. A pane with no frame cannot prove a draft, so it gets the key pad instead.

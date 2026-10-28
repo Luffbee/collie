@@ -366,6 +366,11 @@ export interface PaneSubagent {
   /** ISO 8601. */
   startedAt?: string;
   spawnDepth?: number;
+  /**
+   * `false` for a row read from the session's journal (Oh My Pi, Gentle Shell): no transcript route
+   * serves it, so the row is not a tap. Absent on a Claude Code subagent, whose transcript opens.
+   */
+  transcript?: false;
 }
 
 /**
@@ -1326,8 +1331,12 @@ export type ToolCall =
   | { kind: "search"; query: string; where?: string; hits?: number }
   | { kind: "fetch"; url: string }
   | { kind: "delete" | "move"; path: string; to?: string }
-  /** `agentId` names the subagent's own log. `ongoing`: a background sub-agent that has not finished, though its start result is in. */
-  | { kind: "task"; agent?: string; summary: string; agentId?: string; ongoing?: true }
+  /**
+   * `agentId` names the subagent's own log. `jobId`: the harness's name for the background job that
+   * runs it (Oh My Pi), with no transcript behind it. `ongoing`: a background sub-agent that has not
+   * finished, though its start result is in.
+   */
+  | { kind: "task"; agent?: string; summary: string; agentId?: string; jobId?: string; ongoing?: true }
   /** A task list the agent keeps rewriting (ADR 0119). On pi its updates are folded into the one card. */
   | { kind: "plan"; name: string; tasks: readonly PlanTask[] }
   /** The agent asked the operator to choose. One entry per question the call carried. `answers[i]` is the list of chosen labels for question `i`, present only once the call completed with answers. */
@@ -1666,6 +1675,13 @@ export interface ChatWindowBody {
    */
   queued?: string[];
   /**
+   * The pane's queued sends as Collie's receipts know them, oldest first (ADR 0122): STATE like
+   * {@link queued}, whole on every answer. Never repeated in {@link queued}, which stays the journal's.
+   * Absent when there is none and from a bridge one release behind. Mirrors `ChatWindowBody` in
+   * bridge/journal/live.ts.
+   */
+  queuedSends?: QueuedSendRow[];
+  /**
    * The keys that deliver {@link queued} now, in the neutral key spelling, declared by the bridge
    * for this session's harness. Absent for every harness that has no such key and from a bridge one
    * release behind, and both read as "no Send now button". Mirrors `ChatWindowBody` in
@@ -1679,6 +1695,18 @@ export interface ChatWindowBody {
    * `ChatWindowBody` in bridge/journal/live.ts.
    */
   lastPrompt?: ChatPrompt;
+}
+
+/**
+ * One queued card as Collie's receipts know it (ADR 0122): its request id, whether it waits in the
+ * harness (`queued`), Stop gave it back to the input box (`returned`, a run of texts given back
+ * together is one card), or Collie cannot tell where it went (`unconfirmed`), and its text, masked when
+ * the bridge masks. Mirrors `QueuedSendWire` in bridge/journal/receipt-queue.ts.
+ */
+export interface QueuedSendRow {
+  requestId: string;
+  state: "queued" | "returned" | "unconfirmed";
+  text: string;
 }
 
 /** The operator's newest prompt, capped by the bridge. Mirrors `ChatPrompt` in bridge/journal/live.ts. */
@@ -2564,4 +2592,10 @@ export interface PaneUsage {
   /** Percent of the context window used, 0 to 100. */
   context?: number;
   limits?: UsageLimit[];
+  /**
+   * The session's running cost in US dollars. Claude Code reports it through the wrapped status line;
+   * pi, Oh My Pi and OpenCode write it in their logs and the bridge sums it; Codex reports none.
+   * **Absent, never a placeholder**: no `0` for "unknown". Drawn after the dots (components/model-tag.tsx).
+   */
+  cost?: number;
 }

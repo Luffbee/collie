@@ -50,7 +50,7 @@ write it as the sentence an operator reads there. Do not touch the three version
 
 **A release needs something to ship.** Before you cut one, read `git log --oneline <last tag>..HEAD`.
 If the range holds only docs, tests and chores, do not release: the docs go out with the next real
-release, and the site's docs sync follows it. A docs-only release makes every self-updating lane
+release or on the docs line (below), and the site's docs sync follows either. A docs-only release makes every self-updating lane
 and crew member update for nothing. Never offer a release as "put the docs live"; name it as a
 release. 1.14.2 was cut this way on 2026-09-28.
 
@@ -125,7 +125,7 @@ release. 1.14.2 was cut this way on 2026-09-28.
    set: `bunx playwright test -c e2e/rig/playwright.config.ts` (*Browser tests*; the prerequisites are
    in `web/e2e/rig/README.md`). It starts a scratch bridge and Herdr with real Claude Code, pi and omp,
    and takes about 5 minutes. Then run the crew leg, `bunx playwright test -c e2e/rig/crew.config.ts`:
-   a lead and a member, about 4 minutes. All forty cases (thirty-three solo, seven on the crew leg)
+   a lead and a member, about 4 minutes. All forty-one cases (thirty-four solo, seven on the crew leg)
    must pass on the first tap. A failed case holds the tag, and so does a case that was not reached.
 
 **A PR from a fork is the exception: leave all four files alone.** Bump nothing, add no CHANGELOG
@@ -149,11 +149,20 @@ is nothing to record. Touch one of them *and* the code under it and the ordinary
 source file is what the line is about. This is enforced two ways, but **you are the first line — do
 it as part of the change, not after**:
 
-**A docs change reaches colliepwa.dev only with a release.** Collie's `release.yml` tells the website
-on every tag, and the website re-quotes `docs/*.md` at the newest published release — so a doc-only
-fix pushed to `main` and not released sits unpublished, and the website's daily cron will not pick it
-up either. To publish sooner, run the website's sync by hand against a ref:
-`gh workflow run sync-docs.yml -R AltanS/collie-website -f ref=main`.
+**A docs change reaches colliepwa.dev with the next release, or sooner on the docs line.** Collie's
+`release.yml` tells the website on every tag, and the website re-quotes `docs/*.md` at the newest
+published release. A doc-only fix that sits on `main` waits for that release. To publish it sooner,
+put it on the docs line: a branch `docs/<newest tag>` (for example `docs/v1.24.1`) that the site
+quotes in place of the tag. Run `bun scripts/docs-line.ts <commit>...` (add `--dry-run` to see the
+result first). It cherry-picks the commits with `-x` onto the branch and pushes it. Two guards hold,
+in the script and again on the site: every path is under `docs/` or is `README.md`, and the tag is an
+ancestor of the branch head. The human rule is yours: put only a docs commit that describes the
+RELEASED version on the line. Docs for a feature that has not shipped stay on `main` until its
+release, or the site describes something users cannot run. The site syncs within minutes of the push
+and again in its daily run. When the next release is tagged, the site follows the new tag and
+ignores the old branch; the script prints the command to delete it. Do not use
+`gh workflow run sync-docs.yml -R AltanS/collie-website -f ref=main` any more: it quotes `main` for
+one run, and the next cron reverts it.
 
 - `scripts/check-version.sh` runs inside `collie build` (a release can't build while versions
   disagree).
@@ -400,7 +409,7 @@ component, not a spec. On 2026-10-17 the specs that did not pass that test moved
   crew leg** (`-c e2e/rig/crew.config.ts`): the same phone against a lead and a member, for the walky
   talky cases that need a crew. It is **the gate before
   every release tag**, and **the proof for a change to a harness reader, the Surface, the Send
-  Protocol or the ask code**: run it on the branch, and all forty cases (thirty-three solo, seven
+  Protocol or the ask code**: run it on the branch, and all forty-one cases (thirty-four solo, seven
   on the crew leg) pass on the first tap. A
   unit test cannot show that a tap works on a real screen. `web/e2e/rig/nightly.ts` also runs it every
   night on `origin/main`, once for each main commit and set of agent versions. The README beside it

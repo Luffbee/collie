@@ -1,11 +1,14 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
-import { agentOf, fixtureRows, idleFor, readScreen, rowsOf, SURFACE_FIXTURES_DIR } from "../../test/surface-corpus";
+import { agentOf, fixtureRows, idleFor, PANES_DIR, readScreen, rowsOf, SURFACE_FIXTURES_DIR } from "../../test/surface-corpus";
 import { findInputFrame, plainRows, rowText } from "./frame";
 import { emptyFoldState, endsInsideFrame, foldSurface, type FoldContext, readFold, type ScreenInput, stepFold, SURFACE_SOURCES, type SurfaceInput, surfaceOfScreen } from "./fold";
 import { requireProfile } from "./profile";
 import { type Ask, isFree, modalWord } from "./surface";
-import { ASK, CLAUDE, LABELS, own } from "../../test/surface-fold";
+import { ASK, CLAUDE, LABELS } from "../../test/surface-fold";
 
 // The fold's own rules and the screens that broke it: the OMP widget, a running turn, foldSurface, the agents panel, and the rows around an idle box.
 
@@ -52,12 +55,45 @@ describe("an OMP extension widget around the open box (#468)", () => {
     expect(r.surface).toEqual(IDLE_FREE);
   });
 
-  it("omp: up to maxTailRows rows under the box read free, one more reads torn", () => {
+  it("omp: up to maxTailRows rows under the box read free whatever they hold, past it only a widget run up to maxWidgetRows", () => {
     const widget = (n: number) => Array.from({ length: n }, (_, i) => ` widget row ${i + 1}`);
+    const readOf = (rows: string[]) => surfaceOfScreen({ seq: 1, source: "screen", at: 0, revision: 1, rows: plainRows(rows), ask: null }, OMP).surface;
     expect(OMP.frame.maxTailRows).toBe(3);
-    expect(surfaceOfScreen({ seq: 1, source: "screen", at: 0, revision: 1, rows: plainRows([...box, ...widget(3)]), ask: null }, OMP).surface).toEqual(IDLE_FREE);
-    expect(surfaceOfScreen({ seq: 1, source: "screen", at: 0, revision: 1, rows: plainRows([...box, "", ...widget(2)]), ask: null }, OMP).surface).toEqual(IDLE_FREE);
-    expect(surfaceOfScreen({ seq: 1, source: "screen", at: 0, revision: 1, rows: plainRows([...box, ...widget(4)]), ask: null }, OMP).surface.reason).toBe("torn");
+    expect(OMP.frame.maxWidgetRows).toBe(12);
+    expect(readOf([...box, ...widget(3)])).toEqual(IDLE_FREE);
+    expect(readOf([...box, "", ...widget(2)])).toEqual(IDLE_FREE);
+    // The gang's tester 5 (2026-10-25): a belowEditor widget of four rows or more made the read torn on 18.6.1 and 18.12.6.
+    for (const n of [4, 6, 11, 12]) expect(readOf([...box, ...widget(n)]), `${String(n)} rows`).toEqual(IDLE_FREE);
+    expect(readOf([...box, ...widget(13)]).reason).toBe("torn");
+  });
+
+  it("omp: past maxTailRows a widget run has no blank row, and no row of the command list", () => {
+    const readOf = (rows: string[]) => surfaceOfScreen({ seq: 1, source: "screen", at: 0, revision: 1, rows: plainRows(rows), ask: null }, OMP).surface;
+    // A blank row inside the run: the reach stays the tail bound, so this is a read cut inside the box, as before.
+    expect(readOf([...box, " one", " two", " three", "", " five"]).reason).toBe("torn");
+    // An entry-shaped row (two spaces, a word, two spaces, a description) is a command list's, and a list is read by the list rules.
+    const listed = readOf([...box, " one", " two", "  tests  passing", " four"]);
+    expect(listed.reason).toBe("torn");
+    expect(isFree(listed)).toBe(false);
+  });
+
+  it("omp: a dialog's rows under the open box stay a strong cue past the old reach, so the read is never free", () => {
+    const dialog = [" Allow this tool?", " ❯ 1. Yes", "   2. No", "   3. Always", " Enter to select · Esc to cancel"];
+    const r = surfaceOfScreen({ seq: 1, source: "screen", at: 0, revision: 1, rows: plainRows([...box, ...dialog]), ask: null }, OMP);
+    expect(isFree(r.surface)).toBe(false);
+    expect(r.surface.modal).not.toBe("none");
+  });
+
+  it.each([
+    ["omp--v18-12-6-widget-below-3.txt", "18.12.6"],
+    ["omp--v18-12-6-widget-below-4.txt", "18.12.6"],
+    ["omp--v18-6-1-widget-below-6.txt", "18.6.1"],
+  ])("omp %s (gang, 2026-10-25): the widget rows under the box read idle and free, the composer empty", (name) => {
+    const r = readScreen(fixtureRows(name, SURFACE_FIXTURES_DIR), agentOf("omp"), OMP);
+    expect(r.frame).not.toBeNull();
+    expect(r.frame!.interior.text).toBe("");
+    expect(r.surface).toEqual(IDLE_FREE);
+    expect(isFree(r.surface)).toBe(true);
   });
 
   it("omp: a draft under the widget's box still reads as a draft", () => {
@@ -65,6 +101,35 @@ describe("an OMP extension widget around the open box (#468)", () => {
     const r = surfaceOfScreen({ seq: 1, source: "screen", at: 0, revision: 1, rows, ask: null }, OMP);
     expect(r.frame?.interior.text).toBe("Reply with only OK. Second line of the message.");
     expect(r.surface.composer).toBe("draft");
+  });
+});
+
+describe("an OMP extension's status row under the box and under a slash list (omp gang, 2026-10-25)", () => {
+  // `ctx.ui.setStatus` draws one plain row under everything else. With a list of four rows or more under
+  // the box the read was unreadable and torn; the profile now names that row as the list's footer.
+  const OMP = requireProfile("omp").idle;
+  const read = (name: string) => readScreen(fixtureRows(name, SURFACE_FIXTURES_DIR), agentOf("omp"), OMP);
+
+  it("omp: the box with only the status row under it reads idle and free", () => {
+    const r = read("omp--v18-12-6-status-row-idle.txt");
+    expect(r.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "empty" });
+  });
+
+  it.each([
+    ["omp--v18-12-6-status-row-palette-4.txt", "/wx"],
+    ["omp--v18-6-1-status-row-palette-4.txt", "/wx"],
+    ["omp--v18-12-6-status-row-palette-10.txt", "/w"],
+    // omp-gang three S2 (2026-10-26): a widget of one to six rows under the palette, with a status row or without.
+    ["omp--v18-6-1-palette-widget-below-6.txt", "/wx"],
+    ["omp--v18-12-6-palette-widget-below-6.txt", "/wx"],
+    ["omp--v18-6-1-palette-widget-and-status.txt", "/wx"],
+    ["omp--v18-12-6-palette-widget-and-status.txt", "/wx"],
+    ["omp--v18-6-1-palette-tick-below.txt", "/wx"],
+    ["omp--v18-12-6-palette-tick-below.txt", "/wx"],
+  ])("omp %s: the typed command with its list and the status row under it reads a draft, not unreadable or torn", (name, typed) => {
+    const r = read(name);
+    expect(r.frame?.interior.text).toBe(typed);
+    expect(r.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "draft" });
   });
 });
 
@@ -316,10 +381,13 @@ describe("rows around an idle box that 1.21.3 sent to (1.22.1 audit)", () => {
   });
 
   it("omp: a screen with no whole box under a strong cue still reads torn", () => {
-    // The slash palette stands under the prompt row, so no frame closes and the read ends inside one.
-    const read = own("omp--slash-palette.txt");
-    expect(findInputFrame(fixtureRows("omp--slash-palette.txt"), idleFor("omp")!)).toBeNull();
-    expect(read.surface.reason).toBe("torn");
+    // The slash palette stands under the prompt row. With the pointer taken off its first entry it is no
+    // list (`leadOpens` needs a pointed list), so no frame closes and the read ends inside one.
+    const raw = readFileSync(join(PANES_DIR, "omp--slash-palette.txt"), "utf8");
+    expect(raw).toContain("\u276f skill:");
+    const rows = rowsOf(raw.replace("\u276f skill:", "  skill:"));
+    expect(findInputFrame(rows, idleFor("omp")!)).toBeNull();
+    expect(readScreen(rows, "omp", idleFor("omp")).surface.reason).toBe("torn");
   });
 });
 

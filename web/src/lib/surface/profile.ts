@@ -237,6 +237,73 @@ export interface CommandListRows {
    * showed Enter run the typed text with that list open. Optional.
    */
   readonly argumentList?: boolean;
+  /**
+   * The harness draws a fuzzy list under the box for any text that starts with the lead (OMP's
+   * `/help` lists ten commands that match it in part, the pointer on the first), so the list is the
+   * text's own popup whatever it points at. The Surface leaves its rows out of the cue read, and a
+   * box under a list as tall as the harness draws it is still found. Whether Enter would run what is
+   * typed stays the pointer's question ({@link pointsAt}). Needs `lead`. A profile names it only
+   * where a lab run showed that list under every text that starts with the lead. Optional.
+   */
+  readonly leadOpens?: boolean;
+  /**
+   * A list left on screen under an EMPTY box is stale: the harness did not redraw the rows after the
+   * text that opened the list was cleared (OMP 18.12.6 keeps `❯ ↻ loop` under the box after a cancelled
+   * `//comment`), and the rows go with the next key typed. The rows under the box count none of its
+   * rows, so the probe character that closes the list does not read as a screen that moved. A profile
+   * names it only where a lab run showed the row go at the next key. Optional.
+   */
+  readonly staleWhenEmpty?: boolean;
+  /**
+   * A regular expression source for a box text that opens no command list. The harness draws a popup of
+   * another kind under such a text, and its rows can look like a list's entries: OMP completes a file
+   * path at the start of the box (`/home/me/pic.png`, `~/pic.png`, `./pic.png`, `@/tmp/pic.png`) with a
+   * popup of file names, one `❯ pic.png` row for the path of one file, and a file name has the shape of a
+   * command. A box whose text matches reads no command list, so the row under it is no list pointing at
+   * another command and Enter there is not refused for it. Matched on the box's text, the rows of a
+   * wrapped draft joined. A profile names it only where a lab run showed that popup under the text. Optional.
+   */
+  readonly notForText?: string;
+}
+
+/**
+ * One typeahead popup the harness draws under the box for the text's last word (OMP's `@` file popup, the
+ * `#` issue and pull request popup, the `:` emoji popup). It is the text's own popup, not a dialog.
+ */
+export interface PopupRule {
+  /** A word for the rule, unique in the profile. */
+  readonly name: string;
+  /** A regular expression source for the box text that opens the popup. It cannot match an empty text. */
+  readonly text: string;
+  /**
+   * A regular expression source for each row of the popup, with the named group `pointer` set on the
+   * pointed row (and only there). It cannot match a blank row.
+   */
+  readonly rows: string;
+  /**
+   * The rows stay on screen under an EMPTY box after the text that opened them is gone (OMP 18.6.1 keeps
+   * `PR #1` and `Issue #1` under a box cleared with Ctrl+C), and go with the next key. Optional.
+   */
+  readonly staleWhenEmpty?: true;
+  /**
+   * The popup completes the last word of the text, and it is closed once that word is already the pointed entry: the
+   * text ends with the pointed row's `entry` group after a `/` (OMP 18.12.6 closes its path popup and Enter submits
+   * the text when the typed path equals the one entry). Needs the group `entry` in `rows`. Optional.
+   */
+  readonly closedWhenTyped?: true;
+}
+
+/** `idle.volatile.below.popups`: the popups a box's last word opens ({@link PopupRule}). */
+export interface PopupRows {
+  /**
+   * True: the harness's `keys.submit` ignores an open popup (OMP's Ctrl+Q runs before the autocomplete
+   * handler), so a send committed with that key goes out with the popup open. A send committed with
+   * `keys.commandSubmit` does not: Enter acts on the popup, and that send keeps its refusal.
+   */
+  readonly submitIgnores: true;
+  /** The popup's most rows. */
+  readonly maxRows: number;
+  readonly rules: readonly PopupRule[];
 }
 
 /** A side of the box a command list stands on. */
@@ -273,10 +340,27 @@ export interface FrameLayout {
   readonly bottom: FrameAnchor;
   /** Spaces in front of a wrapped draft row inside the box. */
   readonly continuationIndent: number;
+  /**
+   * For a profile that draws its dialogs in the box's place (`dialogsInBox`): the columns in front of the
+   * rows under the prompt row that hold the draft (OMP's `╰─ ` is three wide, so its draft continues at
+   * three spaces). A row inside the box that starts with that many spaces is the draft's, and a dialog
+   * the person quoted in it is no dialog: the modal cues leave those rows out. A dialog drawn in the box's
+   * place starts at the box's own column. Optional, 1 or more.
+   */
+  readonly draftIndent?: number;
   readonly maxDraftRows: number;
   /** How many rows above the last non-blank row the bottom edge may sit (the frame module's
    *  search bound, M56 spec 03): the tallest thing the harness draws under a live box. */
   readonly maxTailRows: number;
+  /**
+   * An open box only: how many rows an extension's widget may take in one unbroken run right under
+   * the box. Past `maxTailRows`, a box is still found while every row under it up to the screen's last
+   * row is painted (no blank row) and none of them is a row of the profile's command list, and the run
+   * is at most this tall. The list rows keep the tail bound, because a list under the box is read as
+   * the typed command's own or not at all ({@link CommandListRows}). Optional: with none, the tail
+   * bound is the only bound.
+   */
+  readonly maxWidgetRows?: number;
   /**
    * How the walk finds the box. `edges` (the default) walks up from the bottom edge: rows that are
    * no edge are the wrapped draft, the first edge row is the prompt row, the top edge is over it.
@@ -326,6 +410,25 @@ export interface FrameLayout {
    * must name every row the box may hold, so a box with any other row inside is no box. Optional.
    */
   readonly ownPrompt?: boolean;
+  /**
+   * How the harness's editor shows a draft taller than the box (omp gang, 2026-10-25). Optional: a
+   * layout without it grows with its draft, so the box always shows the whole text.
+   */
+  readonly scroll?: FrameScroll;
+}
+
+/**
+ * A box that stops growing at a height and scrolls its draft inside ({@link FrameLayout.scroll}).
+ * OMP 18.6.1 and 18.12.6 cap their editor at 17 draft rows on a pane of 30 rows or more and keep the
+ * cursor's rows in view: after typing, the LAST rows. A box read at that height may hold more text
+ * above its first row, so the Send Protocol compares only the visible rows, against the end of the text
+ * it typed, and empties such a box only when it knows how long the draft is.
+ */
+export interface FrameScroll {
+  /** Which rows stay in view: `tail`, the last ones (the cursor's, at the end of a typed text). */
+  readonly keeps: "tail";
+  /** The box's height in draft rows once it scrolls. A box that shows fewer rows shows the whole draft. */
+  readonly rows: number;
 }
 
 /** The ghost text after the cursor ({@link Profile.idle.inlineHint}). */
@@ -379,6 +482,13 @@ export interface Profile {
          * that hides). The Send Protocol then accepts rows above that only lost text. Optional.
          */
         readonly losesText?: true;
+        /**
+         * Rows above the box may repaint by themselves in place: a counter, a clock or a spinner that
+         * an extension's widget draws over the editor. The Send Protocol then reads every digit run
+         * and braille glyph above the box as a fixed mark; a row that changes any other character,
+         * or a new row, still moves the screen. Optional.
+         */
+        readonly ticks?: true;
       };
       readonly below: {
         readonly maxRows: number;
@@ -413,6 +523,12 @@ export interface Profile {
          * only when the list is its own. Never Escape. Optional.
          */
         readonly commandList?: CommandListRows;
+        /**
+         * The typeahead popups under the box that the text's last word opens ({@link PopupRows}). The
+         * Surface leaves their rows out of every cue read and the Send Protocol out of its row count, so
+         * a draft with a popup open reads as a draft. Optional.
+         */
+        readonly popups?: PopupRows;
       };
     };
     /**
@@ -443,7 +559,8 @@ export interface Profile {
      * Rows that mean a dialog is drawn over the screen above a live box, as regular expression
      * sources, read on every row above the box. A harness that draws its pickers and notices over
      * the transcript and leaves the box on screen needs them: the box looks free under a dialog.
-     * A match makes the modal `unreadable`. Optional.
+     * A match makes the modal `unreadable`. On a screen with no frame at all (a full-screen picker),
+     * a match in the rows the modal cues read does the same when those rows hold any cue. Optional.
      */
     readonly overlayRows?: readonly string[];
     /**
@@ -453,6 +570,22 @@ export interface Profile {
      * as a modal then, and a modal is never free. Optional.
      */
     readonly dialogsInBox?: boolean;
+    /**
+     * True for a harness whose transcript echoes each sent prompt in its prompt row's shape: the prompt
+     * glyph and the text, then the wrapped or later lines at `frame.continuationIndent`, a blank row
+     * after it (Claude Code's `❯ ` echo, 2.1.309 and 2.1.310, 2026-10-25). The bridge's whole-screen cue
+     * read over a found box then reads such a run above the box as blank: a long prompt wraps into rows
+     * that line up like a pointed list, and a numbered list in the answer under it made the read strong,
+     * so a send into a running turn was held instead of queued. The framed cue read (cues.ts
+     * `readCuesFor`, the Surface's modal claim) reads such a run as blank too: Claude Code draws a queued
+     * message over the box in the same shape, `❯ ` and its text, its wrapped or later lines and the
+     * `ctrl+enter to send now` hint indented under it. A queued message of two rows or more (every walky
+     * talky message) read as a pointed list of three rows, so the Surface claimed a modal at S2 and the
+     * send ended `unknown(dialog_after_enter)` (browser leg case 16, 2.1.310, 2026-10-26). A run whose
+     * first row is an option row (a number or a checkbox behind the glyph) stays in the read; the option
+     * rows of a text's own list under its first row do not count (2.1.310, 2026-10-26). Optional.
+     */
+    readonly promptEchoes?: boolean;
     /**
      * Notices the harness draws above its live box while the box keeps the keys, each named by its
      * head row. A notice is that head, up to three continuation rows indented by two spaces, and one
@@ -509,6 +642,16 @@ export interface Profile {
     readonly interruptClearsDraft?: boolean;
     /** One `key` press per typed character, plus `slack` more. Never Escape. */
     readonly clear: { readonly key: string; readonly slack: number };
+    /**
+     * The one key that empties the box at a stroke where `clear` cannot (OMP 18.6.1 and 18.12.6: a
+     * draft that starts with `->` or `=>` grows its queue label back after every Backspace; only
+     * Ctrl+C empties it). Optional: without it a box `clear` leaves unchanged stays, as before.
+     * SAFETY: such a key may quit the program when the box is already empty (OMP quits on a second
+     * Ctrl+C within 500 ms of the first), so Collie presses it at most once per request, only after a
+     * fresh read showed a draft in the box and the `clear` batches left it unchanged, and reads again
+     * at once. Never on an empty box. Never Escape.
+     */
+    readonly clearAll?: { readonly key: string };
     readonly navigation: {
       readonly up: string;
       readonly down: string;
@@ -582,8 +725,29 @@ export interface Profile {
   readonly collapse: {
     /** The long-paste form as a regular expression source. Group `lines` is optional. */
     readonly pattern: string;
+    /**
+     * True when the harness keeps a pasted body registered under its chip after the chip is deleted,
+     * and expands a later typed chip token into that body (OMP 18.6.1 and 18.12.6: a cleared `📄 #1`
+     * leaks into `see 📄 #1 here`). A plain send, command, Add or Replace whose text holds a token
+     * that matches `pattern` is then refused `reserved_lead` before any key. Optional: absent allows
+     * the token as plain text. Collie's own pastes never carry the token in their text, so they pass.
+     */
+    readonly refuseLiteral?: boolean;
   };
+  /**
+   * The leads the harness reads as something other than text: a command (`/`), a shell line (`!`), or
+   * a rewrite of the box (OMP re-inserts a newline after a bare `->` or `=>`, its yield-queue prefix,
+   * so such a box can never be sent as typed or emptied by Backspace). A plain send of a text that
+   * starts with one is refused `reserved_lead` before any key.
+   */
   readonly reservedLeads: readonly string[];
+  /**
+   * For a lead in `reservedLeads` that has no command route either (a text that starts with it cannot
+   * be typed at all): the sentence the refusal carries, which is true for this harness. Optional. A
+   * lead with a note is refused in every writing mode, a Replace and a command included; a lead
+   * without one keeps the generic line and its command route. Every key must be in `reservedLeads`.
+   */
+  readonly reservedLeadNotes?: Readonly<Record<string, string>>;
   readonly probe: {
     readonly char: string;
     readonly status: "verified" | "provisional";
@@ -650,6 +814,7 @@ const STATUSES = ["verified", "provisional", "revoked"] as const;
 const PROBE_STATUSES = ["verified", "provisional"] as const;
 const HOOK_KINDS = ["edge", "ask"] as const;
 const FRAME_WALKS = ["edges", "interior"] as const;
+const SCROLL_KEEPS = ["tail"] as const satisfies readonly FrameScroll["keeps"][];
 const ENTER_MODES = ["queues", "steers", "submits", "ignored"] as const;
 const COMMAND_MODES = ["queues", "runs", "drops", "steers"] as const;
 const SEMVER = /^\d+\.\d+\.\d+$/;
@@ -696,7 +861,8 @@ function textList(value: JsonValue | undefined, path: string, minLength: number)
   return items.map((item, i) => text(item, `${path}[${String(i)}]`));
 }
 
-const PLATFORMS = ["win32", "darwin", "linux"] as const;
+// `wsl` is Linux under Windows Subsystem for Linux, where an agent program may take the Windows keys.
+const PLATFORMS = ["win32", "darwin", "linux", "wsl"] as const;
 
 /** A key list as the file wrote it: the default, and the lists of the platforms that differ. */
 interface PlatformLists {
@@ -893,12 +1059,15 @@ function parseVersions(value: JsonValue | undefined, path: string): [VersionRang
  * problem throws a {@link ProfileError} that names the field path.
  */
 
-/** `idle.volatile.above`: its row count, and `losesText` only when the profile sets it (it may only be true). */
+/** `idle.volatile.above`: its row count, and `losesText` and `ticks` only when the profile sets them (each may only be true). */
 function volatileAbove(node: JsonObject): Profile["idle"]["volatile"]["above"] {
   const maxRows = whole(field(node, "maxRows", "idle.volatile.above"), "idle.volatile.above.maxRows", 0);
-  if (node.losesText === undefined) return { maxRows };
-  if (node.losesText !== true) fail("idle.volatile.above.losesText", "must be true when present");
-  return { maxRows, losesText: true };
+  if (node.losesText !== undefined && node.losesText !== true) fail("idle.volatile.above.losesText", "must be true when present");
+  if (node.ticks !== undefined && node.ticks !== true) fail("idle.volatile.above.ticks", "must be true when present");
+  if (node.losesText === true && node.ticks === true) return { maxRows, losesText: true, ticks: true };
+  if (node.losesText === true) return { maxRows, losesText: true };
+  if (node.ticks === true) return { maxRows, ticks: true };
+  return { maxRows };
 }
 
 /** `idle.volatile.below.footerRows`: each row a unique name and a pattern that cannot match a blank row. */
@@ -956,9 +1125,18 @@ function commandList(value: JsonValue | undefined): CommandListRows {
   if (node.pointerBold !== undefined && node.pointerBold !== true && node.pointerBold !== false) fail(`${path}.pointerBold`, "must be true or false");
   if (node.argumentHint !== undefined && node.argumentHint !== true && node.argumentHint !== false) fail(`${path}.argumentHint`, "must be true or false");
   if (node.argumentList !== undefined && node.argumentList !== true && node.argumentList !== false) fail(`${path}.argumentList`, "must be true or false");
+  if (node.leadOpens !== undefined && node.leadOpens !== true && node.leadOpens !== false) fail(`${path}.leadOpens`, "must be true or false");
+  if (node.leadOpens === true && (node.lead === undefined || node.lead === "")) fail(`${path}.leadOpens`, "needs a lead");
+  if (node.staleWhenEmpty !== undefined && node.staleWhenEmpty !== true && node.staleWhenEmpty !== false) fail(`${path}.staleWhenEmpty`, "must be true or false");
   const withPointerBold = node.pointerBold === true ? { ...withNamespaces, pointerBold: true } : withNamespaces;
   const withArgumentHint = node.argumentHint === true ? { ...withPointerBold, argumentHint: true } : withPointerBold;
-  return node.argumentList === true ? { ...withArgumentHint, argumentList: true } : withArgumentHint;
+  const withArgumentList = node.argumentList === true ? { ...withArgumentHint, argumentList: true } : withArgumentHint;
+  const withLeadOpens = node.leadOpens === true ? { ...withArgumentList, leadOpens: true } : withArgumentList;
+  const withStale = node.staleWhenEmpty === true ? { ...withLeadOpens, staleWhenEmpty: true } : withLeadOpens;
+  if (node.notForText === undefined) return withStale;
+  const notFor = pattern(node.notForText, `${path}.notForText`);
+  if (notFor.test("")) fail(`${path}.notForText`, "must not match an empty text");
+  return { ...withStale, notForText: notFor.source };
 }
 
 /** `commandList.namespaces`: unique words with no space in them. */
@@ -1005,7 +1183,43 @@ function volatileBelow(node: JsonObject): Profile["idle"]["volatile"]["below"] {
       : { ...base, hints: list(node.hints, "idle.volatile.below.hints").map((item, i) => pattern(item, `idle.volatile.below.hints[${String(i)}]`).source) };
   const withFooter = node.footerRows === undefined ? withHints : { ...withHints, footerRows: footerRows(node.footerRows) };
   const withScreens = node.otherScreens === undefined ? withFooter : { ...withFooter, otherScreens: otherScreens(node.otherScreens) };
-  return node.commandList === undefined ? withScreens : { ...withScreens, commandList: commandList(node.commandList) };
+  const withList = node.commandList === undefined ? withScreens : { ...withScreens, commandList: commandList(node.commandList) };
+  return node.popups === undefined ? withList : { ...withList, popups: popupRows(node.popups) };
+}
+
+/**
+ * `idle.volatile.below.popups`: `submitIgnores` true, the most rows, and at least one rule with a unique
+ * name, a text pattern that cannot match an empty text and a row pattern that holds the group `pointer`
+ * and cannot match a blank row.
+ */
+function popupRows(value: JsonValue): PopupRows {
+  const path = "idle.volatile.below.popups";
+  const node = object(value, path);
+  if (node.submitIgnores !== true) fail(`${path}.submitIgnores`, "must be true");
+  const maxRows = whole(field(node, "maxRows", path), `${path}.maxRows`, 1);
+  const names = new Set<string>();
+  const rules = list(field(node, "rules", path), `${path}.rules`).map((item, i): PopupRule => {
+    const at = `${path}.rules[${String(i)}]`;
+    const rule = object(item, at);
+    const name = text(field(rule, "name", at), `${at}.name`);
+    if (names.has(name)) fail(`${at}.name`, "is used twice");
+    names.add(name);
+    const opens = pattern(field(rule, "text", at), `${at}.text`);
+    if (opens.test("") || opens.test(" ")) fail(`${at}.text`, "must not match an empty text");
+    const rowPattern = pattern(field(rule, "rows", at), `${at}.rows`);
+    if (rowPattern.test("") || rowPattern.test(" ")) fail(`${at}.rows`, "must not match a blank row");
+    if (!rowPattern.source.includes("(?<pointer>")) fail(`${at}.rows`, "must hold the named group pointer");
+    if (rule.staleWhenEmpty !== undefined && rule.staleWhenEmpty !== true) fail(`${at}.staleWhenEmpty`, "must be true when named");
+    if (rule.closedWhenTyped !== undefined && rule.closedWhenTyped !== true) fail(`${at}.closedWhenTyped`, "must be true when named");
+    if (rule.closedWhenTyped === true && !rowPattern.source.includes("(?<entry>")) fail(`${at}.closedWhenTyped`, "needs the named group entry in rows");
+    return Object.assign(
+      { name, text: opens.source, rows: rowPattern.source },
+      rule.staleWhenEmpty === true ? { staleWhenEmpty: true as const } : {},
+      rule.closedWhenTyped === true ? { closedWhenTyped: true as const } : {},
+    );
+  });
+  if (rules.length === 0) fail(`${path}.rules`, "must name at least one rule");
+  return { submitIgnores: true, maxRows, rules };
 }
 /** `idle.notices`: each an object whose head pattern compiles and cannot match a blank row, and whose `body` and `letters`, when named, are true. */
 function parseNotices(value: JsonValue | undefined): NoticeHead[] {
@@ -1077,18 +1291,32 @@ function parseTrailer(value: JsonValue): FrameTrailer {
   return { row, pad: pattern(node.pad, "idle.frame.trailer.pad").source, maxPad };
 }
 
+/** `idle.frame.scroll`: which rows a scrolled box keeps in view, and its height then. */
+function parseScroll(value: JsonValue, maxDraftRows: number): FrameScroll {
+  const node = object(value, "idle.frame.scroll");
+  const keeps = oneOf(field(node, "keeps", "idle.frame.scroll"), "idle.frame.scroll.keeps", SCROLL_KEEPS);
+  const rows = whole(field(node, "rows", "idle.frame.scroll"), "idle.frame.scroll.rows", 1);
+  if (rows > maxDraftRows) fail("idle.frame.scroll.rows", "must not pass maxDraftRows: the walk would never read a box that tall");
+  return { keeps, rows };
+}
+
 /** `idle.frame`: the three anchors, the bounds, and the interior walk's own fields when the profile names that walk. */
 function parseFrame(frameNode: JsonObject): FrameLayout {
   const walk = frameNode.walk === undefined ? "edges" : oneOf(frameNode.walk, "idle.frame.walk", FRAME_WALKS);
-  const base = {
+  const maxDraftRows = whole(field(frameNode, "maxDraftRows", "idle.frame"), "idle.frame.maxDraftRows", 1);
+  const anchors = {
     top: anchor(field(frameNode, "top", "idle.frame"), "idle.frame.top", null, true),
     prompt: anchor(field(frameNode, "prompt", "idle.frame"), "idle.frame.prompt", "draft", false),
     continuationIndent: whole(field(frameNode, "continuationIndent", "idle.frame"), "idle.frame.continuationIndent", 0),
-    maxDraftRows: whole(field(frameNode, "maxDraftRows", "idle.frame"), "idle.frame.maxDraftRows", 1),
+    maxDraftRows,
     maxTailRows: whole(field(frameNode, "maxTailRows", "idle.frame"), "idle.frame.maxTailRows", 0),
   };
+  const maxWidgetRows = frameNode.maxWidgetRows === undefined ? undefined : whole(frameNode.maxWidgetRows, "idle.frame.maxWidgetRows", 1);
+  const withWidgets = maxWidgetRows === undefined ? anchors : { ...anchors, maxWidgetRows };
+  const withIndent = frameNode.draftIndent === undefined ? withWidgets : { ...withWidgets, draftIndent: whole(frameNode.draftIndent, "idle.frame.draftIndent", 1) };
+  const base = frameNode.scroll === undefined ? withIndent : { ...withIndent, scroll: parseScroll(frameNode.scroll, maxDraftRows) };
   if (walk === "edges") {
-    for (const key of ["rows", "trailer", "continuation", "ownPrompt"] as const) {
+    for (const key of ["rows", "trailer", "continuation", "ownPrompt", "maxWidgetRows"] as const) {
       if (frameNode[key] !== undefined) fail(`idle.frame.${key}`, "belongs to the interior walk");
     }
     const edgeBottom = anchor(field(frameNode, "bottom", "idle.frame"), "idle.frame.bottom", null, true);
@@ -1096,6 +1324,10 @@ function parseFrame(frameNode: JsonObject): FrameLayout {
     return { ...base, bottom: edgeBottom };
   }
   const interior = { ...base, bottom: anchor(field(frameNode, "bottom", "idle.frame"), "idle.frame.bottom", null, true), walk };
+  if (maxWidgetRows !== undefined) {
+    if (interior.bottom.open !== true) fail("idle.frame.maxWidgetRows", "belongs to an open box");
+    if (maxWidgetRows <= anchors.maxTailRows) fail("idle.frame.maxWidgetRows", "must be more than maxTailRows");
+  }
   const withRows = frameNode.rows === undefined ? interior : { ...interior, rows: pattern(frameNode.rows, "idle.frame.rows").source };
   const withTrailer = frameNode.trailer === undefined ? withRows : { ...withRows, trailer: parseTrailer(frameNode.trailer) };
   const withUnder = frameNode.under === undefined ? withTrailer : { ...withTrailer, under: pattern(frameNode.under, "idle.frame.under").source };
@@ -1186,7 +1418,11 @@ export function parseProfile(raw: JsonValue): Profile {
   if (idleNode.dialogsInBox !== undefined && idleNode.dialogsInBox !== true && idleNode.dialogsInBox !== false) {
     fail("idle.dialogsInBox", "must be true or false");
   }
-  const withDialogs: Profile["idle"] = idleNode.dialogsInBox === true ? { ...withOverlay, dialogsInBox: true } : withOverlay;
+  const withDialogs0: Profile["idle"] = idleNode.dialogsInBox === true ? { ...withOverlay, dialogsInBox: true } : withOverlay;
+  if (idleNode.promptEchoes !== undefined && idleNode.promptEchoes !== true && idleNode.promptEchoes !== false) {
+    fail("idle.promptEchoes", "must be true or false");
+  }
+  const withDialogs: Profile["idle"] = idleNode.promptEchoes === true ? { ...withDialogs0, promptEchoes: true } : withDialogs0;
   const withNotices: Profile["idle"] = idleNode.notices === undefined ? withDialogs : { ...withDialogs, notices: parseNotices(idleNode.notices) };
   const withGaps: Profile["idle"] = idleNode.noticeGaps === undefined ? withNotices : { ...withNotices, noticeGaps: parseNoticeGaps(idleNode.noticeGaps) };
   const withHint: Profile["idle"] = idleNode.inlineHint === undefined ? withGaps : { ...withGaps, inlineHint: parseInlineHint(idleNode.inlineHint) };
@@ -1276,11 +1512,31 @@ export function parseProfile(raw: JsonValue): Profile {
   }
   // Escape is never cleanup (ARCHITECTURE.md, Send Protocol): a profile cannot name it as the clear key.
   if (/^(?:escape|esc)$/i.test(keys.clear.key)) fail("keys.clear.key", "must not be Escape");
+  if (keysNode.clearAll !== undefined) {
+    const clearAllNode = object(keysNode.clearAll, "keys.clearAll");
+    const clearAll = { key: text(field(clearAllNode, "key", "keys.clearAll"), "keys.clearAll.key") };
+    if (/^(?:escape|esc)$/i.test(clearAll.key)) fail("keys.clearAll.key", "must not be Escape");
+    keys = { ...keys, clearAll };
+  }
 
   const collapseNode = object(field(root, "collapse", ""), "collapse");
-  const collapse = { pattern: pattern(field(collapseNode, "pattern", "collapse"), "collapse.pattern").source };
+  const collapseBase = { pattern: pattern(field(collapseNode, "pattern", "collapse"), "collapse.pattern").source };
+  if (collapseNode.refuseLiteral !== undefined && collapseNode.refuseLiteral !== true && collapseNode.refuseLiteral !== false) fail("collapse.refuseLiteral", "must be true or false");
+  const collapse = collapseNode.refuseLiteral === true ? { ...collapseBase, refuseLiteral: true } : collapseBase;
 
   const reservedLeads = textList(field(root, "reservedLeads", ""), "reservedLeads", 1);
+  let reservedLeadNotes: Readonly<Record<string, string>> | undefined;
+  if (root.reservedLeadNotes !== undefined) {
+    const notesNode = object(root.reservedLeadNotes, "reservedLeadNotes");
+    const notes: Record<string, string> = {};
+    for (const lead of Object.keys(notesNode)) {
+      if (!reservedLeads.includes(lead)) fail("reservedLeadNotes", `${lead} is not in reservedLeads`);
+      const leadNote = text(notesNode[lead], `reservedLeadNotes.${lead}`);
+      if (leadNote.trim().length === 0) fail(`reservedLeadNotes.${lead}`, "must not be empty");
+      notes[lead] = leadNote;
+    }
+    reservedLeadNotes = notes;
+  }
   // Read after the leads: each entry is one command word that starts with one of them.
   if (keysNode.commandsRunInTurn !== undefined) {
     const commandsRunInTurn = textList(keysNode.commandsRunInTurn, "keys.commandsRunInTurn", 1);
@@ -1344,7 +1600,8 @@ export function parseProfile(raw: JsonValue): Profile {
   const hold = root.hold === undefined ? undefined : parseHold(root.hold, hooks);
 
   const parsedProfile: Profile = { id, identity: agentNames === undefined ? identity : { ...identity, agentNames }, versions, idle: idleBlock, keys, collapse, reservedLeads, probe, hooks };
-  const withPaste = paste === undefined ? parsedProfile : { ...parsedProfile, paste };
+  const withNotes = reservedLeadNotes === undefined ? parsedProfile : { ...parsedProfile, reservedLeadNotes };
+  const withPaste = paste === undefined ? withNotes : { ...withNotes, paste };
   const withAsk = ask === undefined ? withPaste : { ...withPaste, ask };
   const withEdges = edges === undefined ? withAsk : { ...withAsk, edges };
   return hold === undefined ? withEdges : { ...withEdges, hold };

@@ -12,7 +12,10 @@ import { loadConfig } from "../config.ts";
 import type { MuxGrid, MuxGridRequest, MuxOutcome } from "../mux/types.ts";
 import { guard, paneCanSteer, SURFACE_OFF_TEXT, surfaceRoute } from "../server.ts";
 import type { AgentView } from "../types.ts";
-import { askOf } from "../../web/src/lib/surface/surface.ts";
+import { askOf, frameImageKey } from "../../web/src/lib/surface/surface.ts";
+import { parseAnsi } from "../../web/src/lib/ansi.ts";
+import { splitLines } from "../../web/src/lib/blocks.ts";
+import { rowText } from "../../web/src/lib/surface/frame.ts";
 import { SurfaceLedger } from "./counters.ts";
 import { DISAGREE_REPEAT_MS, DISAGREE_TAG, SurfaceShadow, freeOnOldAxis, maskSurface, surfaceRouteBody } from "./shadow.ts";
 
@@ -94,6 +97,21 @@ describe("surface shadow", () => {
     expect(r.shadow.canStopOf("w1:p1")).toBe(true);
     expect(r.shadow.canStopOf("w1:p2")).toBe(false); // no profile
     expect(r.shadow.canStopOf("w1:p9")).toBe(false); // unknown pane
+  });
+
+  test("answers the newest read's input box, when it was read and its turn, for queued sends (ADR 0122)", async () => {
+    const r = rig("18.6.1");
+    r.mux.set("w1:p1", "omp--v18-6-1-stop-returned--w119.txt", 3);
+    r.mux.set("w1:p2", "omp--v18-6-1-queued-before-stop--w119.txt", 3);
+    expect(r.shadow.boxOf("w1:p1")).toBeNull(); // not read yet
+    await r.shadow.observe([agent("w1:p1", "omp"), agent("w1:p2", "omp")]);
+    expect(r.shadow.boxOf("w1:p1")).toEqual({ box: "second message", at: 1_000_000, turn: "idle" });
+    expect(r.shadow.boxOf("w1:p2")).toEqual({ box: "", at: 1_000_000, turn: "running" });
+    // A read the multiplexer could not take has no box: it says nothing about the text.
+    r.mux.failing.add("w1:p1");
+    r.tick(1_000);
+    await r.shadow.observe([agent("w1:p1", "omp")]);
+    expect(r.shadow.boxOf("w1:p1")).toMatchObject({ box: null, at: 1_001_000 });
   });
 
   test("says no Stop when the range the version borrows is revoked, as StopService would refuse it (M68)", async () => {
@@ -258,6 +276,46 @@ describe("surface shadow", () => {
       throw new Error("socket closed");
     };
     await expect(r.shadow.observe([agent("w1:p1")])).resolves.toBeUndefined();
+  });
+});
+
+describe("surface shadow: a box proven stale (2026-10-25)", () => {
+  const STALE = "omp--v18-6-1-stale-frame-below-live--w120.txt";
+  /** The key of the stale capture's bottom frame (rows 38-39), as the Send Protocol names it. */
+  const staleKey = (): string => frameImageKey(splitLines(parseAnsi(screen(STALE))).map((row) => rowText(row)), 38, 39);
+
+  test("the Surface carries staleFrame while reads show the same rows, and loses it at the first read that shows others", async () => {
+    const r = rig("18.6.1");
+    r.mux.set("w1:p1", STALE, 3);
+    await r.shadow.observe([agent("w1:p1", "omp")]);
+    expect(r.shadow.surfaceOf("w1:p1")).toMatchObject({ composer: "draft" });
+    expect(r.shadow.surfaceOf("w1:p1")?.staleFrame).toBeUndefined();
+    r.shadow.markStale("w1:p1", staleKey());
+    expect(r.shadow.surfaceOf("w1:p1")?.staleFrame).toBe(true);
+    // The same rows on a later read keep the mark.
+    r.tick(1000);
+    r.mux.set("w1:p1", STALE, 4);
+    await r.shadow.observe([agent("w1:p1", "omp")]);
+    expect(r.shadow.surfaceOf("w1:p1")?.staleFrame).toBe(true);
+    // The screen is drawn again and shows other rows: the mark goes, and does not come back with the old rows.
+    r.tick(1000);
+    r.mux.set("w1:p1", "omp--fresh-idle.txt", 5);
+    await r.shadow.observe([agent("w1:p1", "omp")]);
+    expect(r.shadow.surfaceOf("w1:p1")?.staleFrame).toBeUndefined();
+    r.tick(1000);
+    r.mux.set("w1:p1", STALE, 6);
+    await r.shadow.observe([agent("w1:p1", "omp")]);
+    expect(r.shadow.surfaceOf("w1:p1")?.staleFrame).toBeUndefined();
+  });
+
+  test("a mark for rows the newest read does not show, or for a pane never read, marks nothing", async () => {
+    const r = rig("18.6.1");
+    r.shadow.markStale("w1:p1", staleKey());
+    r.mux.set("w1:p1", STALE, 3);
+    await r.shadow.observe([agent("w1:p1", "omp")]);
+    expect(r.shadow.surfaceOf("w1:p1")?.staleFrame).toBeUndefined();
+    r.shadow.markStale("w1:p1", "another-image");
+    expect(r.shadow.surfaceOf("w1:p1")?.staleFrame).toBeUndefined();
   });
 });
 
