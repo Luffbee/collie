@@ -57,6 +57,9 @@ import claudeModelPicker from "@/fixtures/panes/claude-lab--menu-model-picker-v2
 import claudeHeadsUp from "@/fixtures/panes/claude--v2302-heads-up-above-box--w142.txt?raw";
 import claudeHeadsUpDismissed from "@/fixtures/panes/claude--v2304-heads-up-dismissed--w135.txt?raw";
 import claudeHeadsUpExplained from "@/fixtures/panes/claude--v2304-heads-up-explained--w135.txt?raw";
+import claudeAuthBoxWaiting from "@/fixtures/panes/claude--v2307-auth-refresh-before-output--w61.txt?raw";
+import claudeAuthBoxFilled from "@/fixtures/panes/claude--v2307-auth-refresh-output--w61.txt?raw";
+import claudeAuthBoxLocked from "@/fixtures/panes/claude--v2309-auth-refresh-locked--w52.txt?raw";
 
 // ── The one clock ────────────────────────────────────────────────────────────────────────────────
 
@@ -542,6 +545,18 @@ export const rosterFive: ServerSummary[] = [
   },
 ];
 
+/**
+ * Two instances per host (M77): two machines, each running the Herdr TUI and Herdr core side by side,
+ * so four members read as two machines. `workshop-hc` has stopped answering, which turns its machine
+ * degraded and names the core instance as the one that is down.
+ */
+export const rosterTwoPerHost: ServerSummary[] = [
+  { ...lead, host: "lodge", mux: "tui" },
+  { id: "lodge-hc", name: "lodge-hc", isLead: false, reachable: true, protocol: "ok", lastSeenAt: TS - 3 * SEC, host: "lodge", mux: "core" },
+  { id: "workshop", name: "workshop", isLead: false, reachable: true, protocol: "ok", lastSeenAt: TS - 3 * SEC, host: "workshop", mux: "tui" },
+  { id: "workshop-hc", name: "workshop-hc", isLead: false, reachable: false, protocol: "ok", lastSeenAt: TS - 6 * MIN, host: "workshop", mux: "core" },
+];
+
 /** Nine machines — enough that the formation's V has to wrap onto a third and fourth row. */
 export const rosterNine: ServerSummary[] = [
   lead,
@@ -693,6 +708,27 @@ export const censusNine: CrewStatusResponse = {
   ts: TS,
 };
 
+/** Two instances per host, the census that pairs with {@link rosterTwoPerHost}: two machine cards. */
+export const censusTwoPerHost: CrewStatusResponse = {
+  crew: crewMeta,
+  self: crewSelf,
+  deputy: { id: "workshop", warrantGeneration: 3 },
+  members: [
+    { ...selfMember, host: "lodge", mux: "tui" },
+    member("lodge-hc", "reachable", { host: "lodge", mux: "core", address: "lodge.tail1a2b.ts.net:8794" }),
+    member("workshop", "reachable", { host: "workshop", mux: "tui", enrolledAt: TS - 120 * DAY }),
+    member("workshop-hc", "unreachable", {
+      host: "workshop",
+      mux: "core",
+      address: "workshop.tail1a2b.ts.net:8795",
+      reason: "connect ECONNREFUSED 100.71.4.9:8795",
+      linkState: "reconnecting",
+      lastSeenAt: TS - 6 * MIN,
+    }),
+  ],
+  ts: TS,
+};
+
 /**
  * The loud one: `attic` believes ANOTHER collie leads this crew, under a warrant generation higher
  * than the deputy's. Two collies both convinced they are the lead is not a transient the next poll
@@ -784,6 +820,13 @@ export const homeCrew: HomeData = {
 
 /** A three-machine crew, on the trio roster — pairs with {@link censusTrio}. */
 export const homeTrio: HomeData = { ...homeCrew, servers: rosterTrio };
+
+/** Two instances per host, pairs with {@link censusTwoPerHost}. The third machine's panes move to `lodge-hc`. */
+export const homeTwoPerHost: HomeData = {
+  ...homeCrew,
+  agents: homeCrew.agents.map((a) => (a.host === "attic" ? onHost(a, "lodge-hc") : a)),
+  servers: rosterTwoPerHost,
+};
 
 /** A nine-machine crew — pairs with {@link censusNine}. */
 export const homeNine: HomeData = { ...homeCrew, servers: rosterNine };
@@ -1123,6 +1166,42 @@ export const paneHeadsUpExplained: PaneFixture = {
   text: claudeHeadsUpExplained,
   revision: 7_305,
   surface: { revision: 7_305, turn: "idle", modal: "none", composer: "empty" },
+};
+
+/**
+ * Claude Code 2.1.307 while `awsAuthRefresh` has not printed yet, at 61 columns: the Authentication
+ * box holds its title alone, and lifts as a waiting card.
+ */
+export const paneAuthBoxWaiting: PaneFixture = {
+  // SAFETY: `structuredClone` of an `AgentView`, a plain data record, is an `AgentView`.
+  pane: { ...structuredClone(working[0]!), paneId: `${working[0]!.paneId}-auth-box-waiting` },
+  text: claudeAuthBoxWaiting,
+  revision: 7_306,
+  surface: { revision: 7_306, turn: "idle", modal: "none", composer: "empty" },
+};
+
+/**
+ * Claude Code 2.1.307 once the login command printed its URL and device code, at 61 columns, with the
+ * URL broken mid-word at the box edge: the card shows it as one link.
+ */
+export const paneAuthBoxFilled: PaneFixture = {
+  // SAFETY: `structuredClone` of an `AgentView`, a plain data record, is an `AgentView`.
+  pane: { ...structuredClone(working[0]!), paneId: `${working[0]!.paneId}-auth-box-filled` },
+  text: claudeAuthBoxFilled,
+  revision: 7_307,
+  surface: { revision: 7_307, turn: "idle", modal: "none", composer: "empty" },
+};
+
+/**
+ * Claude Code 2.1.309 when another process already runs the login command, at 52 columns: the box
+ * holds one sentence and no link.
+ */
+export const paneAuthBoxLocked: PaneFixture = {
+  // SAFETY: `structuredClone` of an `AgentView`, a plain data record, is an `AgentView`.
+  pane: { ...structuredClone(working[0]!), paneId: `${working[0]!.paneId}-auth-box-locked` },
+  text: claudeAuthBoxLocked,
+  revision: 7_308,
+  surface: { revision: 7_308, turn: "idle", modal: "none", composer: "empty" },
 };
 
 /** A bare shell — no agent, no grammar, a ShellBadge in place of the status chip. */

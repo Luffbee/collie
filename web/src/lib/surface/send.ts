@@ -179,8 +179,10 @@ export interface ReadMark {
  * `commandSettle`: a command on a harness with a command list, from the S1 read that first passed to the
  * read at least the settle interval later that agreed with it on the rows under the box (2026-10-26); S1's
  * gap ends at the first of the two.
+ * `probeWrite`: the multiplexer's time for the probe character's write and its Backspace (2026-10-30); the
+ * probe's gap leaves it out, as the probe's read bound does.
  */
-export type SendStep = "profile" | "settle" | "s0" | "proof" | "clear" | "probe" | "write" | "s1" | "commandSettle" | "commit" | "s2";
+export type SendStep = "profile" | "settle" | "s0" | "proof" | "clear" | "probe" | "probeWrite" | "write" | "s1" | "commandSettle" | "commit" | "s2";
 
 /**
  * The receipt, a closed list of fields. It is written to disk, so it holds no screen text and no
@@ -471,10 +473,25 @@ export function sendLines(text: string): string[] {
   return lines;
 }
 
-/** The reserved lead a text starts with (after leading blanks), or null. */
+/**
+ * The first word of a text is a file the bridge saved from an upload: an absolute path whose last two
+ * segments are `uploads/<pane>-<base36 time>-<8 hex>.<ext>` (the name `bridge/server.ts` gives it).
+ * Pure and shape only, so the phone and the bridge agree and neither touches the disk. A real command
+ * name never holds a second slash.
+ */
+export function startsWithUploadPath(text: string): boolean {
+  const word = text.trimStart().split(/\s/u, 1)[0] ?? "";
+  return /^\/(?:[^/]+\/)*uploads\/[A-Za-z0-9_-]+-[a-z0-9]+-[0-9a-f]{8}\.[A-Za-z0-9]+$/u.test(word);
+}
+
+/**
+ * The reserved lead a text starts with (after leading blanks), or null. A text whose first word is
+ * the path of a saved upload (a screenshot sent with no words) starts with `/` but is no command.
+ */
 export function reservedLead(text: string, leads: readonly string[]): string | null {
   const head = text.trimStart();
-  return leads.find((lead) => head.startsWith(lead)) ?? null;
+  const lead = leads.find((candidate) => head.startsWith(candidate)) ?? null;
+  return lead === "/" && startsWithUploadPath(head) ? null : lead;
 }
 
 /** The text with every white-space character removed: the compare form for wrapped rows. */

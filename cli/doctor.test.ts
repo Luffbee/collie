@@ -7,7 +7,7 @@ import { delimiter, join } from "node:path";
 import { CREW_PROTOCOL_VERSION } from "../bridge/crew/enrollment.ts";
 import { leadStore, member, CREW, peerStore, T0 } from "../bridge/crew/fixtures.ts";
 import { binaryName, HOST, hostFor } from "../bridge/host.ts";
-import { markerFor } from "../bridge/crew/staleness.ts";
+import { markerFor, NO_RUNTIME_FACTS } from "../bridge/crew/staleness.ts";
 import { serializeTrustStore, TrustStore, type TrustStoreData, type TrustStoreIo } from "../bridge/crew/trust-store.ts";
 import { fakeBeaconReader, FAKE_BEACON_NOW, type FakeBeacon } from "../bridge/beacon/fake.ts";
 import { BEACON_SCHEMA_VERSION } from "../bridge/beacon/types.ts";
@@ -93,15 +93,8 @@ const NETMAP_OPEN = JSON.stringify({ PacketFilter: [{ IPProto: ["tcp"] }] });
 /** A netmap whose inbound packet filter is EMPTY — deny-all, the only thing this probe can prove. */
 const NETMAP_DENY = JSON.stringify({ PacketFilter: [] });
 
-/**
- * The netmap probe is bounded through `timeout(1)` where it exists, and the fake `Exec` says every
- * tool exists — so the call it actually makes is `timeout 3 /fake/tailscale debug netmap`. Both
- * spellings are scripted, so the fixture does not silently stop matching if that bound is dropped.
- */
-const netmapAnswers = (json: string): NonNullable<Scripted["answers"]> => [
-  ["timeout 3 /fake/tailscale debug netmap", { stdout: json }],
-  ["tailscale debug netmap", { stdout: json }],
-];
+/** The netmap probe is bounded by the `Exec` seam itself, so the call is plain `tailscale debug netmap`. */
+const netmapAnswers = (json: string): NonNullable<Scripted["answers"]> => [["tailscale debug netmap", { stdout: json }]];
 
 /** `herdr integration status` on a host where every journalled agent's hook is current (issue #137). */
 const INTEGRATION_OK = [
@@ -164,6 +157,9 @@ function healthyFiles(): SeededFiles {
   };
 }
 
+/** One `sends-<harness>` row per harness with a profile (M71 spec 01), there whether or not a send ran. */
+const SENDS_CHECKS = [...loadProfiles().keys()].map((id) => `sends-${id}`);
+
 /** Where the bridge keeps its paired devices, under the fake state dir. */
 const PAIRED_DEVICES = `${STATE}/paired-devices.json`;
 
@@ -221,6 +217,9 @@ function fakeOwnerOnly(
     now: () => T0,
   };
 }
+
+/** A width no row reaches, so a plain row stays one line. */
+const WIDE = 10_000;
 
 const WIN_HOME = "C:\\Users\\Rehearse Ünal";
 const WIN_SID = "S-1-5-21-1678274354-1849132225-3673151578-1000";
@@ -329,6 +328,9 @@ function harness(
       now: () => T0,
       // Every secret path present and owner-only. The `secrets-private` cases build their own.
       ownerOnly: fakeOwnerOnly({}),
+      // Wide enough that no row wraps: the cases below read one row as one line. The layout has its
+      // own suite (doctor-layout.test.ts), and the golden below runs at 80.
+      columns: WIDE,
     },
     io: out,
     files,
@@ -427,8 +429,10 @@ describe("collie doctor — the contract", () => {
       "skill-walky-talky",
       "account-windows",
       "herdr-version",
+      "integration-agy",
       "integration-claude",
       "integration-codex",
+      "integration-dsh-tui",
       "integration-grok",
       "integration-hermes",
       "integration-kiro",
@@ -437,6 +441,7 @@ describe("collie doctor — the contract", () => {
       "integration-opencode",
       "integration-pi",
       "integration-omp",
+      "integration-antigravity",
       // Not on Windows: Herdr's hooks there are PowerShell (M43 spec 08).
       ...(HOST.platform === "win32" ? [] : ["hook-python3"]),
       "agent-sessions",
@@ -444,6 +449,8 @@ describe("collie doctor — the contract", () => {
       "cache-claims",
       "cache-rules",
       "cache-env",
+      ...SENDS_CHECKS,
+      "holds",
       "restart-pending",
       "clock",
     ]);
@@ -523,9 +530,11 @@ describe("collie doctor — the contract", () => {
       // Four keys on every finding, plus `scope` on a crew one and ONLY on a crew one (ADR 0050).
       // Absent is the local answer, so a script written before the field keeps reading correctly.
       // The `collie` finding adds `instance` and `stateDir`, and a harness row `harness`, `binary`,
-      // `version` and `profileStatus` (1.24.1); no other finding carries a fifth key.
+      // `version` and `profileStatus` (1.24.1), a sends row `harness`, `window` and `counts` (M71
+      // spec 01), a holds row `harness` and `holds` (the one that says none is open carries `holds`
+      // alone) and a screen row `harness` (spec 02); no other finding carries a fifth key.
       const keys = Object.keys(f).toSorted();
-      const extra = f.check === "collie" ? ["instance", "stateDir"] : [];
+      const extra = f.check === "collie" ? ["instance", "stateDir"] : f.check.startsWith("sends-") ? ["counts", "harness", "window"] : f.check.startsWith("holds") ? ["harness", "holds"] : f.check.startsWith("screen-") ? ["harness"] : [];
       expect(keys.filter((k) => k !== "scope" && !extra.includes(k))).toEqual(["check", "detail", "remedy", "status"]);
       if (keys.includes("scope")) expect(f.scope).toBe("crew");
       expect(["ok", "warn", "error", "skipped"]).toContain(f.status);
@@ -743,6 +752,43 @@ describe("collie doctor — the local checks", () => {
     }
   });
 
+  // A member enrolled at 127.0.0.1 on the lead's own machine joined by the lead's public name, so its
+  // stored lead address is not loopback. The marker's `leadLastDialledAt` is the only proof it has.
+  test("bind: loopback on a PEER the lead has dialled shares the lead's machine, and the time is shown", async () => {
+    const peer = peerStore({ lead: member({ memberId: "desk", role: "lead", address: "https://collie.example.net" }) });
+    const dialledAt = T0 + 60_000;
+    const { byCheck } = await findings(
+      harness(peer, [hello({ memberId: "desk" })], {
+        files: without(
+          {
+            ...healthyFiles(),
+            [`${STATE}/crew-runtime.json`]: JSON.stringify(
+              markerFor(peer, T0, 42, { ...NO_RUNTIME_FACTS, leadLastDialledAt: dialledAt }),
+            ),
+          },
+          HANDLER,
+        ),
+      }),
+    );
+    expect(byCheck.get("bind")?.status).toBe("ok");
+    expect(byCheck.get("bind")?.detail).toContain(new Date(dialledAt).toISOString());
+    expect(byCheck.get("bind")?.detail).toContain("shares this machine");
+  });
+
+  test("bind: loopback on a PEER the lead has not dialled yet is still the trap, worded as not yet", async () => {
+    const peer = peerStore({ lead: member({ memberId: "desk", role: "lead", address: "https://collie.example.net" }) });
+    const { byCheck } = await findings(
+      harness(peer, [hello({ memberId: "desk" })], {
+        files: without({ ...healthyFiles(), ...markerFile(peer) }, HANDLER),
+      }),
+    );
+    const bind = byCheck.get("bind");
+    expect(bind?.status).toBe("error");
+    expect(bind?.detail).toContain("probe has not landed yet");
+    expect(bind?.detail).not.toContain("never lands");
+    expect(bind?.remedy).toContain("COLLIE_HOST=laptop.tail.ts.net");
+  });
+
   test("bind: loopback on a lead or solo is the RIGHT answer, not a finding", async () => {
     const solo = await findings(harness(null));
     expect(solo.byCheck.get("bind")?.status).toBe("ok");
@@ -872,6 +918,110 @@ describe("collie doctor — the local checks", () => {
     expect(byCheck.get("front-door")?.status).toBe("warn");
     expect(byCheck.get("front-door")?.detail).toContain("no HTTPS certificates");
     expect(byCheck.get("front-door")?.remedy).toContain("https://login.tailscale.com/admin/dns");
+  });
+
+  test("front-door: a signed-out Tailscale is not blamed on the certificates", async () => {
+    const { byCheck } = await findings(
+      harness(null, [], {
+        answers: [
+          ["tailscale status --json", { stdout: JSON.stringify({ BackendState: "NeedsLogin" }) }],
+          ...netmapAnswers(NETMAP_OPEN),
+        ],
+      }),
+    );
+    expect(byCheck.get("front-door")?.status).toBe("skipped");
+    expect(byCheck.get("front-door")?.detail).toContain("Tailscale is not running here");
+    expect(byCheck.get("front-door")?.detail).not.toContain("no HTTPS certificates");
+  });
+
+  test("front-door: a Tailscale that times out is reported as slow, not as signed out or as no certificates", async () => {
+    const { byCheck } = await findings(
+      harness(null, [], {
+        answers: [["tailscale status --json", { code: 124 }], ...netmapAnswers(NETMAP_OPEN)],
+      }),
+    );
+    const row = byCheck.get("front-door");
+    expect(row?.status).toBe("skipped");
+    expect(row?.detail).toContain("did not answer within 3 seconds");
+    expect(row?.detail).not.toContain("no HTTPS certificates");
+    expect(byCheck.get("tailscale")?.detail).toContain("did not answer");
+    expect(byCheck.get("tailscale")?.detail).not.toContain("not signed in");
+  });
+
+  describe("front-door: a hand-made door on another listener", () => {
+    const OWN_HTTP = `http:8787|laptop.tail.ts.net:8787|${PROXY}\n`;
+    const OWN_ONLY = JSON.stringify({
+        TCP: { "8787": { HTTP: true } },
+        Web: { "laptop.tail.ts.net:8787": { Handlers: { "/": { Proxy: PROXY } } } },
+      });
+    const WITH_PORT_80 = JSON.stringify({
+      TCP: { "8787": { HTTP: true }, "80": { HTTP: true } },
+      Web: {
+        "laptop.tail.ts.net:8787": { Handlers: { "/": { Proxy: PROXY } } },
+        "laptop.tail.ts.net:80": { Handlers: { "/": { Proxy: PROXY } } },
+      },
+    });
+    const run = async (serve: string, files: Record<string, string> = { ...healthyFiles(), [HANDLER]: OWN_HTTP }) => {
+      const h = harness(null, [], {
+        files,
+        answers: [
+          ["tailscale status --json", { stdout: JSON.stringify({ Self: { DNSName: "laptop.tail.ts.net." } }) }],
+          ["tailscale serve status --json", { stdout: serve }],
+          ...netmapAnswers(NETMAP_OPEN),
+        ],
+      });
+      h.deps = { ...h.deps, ctx: { ...h.deps.ctx, serveMode: "http" } };
+      return (await findings(h)).byCheck.get("front-door");
+    };
+
+    test("a port-80 mount that proxies to Collie is named, with the removal command", async () => {
+      const row = await run(WITH_PORT_80);
+      expect(row?.status).toBe("warn");
+      expect(row?.detail).toBe(
+        `:80 proxies to ${PROXY}, made by hand on a port Collie does not manage; collie uninstall will not remove it`,
+      );
+      expect(row?.remedy).toContain("`tailscale serve --http=80 --set-path=/ off`");
+      expect(row?.remedy).toContain("then run `collie start`");
+    });
+
+    test("the same status without the :80 mount keeps the ok row", async () => {
+      expect((await run(OWN_ONLY))?.status).toBe("ok");
+    });
+
+    test("any other port counts, and an https mount gets the --https flag", async () => {
+      const row = await run(
+        JSON.stringify({
+          TCP: { "8787": { HTTP: true }, "8443": { HTTPS: true } },
+          Web: {
+            "laptop.tail.ts.net:8787": { Handlers: { "/": { Proxy: PROXY } } },
+            "laptop.tail.ts.net:8443": { Handlers: { "/": { Proxy: PROXY } } },
+          },
+        }),
+      );
+      expect(row?.detail).toContain(":8443 proxies to");
+      expect(row?.remedy).toContain("`tailscale serve --https=8443 --set-path=/ off`");
+    });
+
+    test("a mount on another port that proxies elsewhere is nobody's business", async () => {
+      const other = JSON.stringify({
+        TCP: { "8787": { HTTP: true }, "80": { HTTP: true } },
+        Web: {
+          "laptop.tail.ts.net:8787": { Handlers: { "/": { Proxy: PROXY } } },
+          "laptop.tail.ts.net:80": { Handlers: { "/": { Proxy: "http://127.0.0.1:9000" } } },
+        },
+      });
+      expect((await run(other))?.status).toBe("ok");
+    });
+
+    test("with COLLIE_SKIP_SERVE=1 the existing answer stands", async () => {
+      const { [HANDLER]: _recorded, ...unrecorded } = healthyFiles();
+      const h = harness(null, [], {
+        env: { COLLIE_SKIP_SERVE: "1" },
+        files: unrecorded,
+        answers: [["tailscale serve status --json", { stdout: WITH_PORT_80 }], ...netmapAnswers(NETMAP_OPEN)],
+      });
+      expect((await findings(h)).byCheck.get("front-door")?.status).toBe("ok");
+    });
   });
 
   // Since 2026-10-28 `collie start` publishes the door on Windows too (ADR 0075, addendum), so the
@@ -1485,6 +1635,32 @@ describe("mux", () => {
     expect(code).toBe(EXIT.OK);
   });
 
+  test("herdr-core: hc-socket dials the core and reads its version and terminal count; no herdr rows (M74 spec 04)", async () => {
+    const core = "/run/user/7/herdr-core/default.sock";
+    const h = harness(null, [], {
+      env: { COLLIE_MUX: "herdr-core", XDG_RUNTIME_DIR: "/run/user/7" },
+      files: { ...healthyFiles(), [core]: "" },
+    });
+    h.deps = { ...h.deps, hcDial: () => Promise.resolve({ version: "0.1.14", generation: 1, live: 4 }) };
+    const { byCheck } = await findings(h);
+    expect(byCheck.get("hc-socket")?.status).toBe("ok");
+    expect(byCheck.get("hc-socket")?.detail).toBe(`${core}: herdr-core 0.1.14, 4 live terminals`);
+    expect(byCheck.has("herdr-socket")).toBe(false);
+  });
+
+  test("herdr-core: a socket file with no core behind it is an error with the start remedy", async () => {
+    const core = "/run/user/7/herdr-core/default.sock";
+    const h = harness(null, [], {
+      env: { COLLIE_MUX: "herdr-core", XDG_RUNTIME_DIR: "/run/user/7" },
+      files: { ...healthyFiles(), [core]: "" },
+    });
+    h.deps = { ...h.deps, hcDial: () => Promise.reject(new Error("connect ECONNREFUSED")) };
+    const { byCheck, code } = await findings(h);
+    expect(byCheck.get("hc-socket")?.status).toBe("error");
+    expect(byCheck.get("hc-socket")?.remedy).toContain("hc server start");
+    expect(code).toBe(EXIT.FAIL);
+  });
+
   // Since M14/03 an unset COLLIE_MUX is not silently "herdr" — `collie start` probes and decides, so
   // `doctor` names the multiplexer that decision would land on, and the evidence for it.
   test("with nothing configured it names what `start` would pick, and why", async () => {
@@ -1502,7 +1678,7 @@ describe("mux", () => {
     const finding = byCheck.get("mux")!;
     expect(finding.status).toBe("error");
     expect(finding.detail).toContain("no multiplexers are running");
-    expect(finding.remedy).toContain("COLLIE_MUX=<durable|herdr|tern|tmux|tuios|zellij> collie start");
+    expect(finding.remedy).toContain("COLLIE_MUX=<durable|herdr|herdr-core|tern|tmux|tuios|zellij> collie start");
   });
 
   test("nothing configured and two multiplexers running is an error naming both", async () => {
@@ -1695,6 +1871,8 @@ describe("the finding set is scoped by the chosen multiplexer", () => {
       "cache-claims",
       "cache-rules",
       "cache-env",
+      ...SENDS_CHECKS,
+      "holds",
       "restart-pending",
       "clock",
     ]);
@@ -1770,6 +1948,36 @@ describe("beacon-hooks-claude", () => {
     expect(code).toBe(EXIT.OK);
   });
 
+  test("under herdr-core, which names agents but not sessions, no install is a skip naming the hook, never an error (M74 spec 04)", async () => {
+    const core = "/run/user/7/herdr-core/default.sock";
+    const h = harness(null, [], {
+      env: { COLLIE_MUX: "herdr-core", XDG_RUNTIME_DIR: "/run/user/7" },
+      files: { ...without(healthyFiles(), SETTINGS), [core]: "" },
+    });
+    h.deps = { ...h.deps, hcDial: () => Promise.resolve({ version: "0.1.14", generation: 1, live: 1 }) };
+    const { byCheck } = await findings(h);
+    const hooks = byCheck.get("beacon-hooks-claude")!;
+    expect(hooks.status).toBe("skipped");
+    expect(hooks.detail).toContain("History");
+    expect(hooks.remedy).toContain("collie hooks install claude");
+    const sessions = byCheck.get("agent-sessions")!;
+    expect(sessions.status).toBe("skipped");
+    expect(sessions.remedy).toContain("collie hooks install claude");
+  });
+
+  test("under herdr-core, an install says the hooks give edges and the session, and agent-sessions reads the bridge's panes", async () => {
+    const core = "/run/user/7/herdr-core/default.sock";
+    const h = harness(null, [], {
+      env: { COLLIE_MUX: "herdr-core", XDG_RUNTIME_DIR: "/run/user/7" },
+      files: { ...healthyFiles(), [core]: "" },
+    });
+    h.deps = { ...h.deps, hcDial: () => Promise.resolve({ version: "0.1.14", generation: 1, live: 1 }) };
+    const { byCheck } = await findings(h);
+    expect(byCheck.get("beacon-hooks-claude")?.status).toBe("ok");
+    expect(byCheck.get("beacon-hooks-claude")?.detail).toContain("each Claude pane's session");
+    expect(byCheck.get("agent-sessions")?.detail ?? "").not.toContain("no pane can report");
+  });
+
   test("under a mux that does NOT, no install is an ERROR naming the install verb", async () => {
     const h = harness(null, [], {
       env: ON_TMUX,
@@ -1785,6 +1993,23 @@ describe("beacon-hooks-claude", () => {
     expect(finding.detail).toContain("notification");
     expect(finding.detail).toContain(OWN_BINARY);
     expect(code).toBe(EXIT.FAIL);
+  });
+
+  test("CLAUDE_CONFIG_DIR names the file the check reads: an install there is ok, and one only under ~/.claude is not", async () => {
+    const profile = "/srv/work-profile";
+    const profileSettings = `${profile}/settings.json`;
+    const there = harness(null, [], {
+      env: { ...ON_ZELLIJ, CLAUDE_CONFIG_DIR: profile },
+      files: { ...without(healthyFiles(), SETTINGS), [profileSettings]: settingsWith(hookCommand(OWN_BINARY)), [ZELLIJ_BIN]: "" },
+      answers: zellijAnswers("work\n"),
+    });
+    expect((await findings(there)).byCheck.get("beacon-hooks-claude")?.status).toBe("ok");
+    const elsewhere = harness(null, [], {
+      env: { ...ON_ZELLIJ, CLAUDE_CONFIG_DIR: profile },
+      files: { ...healthyFiles(), [ZELLIJ_BIN]: "" },
+      answers: zellijAnswers("work\n"),
+    });
+    expect((await findings(elsewhere)).byCheck.get("beacon-hooks-claude")?.status).toBe("error");
   });
 
   test("an install under a blind mux is the ordinary ✓", async () => {
@@ -2462,8 +2687,11 @@ describe("secrets-private (M43 spec 04)", () => {
     };
     await cmdDoctor(loose.deps, []);
     const out = loose.io.stdout.join("\n");
-    expect(out).toContain(`secrets-private       the Collie state folder can be read by other accounts`);
-    expect(out).toContain(`\n${" ".repeat(33)}${WIN_STATE} → Fix: restart Collie, or run: icacls`);
+    // The value column sits two past the section's longest check id (doctor-layout.ts), so the
+    // spacing follows the id list; the path line starts exactly under the value.
+    const valueAt = out.indexOf("the Collie state folder") - out.lastIndexOf("\n", out.indexOf("secrets-private")) - 1;
+    expect(out).toMatch(/secrets-private {2,}the Collie state folder can be read by other accounts/);
+    expect(out).toContain(`\n${" ".repeat(valueAt)}${WIN_STATE} → Fix: restart Collie, or run: icacls`);
   });
 });
 
@@ -2529,17 +2757,17 @@ describe("windows-task", () => {
 });
 
 // ── POSIX parity (M43 spec 04) ──────────────────────────────────────────────
-describe("POSIX parity (M43 spec 04)", () => {
+describe("plain output parity (M43 spec 04, wrapped at 80 by M71 spec 03)", () => {
   const GOLDEN = join(import.meta.dir, "testdata", "doctor-posix.golden.txt");
   // The identity line names the machine the suite runs on, so it is the one line normalised.
   const render = async (over: Parameters<typeof harness>[2] = {}): Promise<string> => {
     const h = harness(null, [], over);
-    h.deps = { ...h.deps, host: hostFor("linux") };
+    h.deps = { ...h.deps, host: hostFor("linux"), columns: 80 };
     await cmdDoctor(h.deps, []);
     // Two lines are normalised: the machine's identity, and the age of the oldest cache claim, which
     // grows by one every day and must not fail this test on the day after it was written.
     const text = h.io.stdout.join("\n").replace(/ · [a-z0-9]+-[a-z0-9]+$/m, " · <platform>");
-    return `${text.replace(/the oldest was checked \d+ days? ago/g, "the oldest was checked <N> days ago")}\n`;
+    return `${text.replace(/was checked \d+ days? ago/g, "was checked <N> days ago")}\n`;
   };
   // A config.toml secret that could not be made private: the POSIX `config-file` remedy is pinned too.
   const blocked = (): Parameters<typeof harness>[2] => ({
@@ -2551,16 +2779,21 @@ describe("POSIX parity (M43 spec 04)", () => {
     ),
   });
 
-  // The golden was written by this same block run before spec 04, then gained the integration-omp row from main (the
-  // healthy solo fixture, then a config.toml secret the mode rule could not tighten). The
+  // The golden was written by this same block run before spec 04, then gained the integration-omp row from main and
+  // the eleven `sends-*` rows of M71 spec 01, one per profile with no receipts, and the one `holds` row of
+  // spec 02 (no screen row: a harness with no receipt has none) (the healthy solo fixture, then a config.toml
+  // secret the mode rule could not tighten). M71 spec 03 moved it once more: rows wrap at 80 columns, so a
+  // long detail continues under the value column. The
   // `secrets-private` line is Windows-only: on a POSIX host it does not exist at all.
-  test("the plain doctor output on a POSIX host is byte-identical to the one before spec 04", async () => {
+  test("the plain doctor output on a POSIX host matches the golden, wrapped at 80 columns", async () => {
     const out = `${await render()}---\n${await render(blocked())}`;
     const golden = readFileSync(GOLDEN, "utf8");
     // Paths in the output are joined with the machine's own separator, so the byte comparison runs
     // where the golden was made (POSIX). Windows compares the check ids and statuses line by line.
     if (process.platform !== "win32") expect(out).toBe(golden);
-    const ids = (text: string) => text.split("\n").map((l) => /^\s+(\S+)\s+(\S+)/.exec(l)?.slice(1, 3).join(" ")).filter(Boolean);
+    // Only the rows, not the lines a long detail wraps onto: a Windows path is longer (`\opt\collie\bin\collie.exe`),
+    // so it wraps at other words than the golden does.
+    const ids = (text: string) => text.split("\n").map((l) => /^ {2}([^\s`]\S*)\s+(\S+)/.exec(l)?.slice(1, 3).join(" ")).filter(Boolean);
     expect(ids(out)).toEqual(ids(golden));
     expect(out).not.toContain("secrets-private");
   });
@@ -2882,9 +3115,10 @@ describe("doctor: the surface table (M56 spec 09)", () => {
     expect(summary.detail).toContain(join(STATE, "surface", "inbox.jsonl"));
     expect(summary.detail).toContain("3 day files");
     const line = byCheck.get("surface-agent-2.1.301")!;
-    // 8 refusals against 18 sends is above the refusal rate, so the line warns (2026-10-17).
-    expect(line.status).toBe("warn");
-    expect(line.remedy).toContain("8 sends refused by the reader against 18 that went out on agent 2.1.301, most of them not_free (8)");
+    // 8 refusals against 18 sends: the counters no longer warn on refusals, the `sends-*` rows read
+    // the receipts for that (M71 spec 01).
+    expect(line.status).toBe("ok");
+    expect(line.remedy).toBeNull();
     expect(line.detail).toBe(
       "2.1.301 provisional · free 150 · unknown 16 (no-match 12, weak-cue 4) · modal 6 (permission 6) · refused 8 (not_free 8) · probed 10 · manual 3 · sent 18 · effective 0 · unknown-outcome 2 · typed-not-submitted 0 · discarded 2",
     );
@@ -2907,43 +3141,6 @@ describe("doctor: the surface table (M56 spec 09)", () => {
     expect(line.status).toBe("warn");
     expect(line.remedy).toContain(join(STATE, "surface", "inbox.jsonl"));
     expect(code).toBe(0);
-  });
-
-  test("surface: refusals above 0.3 per send that went out, over at least 10 sends, warn and name the top reason", async () => {
-    // 2026-10-17: the field case, seven not_free refusals against a handful of sends.
-    const { byCheck, code } = await run([day(0, [row({ manual: 0, sent: 8, effective: 2, refused: { not_free: 3, probe_failed: 1, draft_present: 5 } })])]);
-    const line = byCheck.get("surface-agent-2.1.301")!;
-    expect(line.status).toBe("warn");
-    expect(line.remedy).toContain("4 sends refused by the reader against 10 that went out on agent 2.1.301, most of them not_free (3)");
-    expect(line.remedy).toContain(join(STATE, "surface", "examples"));
-    expect(code).toBe(0);
-  });
-
-  test("surface: the refusal warning needs both the rate and the ten sends", async () => {
-    const atRate = await run([day(0, [row({ manual: 0, sent: 10, effective: 0, refused: { not_free: 3 } })])]);
-    expect(atRate.byCheck.get("surface-agent-2.1.301")!.status).toBe("ok");
-    const fewSends = await run([day(0, [row({ manual: 0, sent: 5, effective: 4, refused: { not_free: 9 } })])]);
-    expect(fewSends.byCheck.get("surface-agent-2.1.301")!.status).toBe("ok");
-    // Seven days add up: two days of 5 sends and 2 refusals each pass both limits together.
-    const twoDays = await run([day(0, [row({ manual: 0, sent: 5, refused: { bound: 2 } })]), day(2, [row({ manual: 0, sent: 5, refused: { bound: 2 } })])]);
-    expect(twoDays.byCheck.get("surface-agent-2.1.301")!.remedy).toContain("most of them bound (4)");
-  });
-
-  test("surface: only the reader's refusals count toward the warning, never the person's or the pane's", async () => {
-    const theirs = { draft_present: 4, unconfirmed: 3, stale_surface: 2, busy: 2, id_reused: 1, pane_gone: 1, turn_running: 5 };
-    const quiet = await run([day(0, [row({ manual: 0, sent: 10, refused: { ...theirs, not_free: 3 } })])]);
-    expect(quiet.byCheck.get("surface-agent-2.1.301")!.status).toBe("ok");
-    const loud = await run([day(0, [row({ manual: 0, sent: 10, refused: { ...theirs, bound: 2, probe_failed: 2 } })])]);
-    expect(loud.byCheck.get("surface-agent-2.1.301")!.remedy).toContain("4 sends refused by the reader against 10");
-    expect(loud.byCheck.get("surface-agent-2.1.301")!.remedy).not.toContain("turn_running");
-  });
-
-  test("surface: a row with both warnings carries both remedies", async () => {
-    const { byCheck } = await run([day(0, [row({ manual: 5, sent: 10, refused: { not_free: 6 } })])]);
-    const line = byCheck.get("surface-agent-2.1.301")!;
-    expect(line.status).toBe("warn");
-    expect(line.remedy).toContain(join(STATE, "surface", "inbox.jsonl"));
-    expect(line.remedy).toContain("most of them not_free (6)");
   });
 
   test("surface: the plain output carries the table and a torn file is skipped", async () => {

@@ -20,6 +20,9 @@ import { leadStore, member, peerStore } from "../bridge/crew/fixtures.ts";
 import { hostFor, type Host } from "../bridge/host.ts";
 import { serializeTrustStore } from "../bridge/crew/trust-store.ts";
 import { EXIT, type Io } from "./io.ts";
+import type { Census, CensusInput, CensusReader } from "./census.ts";
+import { SETUP_CLOSING } from "./setup-findings.ts";
+import { TAILSCALE_PROBE_MS } from "./tailnet.ts";
 import { POWERSHELL_UTF8, PROCESS_QUERY_SLOW_START_MS } from "./sys.ts";
 import { collieBinary, taskFilePath } from "./unit.ts";
 
@@ -40,6 +43,7 @@ import {
   cmdRestart,
   cmdStart,
   cmdStatus,
+  type StatusJson,
   cmdStop,
   cmdUninstall,
   cmdUrl,
@@ -55,6 +59,7 @@ import {
   systemdUserReachable,
   writeUnit,
 } from "./lifecycle.ts";
+import { ensureMuxChosen } from "./mux.ts";
 import { cmdServe } from "./serve.ts";
 import { formatTaskRecord, taskRecordPath, taskRestartPath } from "./task-scheduler.ts";
 
@@ -176,6 +181,47 @@ describe("the Host allowlist discovery", () => {
     expect(h.files.read(`${HOME}/.config/systemd/user/collie.service`)).not.toContain(
       "COLLIE_TAILSCALE_HOSTS",
     );
+  });
+});
+
+// A herdr-core host (M74 spec 04): the unit names the core, and the operator's session travels.
+describe("the unit of a herdr-core install", () => {
+  const UNIT = `${HOME}/.config/systemd/user/collie.service`;
+
+  test("COLLIE_MUX and the operator's HC_SESSION and HC_SOCKET are written into the unit", () => {
+    const h = harness({
+      env: { COLLIE_MUX: "herdr-core", HC_SESSION: "work", HC_SOCKET: "/run/user/501/herdr-core/work.sock" },
+      answers: [["tailscale status --json", { code: 1 }]],
+    });
+    expect(writeUnit(h.deps)).toBe(true);
+    const unit = h.files.read(UNIT) ?? "";
+    expect(unit).toContain("Environment=COLLIE_MUX=herdr-core\n");
+    expect(unit).toContain("Environment=HC_SESSION=work\n");
+    expect(unit).toContain("Environment=HC_SOCKET=/run/user/501/herdr-core/work.sock\n");
+  });
+
+  test("no session set: only COLLIE_MUX, and the Herdr TUI install keeps its unit unchanged", () => {
+    const core = harness({ env: { COLLIE_MUX: "herdr-core" }, answers: [["tailscale status --json", { code: 1 }]] });
+    writeUnit(core.deps);
+    const coreUnit = core.files.read(UNIT) ?? "";
+    expect(coreUnit).toContain("Environment=COLLIE_MUX=herdr-core\n");
+    expect(coreUnit).not.toContain("HC_SESSION");
+
+    const tui = harness({ env: { HC_SESSION: "work" }, answers: [["tailscale status --json", { code: 1 }]] });
+    writeUnit(tui.deps);
+    const tuiUnit = tui.files.read(UNIT) ?? "";
+    expect(tuiUnit).not.toContain("COLLIE_MUX");
+    expect(tuiUnit).not.toContain("HC_SESSION");
+  });
+
+  test("an auto-pick lands in the unit: start writes COLLIE_MUX into the env it hands the unit", async () => {
+    const core = "/run/user/501/herdr-core/default.sock";
+    const h = harness({ env: { COLLIE_MUX: undefined, XDG_RUNTIME_DIR: "/run/user/501" }, answers: [["tailscale status --json", { code: 1 }]] });
+    h.files.write(core, "");
+    expect(await ensureMuxChosen(h.deps)).toBe(EXIT.OK);
+    expect(h.io.stdout.join("\n")).toContain("auto-selected herdr-core");
+    writeUnit(h.deps);
+    expect(h.files.read(UNIT) ?? "").toContain("Environment=COLLIE_MUX=herdr-core\n");
   });
 });
 
@@ -579,7 +625,7 @@ describe("the first-run multiplexer gate", () => {
     expect(h.exec.spawned).toHaveLength(0);
     const said = h.io.stderr.join("\n");
     expect(said).toContain("no COLLIE_MUX is set, and 2 multiplexers are running");
-    expect(said).toContain("  COLLIE_MUX=<durable|herdr|tern|tmux|tuios|zellij> collie start");
+    expect(said).toContain("  COLLIE_MUX=<durable|herdr|herdr-core|tern|tmux|tuios|zellij> collie start");
   });
 });
 
@@ -681,6 +727,46 @@ describe("the setup check in start", () => {
     h.deps.link = fakeLinkFs();
     expect(await cmdStart(h.deps)).toBe(EXIT.OK);
     expect(h.io.stderr.filter((l) => l.startsWith("setup:") || l.startsWith("Running, but"))).toEqual([]);
+  });
+
+  test("a missing PATH link alone prints its lines but not the closing sentence", async () => {
+    const h = harness({
+      answers: [
+        ...NO_SYSTEMD,
+        ["tailscale status --json", { stdout: JSON.stringify({ BackendState: "Running", Self: { DNSName: "desk.tail.ts.net." }, CertDomains: ["desk.tail.ts.net"] }) }],
+        ["tailscale debug prefs", { stdout: JSON.stringify({ OperatorUser: "pat" }) }],
+      ],
+      env: { USER: "pat", PATH: "/usr/bin" },
+    });
+    h.deps.link = fakeLinkFs();
+    expect(await cmdStart(h.deps)).toBe(EXIT.OK);
+    expect(h.io.stderr.some((l) => l.startsWith("setup: no `collie` is on PATH"))).toBe(true);
+    expect(h.io.stderr.some((l) => l.startsWith("Running, but"))).toBe(false);
+  });
+
+  test("an open tailnet-https row earns the closing sentence", async () => {
+    const h = harness({
+      answers: [...NO_SYSTEMD, ["tailscale status --json", { stdout: NO_HTTPS }], ["tailscale debug prefs", { stdout: JSON.stringify({ OperatorUser: "pat" }) }]],
+      env: { USER: "pat", PATH: "/usr/bin" },
+      files: { "/usr/bin/collie": "" },
+    });
+    h.deps.link = fakeLinkFs();
+    expect(await cmdStart(h.deps)).toBe(EXIT.OK);
+    expect(h.io.stderr.some((l) => l.startsWith("setup: HTTPS certificates are off"))).toBe(true);
+    expect(h.io.stderr.at(-1)).toBe(SETUP_CLOSING);
+  });
+
+  test("the banner's tailnet row says so when the front door did not come up", async () => {
+    const failed = harness({ serve: () => Promise.resolve(EXIT.FAIL) });
+    expect(await cmdStart(failed.deps)).toBe(EXIT.OK);
+    const failedRow = failed.io.stdout.find((l) => l.trimStart().startsWith("tailnet"));
+    expect(failedRow).toContain("not published yet, see the lines above");
+
+    const up = harness();
+    expect(await cmdStart(up.deps)).toBe(EXIT.OK);
+    const upRow = up.io.stdout.find((l) => l.trimStart().startsWith("tailnet"));
+    expect(upRow).toBeDefined();
+    expect(upRow).not.toContain("not published yet");
   });
 
   test("a Windows start with Tailscale missing says so in Windows words, then starts the task anyway", async () => {
@@ -1912,15 +1998,202 @@ describe("the status banner", () => {
     expect((await statusBanner(unset.deps)).join("\n")).toContain("set COLLIE_PUBLIC_URL");
   });
 
-  test("status appends the serve config, or says it was skipped", async () => {
+  test("status prints no serve dump by default, and --verbose adds it or says it was skipped", async () => {
     const h = harness({ answers: [["tailscale serve status", { stdout: "https://host (tailnet only)\n" }]] });
     await cmdStatus(h.deps);
-    expect(h.io.stdout).toContain("  serve config:");
-    expect(h.io.stdout).toContain("    https://host (tailnet only)");
+    expect(h.io.stdout).not.toContain("  serve config:");
+    expect(h.exec.calls).not.toContain("tailscale serve status");
+
+    const verbose = harness({ answers: [["tailscale serve status", { stdout: "https://host (tailnet only)\n" }]] });
+    await cmdStatus(verbose.deps, ["--verbose"]);
+    expect(verbose.io.stdout).toContain("  serve config:");
+    expect(verbose.io.stdout).toContain("    https://host (tailnet only)");
+    expect(verbose.exec.timeouts).toContainEqual({ call: "tailscale serve status", ms: TAILSCALE_PROBE_MS });
 
     const skipped = harness({ env: { COLLIE_SKIP_SERVE: "1" } });
-    await cmdStatus(skipped.deps);
+    await cmdStatus(skipped.deps, ["--verbose"]);
     expect(skipped.io.stdout).toContain("  serve config: skipped (COLLIE_SKIP_SERVE=1)");
+  });
+
+  test("status prints the census under the head: members, devices, sessions", async () => {
+    const reads: CensusInput[] = [];
+    const census: CensusReader = async (input) => {
+      reads.push(input);
+      return FAKE_CENSUS;
+    };
+    const h = harness({
+      ready: true,
+      answers: [["tailscale serve status", { stdout: "https://host (tailnet only)\n" }]],
+      files: { [`${STATE}/crew-trust.json`]: serializeTrustStore(leadStore({ peers: [member({ memberId: "nas" })] })) },
+    });
+    expect(await cmdStatus(h.deps, [], census)).toBe(EXIT.OK);
+    // The reader is told what the head already knows, so it does not dial a bridge that is down.
+    expect(reads).toEqual([{ running: true, crew: "lead" }]);
+    const out = h.io.stdout.join("\n");
+    expect(out.indexOf("Collie is running")).toBeLessThan(out.indexOf("  members"));
+    expect(out).toContain("  members");
+    // Columns are padded to the widest name, link and version, so the rows line up.
+    expect(out).toContain("\n    minibuch     reachable    1.25.0  mux -  panes -\n");
+    expect(out).toContain("\n    minibuch-hc  unreachable  -       mux -  panes -\n");
+    expect(out).toContain("  devices   2 paired (Pixel, iPad)");
+    expect(out).toContain("  sessions  5 agents  working 2  blocked 1  idle 1  done 1  unknown 0  (3 report a session id)");
+    expect(out).not.toContain("serve config");
+  });
+
+  test("a solo install prints no members block, and a bridge that is down says so", async () => {
+    const solo: CensusReader = async () => ({
+      members: [],
+      devices: { count: 0, names: [] },
+      sessions: { read: "bridge-not-running", refusedWith: null, total: null, byState: null, withSessionId: null },
+    });
+    const h = harness({ ready: false });
+    expect(await cmdStatus(h.deps, [], solo)).toBe(EXIT.OK);
+    const out = h.io.stdout.join("\n");
+    expect(out).toContain("  crew      no crew, this install is solo");
+    expect(out).not.toContain("  members");
+    expect(out).toContain("  devices   none paired");
+    expect(out).toContain("  sessions  bridge not running");
+  });
+
+  test("six devices print the count and no names", async () => {
+    const many: CensusReader = async () => ({
+      ...FAKE_CENSUS,
+      devices: { count: 6, names: ["a", "b", "c", "d", "e", "f"] },
+    });
+    const h = harness({ ready: true });
+    await cmdStatus(h.deps, [], many);
+    expect(h.io.stdout.join("\n")).toContain("  devices   6 paired\n");
+  });
+});
+
+/** A crew of two (one answering, one not), two devices and five agent sessions. */
+const FAKE_CENSUS: Census = {
+  members: [
+    { name: "minibuch", role: "peer", link: "reachable", version: "1.25.0", mux: null, panes: null, host: null },
+    { name: "minibuch-hc", role: "peer", link: "unreachable", version: null, mux: null, panes: null, host: null },
+  ],
+  devices: { count: 2, names: ["Pixel", "iPad"] },
+  sessions: {
+    read: "ok",
+    refusedWith: null,
+    total: 5,
+    byState: { working: 2, blocked: 1, idle: 1, done: 1, unknown: 0 },
+    withSessionId: 3,
+  },
+};
+
+// `status --json` is read by a program (the herdr-app mod, herdr-app-mod/collie/), so its shape is a
+// contract: one line of JSON on stdout, nothing on stderr, no serve config, and the same facts the
+// banner prints.
+describe("status --json", () => {
+  const NAMED: Scripted["answers"] = [["tailscale status --json", { stdout: '{"Self":{"DNSName":"host.example."},"CertDomains":["host.example"]}' }]];
+
+  const json = async (h: Harness): Promise<StatusJson> => {
+    expect(await cmdStatus(h.deps, ["--json"])).toBe(EXIT.OK);
+    expect(h.io.stdout).toHaveLength(1);
+    expect(h.io.stderr).toEqual([]);
+    // SAFETY: `status --json` prints `JSON.stringify` of a `StatusJson` as its one stdout line, just
+    // asserted; every field the tests read is then compared against a literal.
+    return JSON.parse(h.io.stdout[0]!) as StatusJson;
+  };
+
+  test("a running solo collie: version, port, both URLs, the service and no device paired", async () => {
+    const h = harness({ ready: true, answers: NAMED });
+    const out = await json(h);
+    expect(out).toMatchObject({
+      running: true,
+      instance: null,
+      port: 8787,
+      localUrl: "http://127.0.0.1:8787",
+      phoneUrl: "https://host.example",
+      crew: "solo",
+      pairedDevices: 0,
+    });
+    expect(out.version).not.toBe("");
+    expect(out.service).toContain("systemd");
+    expect(h.exec.calls).not.toContain("tailscale serve status");
+  });
+
+  test("census rides beside every old key, which all stay", async () => {
+    const h = harness({ ready: true, answers: NAMED });
+    expect(await cmdStatus(h.deps, ["--json"], async () => FAKE_CENSUS)).toBe(EXIT.OK);
+    expect(h.io.stdout).toHaveLength(1);
+    expect(h.io.stderr).toEqual([]);
+    // SAFETY: `status --json` prints `JSON.stringify` of a `StatusJson` plus `census` as its one stdout
+    // line, just asserted; every field is compared against a literal below.
+    const body = JSON.parse(h.io.stdout[0]!) as StatusJson & { census: Census };
+    expect(Object.keys(body).toSorted()).toEqual([
+      "census",
+      "crew",
+      "instance",
+      "localUrl",
+      "mux",
+      "muxPickedBecause",
+      "pairedDevices",
+      "phoneUrl",
+      "port",
+      "running",
+      "service",
+      "version",
+    ]);
+    expect(body.census).toEqual(FAKE_CENSUS);
+    expect(Object.keys(body.census)).toEqual(["members", "devices", "sessions"]);
+    expect(h.exec.calls).not.toContain("tailscale serve status");
+  });
+
+  test("the multiplexer: named, or picked with the reason, in the JSON and the banner", async () => {
+    const named = await json(harness({ ready: true, answers: NAMED }));
+    expect(named.mux).toBe("herdr");
+    expect(named.muxPickedBecause).toBeNull();
+
+    const core = "/run/user/7/herdr-core/default.sock";
+    const env = { COLLIE_MUX: "", XDG_RUNTIME_DIR: "/run/user/7" };
+    const picked = await json(harness({ ready: true, answers: NAMED, env, files: { [core]: "" }, host: hostFor("linux") }));
+    expect(picked.mux).toBe("herdr-core");
+    expect(picked.muxPickedBecause).toContain(core);
+
+    const banner = (await statusBanner(harness({ ready: true, answers: NAMED, env, files: { [core]: "" }, host: hostFor("linux") }).deps)).join("\n");
+    expect(banner).toContain(`mux       herdr-core · no COLLIE_MUX, picked: a herdr-core socket at ${core}`);
+
+    // A Herdr TUI install on the host: the default, and the banner says why the core was passed over.
+    const tuiConfig = "/home/pat/.config/herdr/config.toml";
+    const files = { [core]: "", [tuiConfig]: "" };
+    const declined = await json(harness({ ready: true, answers: NAMED, env, files, host: hostFor("linux") }));
+    expect(declined.mux).toBe("herdr");
+    expect(declined.muxPickedBecause).toBeNull();
+    const said = (await statusBanner(harness({ ready: true, answers: NAMED, env, files, host: hostFor("linux") }).deps)).join("\n");
+    expect(said).toContain("mux       herdr · no COLLIE_MUX, the default; a herdr-core socket at");
+    expect(said).toContain(`this host has a Herdr TUI install (${tuiConfig})`);
+  });
+
+  test("a stopped bridge says running false and still names where it would answer", async () => {
+    const out = await json(harness({ ready: false, answers: NAMED }));
+    expect(out.running).toBe(false);
+    expect(out.localUrl).toBe("http://127.0.0.1:8787");
+  });
+
+  test("no tailnet name, or a peer, or a proxy without a URL: no phone URL, never a loopback one", async () => {
+    expect((await json(harness({ ready: true }))).phoneUrl).toBeNull();
+    const peer = await json(
+      harness({
+        ready: true,
+        env: { COLLIE_HOST: "192.168.77.2" },
+        files: { [`${STATE}/crew-trust.json`]: serializeTrustStore(peerStore()) },
+      }),
+    );
+    expect(peer.crew).toBe("peer");
+    expect(peer.phoneUrl).toBeNull();
+    expect((await json(harness({ ready: true, env: { COLLIE_SKIP_SERVE: "1" } }))).phoneUrl).toBeNull();
+  });
+
+  test("a proxy's COLLIE_PUBLIC_URL is the phone URL, and the tailnet is not asked", async () => {
+    const h = harness({ ready: true, env: { COLLIE_SKIP_SERVE: "1", COLLIE_PUBLIC_URL: "https://c.example" } });
+    expect((await json(h)).phoneUrl).toBe("https://c.example");
+    expect(h.exec.calls.join("\n")).not.toContain("tailscale status");
+  });
+
+  test("a named instance names itself", async () => {
+    expect((await json(harness({ ready: true, instance: "next" }))).instance).toBe("next");
   });
 });
 
@@ -2185,6 +2458,7 @@ describe("restart off Windows, golden", () => {
     "",
     "  ✓ Collie is running  ·  vunknown",
     `    service   ${service}`,
+    "    mux       herdr",
     "    local     http://127.0.0.1:8787",
     "    tailnet   http://127.0.0.1:8787 (Tailscale name unavailable)",
     // These fakes hold no paired device, so the banner names `collie pair` (ADR 0086).

@@ -332,6 +332,7 @@ describe("readSinceFile", () => {
 // accept, and their answer to it is the same sentence: nothing new, hold what you have.
 describe("every harness answers a live read", () => {
   const registry = buildJournalRegistry({
+    agy: ["/nope/agy"],
     claude: ["/nope/claude"],
     codex: ["/nope/codex"],
     pi: ["/nope/pi"],
@@ -341,11 +342,12 @@ describe("every harness answers a live read", () => {
     muse: ["/nope/muse"],
     openclaw: ["/nope/openclaw"],
     kiro: ["/nope/kiro"],
+    "dsh-tui": ["/nope/dsh"],
   });
 
   test("every journal this build ships is under test", () => {
     expect(Object.keys(registry).toSorted()).toEqual([...KNOWN_HARNESS_NAMES].toSorted());
-    expect(KNOWN_HARNESS_NAMES).toHaveLength(9);
+    expect(KNOWN_HARNESS_NAMES).toHaveLength(11);
   });
 
   test.each(Object.keys(registry))("%s reports nothing new for a key it cannot serve", async (agent) => {

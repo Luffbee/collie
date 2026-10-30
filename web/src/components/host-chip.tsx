@@ -1,11 +1,14 @@
 import { Server, ServerOff } from "lucide-react";
+import { useMemo } from "react";
 
 import { cn } from "@/lib/utils";
 import { AddressTag } from "@/components/ui/address-tag";
-import { HOST_TEXT_CLASSES, hostName, hostSlot } from "@/lib/hosts";
+import { HOST_TEXT_CLASSES, hostName, hostSlot, serverFor } from "@/lib/hosts";
+import { groupByHost, hasSharedHost, instanceLabel, machineOf } from "@/lib/machines";
 import { linkPresentation, type HostState } from "@/lib/host-health";
 import { useHostHealth, useCrew } from "@/components/crew-provider";
 import { t } from "@/lib/i18n";
+import type { ServerSummary } from "@/lib/types";
 import { useLocale } from "@/hooks/use-locale";
 
 interface HostChipProps {
@@ -49,6 +52,12 @@ interface HostChipProps {
    * this cannot simply be the variant's default.
    */
   sends?: boolean;
+  /**
+   * Name the member plainly, even on a crew where a host runs two instances. The pane HEADER has the
+   * room for `<host> · <mux>`; a dashboard row does not (it clipped at 390px), and the row's neighbours
+   * already say the rest. Default: the two-part name where the crew shares a host.
+   */
+  plain?: boolean;
   className?: string;
 }
 
@@ -75,16 +84,18 @@ function useHostChipShown(host: string | undefined): boolean {
   return multi && host !== undefined;
 }
 
-export function HostChip({ host, state, variant = "tag", sends, className }: HostChipProps) {
+export function HostChip({ host, state, variant = "tag", sends, plain = false, className }: HostChipProps) {
   useLocale();
   const { servers } = useCrew();
   const health = useHostHealth(host);
   const shown = useHostChipShown(host);
+  // M77: the machines of the crew, for the two-part name. A view over the same rows; nothing is keyed on it.
+  const machines = useMemo(() => groupByHost(servers ?? []), [servers]);
   // No crew, or nothing to name: the whole dimension is invisible. (Hooks run first — the hide rule
   // is a render decision, not a reason to call a hook conditionally.)
   if (!shown || host === undefined) return null;
 
-  const name = hostName(servers, host) ?? host;
+  const name = plain ? (hostName(servers, host) ?? host) : chipName(servers, machines, host);
   // The machine's IDENTITY tint, or null when there is nothing to tell apart (lib/hosts.ts). It is
   // read here and not in AddressTag for the same reason the hide rule is here: which machine a row
   // is about is a fact about the snapshot, and this is the one component that already holds it.
@@ -227,6 +238,27 @@ export function HostChip({ host, state, variant = "tag", sends, className }: Hos
       className={className}
     />
   );
+}
+
+/**
+ * What the chip calls a member. The plain member name, as ever, unless some machine of the crew runs
+ * two instances (the Herdr TUI and the Herdr core, say): then every chip reads `<host> · <mux>`, so a
+ * pane says which instance of the machine it lives on. The rule is {@link hasSharedHost} and the
+ * second part is {@link instanceLabel}; there is no third. A member the roster no longer lists keeps
+ * its id. View only: `?h=`, scopes and API paths keep the member id.
+ */
+function chipName(
+  servers: readonly ServerSummary[] | undefined,
+  machines: ReturnType<typeof groupByHost>,
+  host: string,
+): string {
+  const plain = hostName(servers, host) ?? host;
+  if (!hasSharedHost(machines)) return plain;
+  const member = serverFor(servers, host);
+  const machine = machineOf(machines, member?.id ?? host);
+  if (member === undefined || machine === undefined) return plain;
+  const instance = instanceLabel(member, machine.instances);
+  return instance === machine.name ? machine.name : `${machine.name} · ${instance}`;
 }
 
 /**

@@ -141,6 +141,8 @@ interface Compiled {
   readonly hint: ReadonlySet<string> | null;
   /** The placeholder's colours (`idle.placeholders.fg`); null for a profile that names none. */
   readonly placeholderFg: ReadonlySet<string> | null;
+  /** The placeholder's shapes (`idle.placeholders.patterns`); empty for a profile that names none. */
+  readonly placeholderPatterns: readonly RegExp[];
 }
 
 const compiledByIdle = new WeakMap<IdleProfile, Compiled>();
@@ -178,6 +180,7 @@ function compile(idle: IdleProfile): Compiled {
     },
     hint: idle.inlineHint === undefined ? null : new Set(idle.inlineHint.fg),
     placeholderFg: idle.placeholders.fg === undefined ? null : new Set(idle.placeholders.fg),
+    placeholderPatterns: (idle.placeholders.patterns ?? []).map((source) => new RegExp(source, "u")),
   };
   compiledByIdle.set(idle, compiled);
   return compiled;
@@ -327,17 +330,35 @@ function holeIsGhostColoured(rows: readonly FrameRow[], prompt: number, holeStar
   return colours !== null && holeEvery(rows, prompt, holeStart, last, (run) => run.fg !== undefined && colours.has(run.fg));
 }
 
-/** Whether a draft text is one of the profile's placeholder texts, or starts with one of its prefixes. */
-function isPlaceholderText(text: string, idle: IdleProfile): boolean {
+/**
+ * Whether a draft text is one of the profile's placeholder texts, starts with one of its prefixes, or
+ * matches one of its patterns whole (blanks at the ends cut). The patterns are what marks a rotating
+ * hint on a plain-text read, where no faint attribute or colour survives.
+ */
+function isPlaceholderText(text: string, idle: IdleProfile, patterns: readonly RegExp[]): boolean {
   if (text.length === 0) return false;
   if (idle.placeholders.texts.includes(text)) return true;
-  return (idle.placeholders.prefixes ?? []).some((prefix) => text.startsWith(prefix));
+  if ((idle.placeholders.prefixes ?? []).some((prefix) => text.startsWith(prefix))) return true;
+  const trimmed = text.trim();
+  return patterns.some((hint) => hint.test(trimmed));
+}
+
+/**
+ * Whether the read carries no styling at all: no run has a foreground colour or an attribute flag.
+ * That is what a plain-text multiplexer hands out (herdr-core). A typed draft is unstyled on a
+ * coloured read too (default ink), so the hole alone cannot tell the two apart; the prompt marker,
+ * the rules and the footer of a coloured read carry colour, and a plain read carries none anywhere.
+ */
+export function readIsUnstyled(rows: readonly FrameRow[]): boolean {
+  return rows.every((row) => row.segments.every((run) => run.fg === undefined && RUN_FLAGS.every((flag) => run[flag] !== true)));
 }
 
 /**
  * Whether the hole shows the profile's placeholder, by its text, its attribute or its colours; each
  * way that holds adds its anchor to `anchorsHit`. The three tests are whole-hole: one visible run
- * that is neither faint nor ghost-coloured leaves the text a draft.
+ * that is neither faint nor ghost-coloured leaves the text a draft. The profile's text patterns are
+ * a fallback for a read with no styling: on a styled read the attribute and colour tests decide, so
+ * a person's typed text of the hint's shape stays a draft.
  */
 function readPlaceholder(
   rows: readonly FrameRow[],
@@ -347,9 +368,10 @@ function readPlaceholder(
   text: string,
   idle: IdleProfile,
   colours: ReadonlySet<string> | null,
+  patterns: readonly RegExp[],
   anchorsHit: FrameAnchorHit[],
 ): boolean {
-  const byText = isPlaceholderText(text, idle);
+  const byText = isPlaceholderText(text, idle, patterns.length > 0 && readIsUnstyled(rows) ? patterns : []);
   const bySgr = holeIsFaint(rows, prompt, holeStart, last, idle.placeholders.sgr);
   const byFg = holeIsGhostColoured(rows, prompt, holeStart, last, colours);
   if (byText) anchorsHit.push("placeholder-text");
@@ -703,7 +725,7 @@ export function frameAt(rows: readonly FrameRow[], bottom: number, idle: IdlePro
   const text = draftText(rows, texts, pieces, c.hint);
   anchorsHit.push("bottom");
 
-  const placeholder = readPlaceholder(rows, prompt, holeStart, bottom - 1, text, idle, c.placeholderFg, anchorsHit);
+  const placeholder = readPlaceholder(rows, prompt, holeStart, bottom - 1, text, idle, c.placeholderFg, c.placeholderPatterns, anchorsHit);
 
   let end = texts.length;
   while (end > bottom + 1 && isBlank(texts[end - 1]!)) end--;
@@ -832,7 +854,7 @@ function interiorFrameAt(rows: readonly FrameRow[], bottom: number, idle: IdlePr
   anchorsHit.push("prompt");
   if (hole !== undefined) anchorsHit.push("draft");
   anchorsHit.push("bottom");
-  const placeholder = readPlaceholder(rows, prompt, holeStart, last, text, idle, c.placeholderFg, anchorsHit);
+  const placeholder = readPlaceholder(rows, prompt, holeStart, last, text, idle, c.placeholderFg, c.placeholderPatterns, anchorsHit);
 
   let end = texts.length;
   while (end > bottom + 1 && isBlank(texts[end - 1]!)) end--;

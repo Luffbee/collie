@@ -296,6 +296,11 @@ export interface MuxPane extends MuxIdentity {
    * reason: a wrong agent name picks a wrong harness grammar AND a wrong journal adapter, so the
    * port's answer to "which agent runs here" is `agentDetection` or `"shell"` — never a process
    * name, however much this one looks like an identity.
+   *
+   * One exception: a foreground process name is never identity on its own, but an adapter whose agent
+   * report is absent for a pane (herdr-core, when the program sends no OSC 7501) may take an exact,
+   * known program name from its table as a provisional identity, with status `unknown` and never a
+   * status word. No prefix, no path component.
    */
   readonly foregroundCommand?: string;
   /**
@@ -404,6 +409,12 @@ export interface MuxGrid {
   readonly text: string;
   /** The multiplexer truncated the read to fit its own limits. */
   readonly truncated: boolean;
+  /**
+   * The multiplexer says rows may be missing from this read: show it, decide nothing on it. Distinct
+   * from {@link truncated}, which means the scrollback was cut. The Send Protocol takes a partial read
+   * as no read and waits for a whole one. Absent on a whole read, and on every adapter that cannot tell.
+   */
+  readonly partial?: true;
   /**
    * A number that CHANGES when this pane's content changes and never decreases while the pane lives.
    *

@@ -5,6 +5,8 @@ import { clientsClaim } from "workbox-core";
 
 import { decidePush, notificationPath, type NotifData, type PushPayload } from "./lib/push-decision";
 import { askInApp, openNotificationTarget, type OpenOutcome, type OpenTargetClient } from "./lib/notification-open";
+import { recordSlot, showBadge, slotCount } from "./lib/app-badge";
+import { asJsonString } from "./lib/json";
 import { readPushTitles } from "./lib/push-title-store";
 import { FONT_URLS, navigationNetworkOnlyUnder } from "./lib/sw-routes";
 import { stripMount, sttCacheName, sttCopyToStore, sttStorable, sttSweepKeeps } from "./lib/stt-cache";
@@ -228,6 +230,17 @@ async function handlePush(event: PushEvent): Promise<void> {
   } catch {
     // Non-JSON / empty push — fall back to a plain-text body so we never silently drop it.
     payload = { body: event.data?.text() };
+  }
+
+  // Before the decision, because a push a visible tab suppresses still moves the icon's count.
+  const count = slotCount(payload);
+  const slotTag = asJsonString(payload.tag);
+  if (count !== undefined && slotTag !== undefined) {
+    try {
+      await showBadge(self.navigator, await recordSlot(self.caches, self.location.origin, MOUNT, slotTag, count));
+    } catch {
+      // Cache Storage refused: the notification below matters more than the count.
+    }
   }
 
   // The title in this device's language, from the table the page left (lib/push-titles.ts, ADR 0074).

@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { resolveJournalRoots } from "../bridge/config.ts";
 import { hostFor } from "../bridge/host.ts";
-import { adapterFor, buildJournalRegistry, DISCOVERS_OWN_SESSIONS } from "../bridge/journal/registry.ts";
+import { adapterFor, AGENT_ALIASES, buildJournalRegistry, DISCOVERS_OWN_SESSIONS } from "../bridge/journal/registry.ts";
 import { toPaneWire, type AgentView } from "../bridge/types.ts";
 import { context, fakeExec, fakeFiles, HOME, type Scripted, type SeededFiles } from "./fakes.ts";
 import type { Finding } from "./finding.ts";
@@ -198,6 +198,9 @@ async function run(
     /** What `herdr --version` prints. */
     herdr?: string;
     platform?: string;
+    noSessionRefs?: string;
+    noSessionRefsRemedy?: string;
+    sessionsFromHooks?: boolean;
   } = {},
 ): Promise<Map<string, Finding>> {
   const answers: Scripted["answers"] = [
@@ -214,6 +217,9 @@ async function run(
       return { kind: "body", text: over.snapshot ?? snapshotOf([]) };
     },
     host: hostFor(over.platform ?? "linux"),
+    noSessionRefs: over.noSessionRefs,
+    noSessionRefsRemedy: over.noSessionRefsRemedy,
+    sessionsFromHooks: over.sessionsFromHooks,
   });
   return new Map(findings.map((f) => [f.check, f]));
 }
@@ -292,6 +298,30 @@ describe("the history section", () => {
     expect(good.get("agent-sessions")?.status).toBe("ok");
   });
 
+  test("agent-sessions is skipped, not an error, where the multiplexer can report no session (M74)", async () => {
+    const found = await run({ snapshot: snapshotOf([{ paneId: "t1", agent: "claude" }]), noSessionRefs: "herdr-core keeps no conversation id" });
+    expect(found.get("agent-sessions")?.status).toBe("skipped");
+    expect(found.get("agent-sessions")?.detail).toContain("herdr-core keeps no conversation id");
+  });
+
+  test("where a hook adds the session, the skip names the hook and a missing session names it too (M74 spec 04)", async () => {
+    const skippedRow = await run({
+      snapshot: snapshotOf([{ paneId: "t1", agent: "claude" }]),
+      noSessionRefs: "the hooks are not installed",
+      noSessionRefsRemedy: "`collie hooks install claude`",
+    });
+    expect(skippedRow.get("agent-sessions")?.status).toBe("skipped");
+    expect(skippedRow.get("agent-sessions")?.remedy).toContain("collie hooks install claude");
+
+    const missing = await run({ snapshot: snapshotOf([{ paneId: "t1", agent: "claude" }]), sessionsFromHooks: true });
+    expect(missing.get("agent-sessions")?.status).toBe("error");
+    expect(missing.get("agent-sessions")?.remedy).toContain("collie hooks install claude");
+    expect(missing.get("agent-sessions")?.remedy).not.toContain("herdr integration install");
+
+    const present = await run({ snapshot: snapshotOf([{ paneId: "t1", agent: "claude", hasSession: true }]), sessionsFromHooks: true });
+    expect(present.get("agent-sessions")?.status).toBe("ok");
+  });
+
   // An omp pane reads through pi's adapter, so the bridge hides its History and Chat when it names no
   // session, and `collie doctor` has to say so and name omp's own hook.
   test("an omp pane with no session is named, and its own hook is the remedy", async () => {
@@ -359,7 +389,8 @@ describe("the history section", () => {
     for (const agent of JOURNAL_AGENT_NAMES) {
       // The exception proves the rule: an adapter that discovers its own sessions needs no hook, so
       // its ok does not come from Herdr's answer and Herdr's silence cannot take it away.
-      if (DISCOVERS_OWN_SESSIONS.includes(agent)) {
+      const canonical = Object.entries(AGENT_ALIASES).find(([alias]) => alias === agent)?.[1] ?? agent;
+      if (DISCOVERS_OWN_SESSIONS.includes(canonical)) {
         expect(byCheck.get(`integration-${agent}`)?.status).toBe("ok");
       } else {
         expect(byCheck.get(`integration-${agent}`)?.status).toBe("skipped");
@@ -405,7 +436,7 @@ describe("the history section", () => {
     const none = await run({ files: {} });
     expect(none.get("journal-roots")?.status).toBe("warn");
     // pi has two default roots; every other harness has one.
-    expect(none.get("journal-roots")?.detail).toContain("none of the 10 journal roots is there");
+    expect(none.get("journal-roots")?.detail).toContain("none of the 12 journal roots is there");
 
     // `list` answers `[]` for a directory this user cannot read AND for an empty one; the finding
     // says both, because the seam cannot tell them apart and a doctor may not guess.

@@ -2,6 +2,7 @@ import { join } from "node:path";
 
 import { binaryName, type Host } from "../bridge/host.ts";
 import { DURABLE_MUX } from "../bridge/mux/durable/adapter.ts";
+import { HERDR_CORE_MUX } from "../bridge/mux/herdr-core/adapter.ts";
 import { buildMuxRegistry, DEFAULT_MUX, factoryFor, muxEndpointVar, muxNames } from "../bridge/mux/registry.ts";
 import { TMUX_MUX, TMUX_VERSION_ARGS } from "../bridge/mux/tmux/adapter.ts";
 import { resolveTmuxBinary, TMUX_BINARY_CANDIDATES, tmuxServerArgs, tmuxServerLabel } from "../bridge/mux/tmux/exec.ts";
@@ -16,7 +17,15 @@ import { classifyLink, linkDir, linkPath, type LinkReader } from "./link.ts";
 import { explicitMux, probeMuxes, refusedMux, type MuxSighting } from "./mux.ts";
 import { crewModeOnDisk } from "./serve.ts";
 import type { Exec, Files } from "./sys.ts";
-import { certDomains, HTTPS_DISABLED_HINT, NO_CERTIFICATES_HTTP_HINT, selfDnsName } from "./tailnet.ts";
+import {
+  certDomains,
+  HTTPS_DISABLED_HINT,
+  NO_CERTIFICATES_HTTP_HINT,
+  readTailscale,
+  selfDnsName,
+  TAILSCALE_PROBE_MS,
+  type TailscaleState,
+} from "./tailnet.ts";
 
 // The setup check: what a machine needs before `collie start` can put Collie on a phone, in words an
 // operator who never read the docs understands. `collie start` prints the rows that are not fine,
@@ -57,8 +66,8 @@ export interface SetupDeps {
 /** What the multiplexer check reads. */
 export type MuxDeps = Pick<SetupDeps, "ctx" | "exec" | "files">;
 
-/** How long one `tailscale` call may take before it reads as "did not answer". */
-export const TAILSCALE_PROBE_MS = 3000;
+// Defined in `./tailnet.ts` (the doctor and `url` paths bound their calls with it too).
+export { TAILSCALE_PROBE_MS };
 
 /**
  * Every setup row, in the order `start` prints them: the three Tailscale rows (two off Linux), then
@@ -85,43 +94,15 @@ export function setupLines(f: Finding): string[] {
 }
 
 /**
- * The sentence `collie start` prints on stderr AFTER the status banner when any setup row printed.
- * Before the banner it read as "stopped"; after it, the bridge is plainly up and the phone is not.
+ * The sentence `collie start` prints on stderr AFTER the status banner when a Tailscale row is open
+ * ({@link phoneBlocked}). Before the banner it read as "stopped"; after it, the bridge is plainly up
+ * and the phone is not. A `path-link` or `mux` row alone does not earn it: those print, and the phone
+ * still reaches the door.
  */
 export const SETUP_CLOSING =
   "Running, but your phone cannot reach it yet. Fix the setup lines above, then run collie start again. collie doctor repeats this check.";
 
 // ── Tailscale ────────────────────────────────────────────────────────────────
-
-/** What one bounded `tailscale status --json` said about this machine. */
-type TailscaleState =
-  | { readonly kind: "absent" }
-  /** Ran, and said the daemon is down, logged out or stopped. `state` is its `BackendState`. */
-  | { readonly kind: "down"; readonly state: string | null }
-  /** Exit 0 with a document this build cannot read: no verdict either way. */
-  | { readonly kind: "unreadable" }
-  | { readonly kind: "running"; readonly json: string };
-
-function readTailscale(exec: Exec): TailscaleState {
-  if (exec.which("tailscale") === null) return { kind: "absent" };
-  const r = exec.capture("tailscale", ["status", "--json"], TAILSCALE_PROBE_MS);
-  if (!r.found) return { kind: "absent" };
-  if (r.code !== 0) return { kind: "down", state: null };
-  let data: unknown;
-  try {
-    data = JSON.parse(r.stdout);
-  } catch {
-    return { kind: "unreadable" };
-  }
-  if (!(data instanceof Object)) return { kind: "unreadable" };
-  // SAFETY: narrowed to an object above, and the field is only compared and stringified, never
-  // trusted as a shape. An absent state reads as running: every Tailscale build that writes this
-  // document names it, so its absence is a document from somewhere else, and the rows below read
-  // what it does say.
-  const state = (data as { BackendState?: unknown }).BackendState;
-  if (state !== undefined && state !== null && state !== "Running") return { kind: "down", state: String(state) };
-  return { kind: "running", json: r.stdout };
-}
 
 /** The user name a remedy can name, or the shell's `$USER` when the environment does not say. */
 function userName(deps: Pick<SetupDeps, "ctx">): string | null {
@@ -174,9 +155,26 @@ function tailscaleNotUsed(deps: SetupDeps): { detail: string; remedy: string } |
 const notYet = (check: string): Finding =>
   skipped(check, "Tailscale is not running here, so this cannot be checked yet", "fix the tailscale line first, then run `collie doctor` again");
 
+/**
+ * The check names of the Tailscale rows, in print order: `tailscale`, `tailnet-https`, and on Linux
+ * `tailscale-operator`. These are the rows that decide whether a phone can reach the front door.
+ */
+export function reachabilityChecks(host: Host): readonly string[] {
+  return isLinux(host) ? ["tailscale", "tailnet-https", "tailscale-operator"] : ["tailscale", "tailnet-https"];
+}
+
+/**
+ * Does an open Tailscale row stand between the phone and the front door? `mux` and `path-link` are
+ * setup rows too, but neither one is about the phone: a missing PATH link leaves a door that works.
+ */
+export function phoneBlocked(findings: readonly Finding[], host: Host): boolean {
+  const checks = reachabilityChecks(host);
+  return findings.some((f) => checks.includes(f.check) && (f.status === "warn" || f.status === "error"));
+}
+
 /** The `tailscale`, `tailnet-https` and (Linux only) `tailscale-operator` rows. */
 export function tailscaleFindings(deps: SetupDeps): Finding[] {
-  const checks = isLinux(deps.host) ? ["tailscale", "tailnet-https", "tailscale-operator"] : ["tailscale", "tailnet-https"];
+  const checks = reachabilityChecks(deps.host);
   const unused = tailscaleNotUsed(deps);
   if (unused !== null) return checks.map((check) => skipped(check, unused.detail, unused.remedy));
 
@@ -195,6 +193,12 @@ function tailscaleRow(deps: SetupDeps, state: TailscaleState): Finding {
       const said = state.state === null ? "" : ` (it reports ${state.state})`;
       return warn("tailscale", `Tailscale is installed but not signed in or not running${said}`, upRemedy(deps));
     }
+    case "slow":
+      return warn(
+        "tailscale",
+        `Tailscale did not answer within ${TAILSCALE_PROBE_MS / 1000} seconds`,
+        "run `tailscale status` by hand; when it answers, run `collie start` again",
+      );
     case "unreadable":
       return skipped(
         "tailscale",
@@ -505,6 +509,8 @@ export function muxFinding(deps: MuxDeps): Finding {
   // A durable program is asked by the six `durable-*` rows (and `durable-lead` in a crew), so this
   // line defers to them as the Herdr line defers to `herdr-socket`.
   if (settings.name === DURABLE_MUX) return ok("mux", `${DURABLE_MUX}, see the durable-* lines${originSuffix(settings.origin)}`);
+  // herdr-core is asked by its own two rows, `hc-socket` and `hc-version` (cli/herdr-core-findings.ts).
+  if (settings.name === HERDR_CORE_MUX) return ok("mux", `${HERDR_CORE_MUX}, see hc-socket${originSuffix(settings.origin)}`);
   // Registered, and this verb has no probe for it. `skipped` rather than a pass, for the reason
   // `acl` gives: a check that could not run must never render as one that did.
   return skipped(

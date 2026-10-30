@@ -695,6 +695,58 @@ describe("GET /crew/v1/snapshot — the one merged route, §9.2", () => {
     expect(Object.hasOwn(answered as object, "machineStats")).toBe(false);
   });
 
+  // ── M76 spec 04: THE MEMBER'S MUX NAME AND PANE COUNT, IN THAT SAME SEAT ────
+  test("mux and panes ride beside the body, and a member that cannot count sends no panes, never 0", async () => {
+    const h = harness(peerStore());
+    const body = ownSnapshot();
+    let counted: number | null = 3;
+    const handler = createCrewRouter({
+      store: h.store,
+      audit: h.audit,
+      transportPinned: true,
+      snapshot: () => body,
+      mux: () => ({ name: "herdr", capabilities: muxCaps({}), unsupportedKeys: [], notes: {} }),
+      panes: () => counted,
+    });
+    const res = (await call(handler, CREW_SNAPSHOT_PATH, { headers: authed }))!;
+    expect(await res.json()).toEqual({ ...body, mux: "herdr", panes: 3 });
+    // The browser's own snapshot is untouched.
+    expect(body).toEqual(ownSnapshot());
+
+    // A bridge still starting has no count: the key is absent, and zero is a different statement.
+    counted = null;
+    const starting: unknown = await (await call(handler, CREW_SNAPSHOT_PATH, { headers: authed }))!.json();
+    expect(starting).toEqual({ ...body, mux: "herdr" });
+    // SAFETY: `toEqual` above has already established that this is an object.
+    expect(Object.hasOwn(starting as object, "panes")).toBe(false);
+
+    // A real zero is reported as zero.
+    counted = 0;
+    const idle: unknown = await (await call(handler, CREW_SNAPSHOT_PATH, { headers: authed }))!.json();
+    expect(idle).toEqual({ ...body, mux: "herdr", panes: 0 });
+  });
+
+  test("host rides beside the body when the machine has a name, and is absent otherwise (M77 spec 01)", async () => {
+    const h = harness(peerStore());
+    const body = ownSnapshot();
+    let named: string | null = " minibuch ";
+    const handler = createCrewRouter({
+      store: h.store,
+      audit: h.audit,
+      transportPinned: true,
+      snapshot: () => body,
+      host: () => named,
+    });
+    expect(await (await call(handler, CREW_SNAPSHOT_PATH, { headers: authed }))!.json()).toEqual({ ...body, host: "minibuch" });
+    for (const unusable of [null, "", "   "]) {
+      named = unusable;
+      const answer: unknown = await (await call(handler, CREW_SNAPSHOT_PATH, { headers: authed }))!.json();
+      expect(answer).toEqual(body);
+      // SAFETY: `toEqual` above has already established that this is an object.
+      expect(Object.hasOwn(answer as object, "host")).toBe(false);
+    }
+  });
+
   test("an UNADMITTED caller never reaches the follow headers either", async () => {
     const h = harness(peerStore());
     let seen = 0;
@@ -787,6 +839,26 @@ describe("POST /crew/v1/enroll — admitted by the TOKEN, not by the two factors
     expect(payload.crewSecret).toBeString();
     // The peer is now pinned on the lead's roster, and the invite is gone.
     expect(h.data().peers.map((p) => [p.memberId, p.fingerprint])).toEqual([["laptop", fp("laptop")]]);
+    expect(h.data().invites).toEqual([]);
+  });
+
+  test("a name the lead already uses is refused with 422 and a reason; the invite is spent, nothing is pinned", async () => {
+    const h = invited();
+    const handler = createCrewRouter({ store: h.store, audit: h.audit, now: () => T0 + 1, hostname: () => "bluefin.lan" });
+    const res = (await call(handler, CREW_ENROLL_PATH, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-crew-protocol": "2" },
+      body: JSON.stringify(body({ token: h.token, label: "Bluefin" })),
+    }))!;
+    expect(res.status).toBe(422);
+    expect(res.headers.get("x-crew-protocol")).toBe("2");
+    expect(await res.json()).toEqual({
+      error: 'the name "Bluefin" is already taken by the lead. Pass --label <another name>.',
+      code: "label_taken",
+      label: "Bluefin",
+      takenBy: "lead",
+    });
+    expect(h.data().peers).toEqual([]);
     expect(h.data().invites).toEqual([]);
   });
 

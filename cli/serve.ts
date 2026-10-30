@@ -23,6 +23,7 @@ import {
   bridgeUrl,
   HTTPS_DISABLED_HINT,
   localBridgeHostPort,
+  TAILSCALE_PROBE_MS,
   tailnetCertDomains,
   tailnetName,
 } from "./tailnet.ts";
@@ -51,6 +52,9 @@ export {
   type ServeHandlers,
   type ServeStatus,
 };
+
+/** The sub-verbs of `collie serve`. The bare verb publishes; these read. */
+export const SERVE_SUBCOMMANDS = ["status"] as const;
 
 export interface ServeDeps {
   ctx: CliContext;
@@ -117,6 +121,38 @@ export function rootAvailability(
   const targets = rootTargets(status);
   if (targets.length === 0) return "free";
   return targets.every((target) => target === expectedProxy) ? "adoptable" : "occupied";
+}
+
+/** A root mount on a listener Collie does not manage that still proxies to Collie's own loopback. */
+export interface HandMadeDoor {
+  readonly listener: number;
+  readonly protocol: ServeMode;
+}
+
+/**
+ * Every listener OTHER than `ownPort` whose mount at `path` proxies to `expectedProxy`, in listener
+ * order. The old Headscale recipe in docs/windows.md published on port 80; Collie neither adopts
+ * such a mapping nor removes it on `uninstall`, so it keeps working as a second, unrecorded door.
+ * Read from the same parsed status {@link rootAvailability} reads, with the same listener match
+ * (the `:<port>` suffix of the `Web` key). Foreground sessions are not looked at: they belong to a
+ * live process, not to a forgotten mapping.
+ */
+export function handMadeDoors(
+  status: ServeStatus,
+  ownPort: number,
+  expectedProxy: string,
+  path = "/",
+): HandMadeDoor[] {
+  const found = new Map<number, HandMadeDoor>();
+  for (const [hostPort, server] of Object.entries(status.Web ?? {})) {
+    const listener = Number(/:(\d+)$/.exec(hostPort)?.[1]);
+    if (!Number.isInteger(listener) || listener === ownPort) continue;
+    const handlers = server?.Handlers ?? {};
+    if (!hasMount(handlers, path) || handlers[path]?.Proxy !== expectedProxy) continue;
+    const protocol: ServeMode = status.TCP?.[String(listener)]?.HTTPS === true ? "https" : "http";
+    found.set(listener, { listener, protocol });
+  }
+  return [...found.values()].toSorted((a, b) => a.listener - b.listener);
 }
 
 // ── Teardown ────────────────────────────────────────────────────────────────
@@ -268,7 +304,7 @@ export function cmdServe(deps: ServeDeps): number {
   // has returned. Anything it prints WHILE it waits then reaches nobody, and the operator watches a
   // command that looks hung. Nothing parses this output, so letting it through costs nothing and
   // buys back every question tailscale decides to ask.
-  const r = deps.exec.inherit("tailscale", args);
+  const r = deps.exec.inherit("tailscale", args, deps.io.childOutToErr === true ? "stderr" : undefined);
   if (r.found && r.code === 0) {
     const at = path === "/" ? "" : ` ${path}`;
     deps.io.out(
@@ -300,6 +336,28 @@ export function cmdServeVerb(deps: ServeDeps): number {
   if (code !== EXIT.OK) return code;
   if (crewModeOnDisk(deps) === "peer") return EXIT.OK;
   deps.io.out(`open: ${bridgeUrl(deps.exec, deps.ctx)}`);
+  return EXIT.OK;
+}
+
+/**
+ * `collie serve status`: what `tailscale serve` publishes on this machine, which is every front door
+ * on it and not only Collie's. It is the dump `collie status` printed until M76; `status --verbose`
+ * still prints it, from this same function, so the two can never word it differently.
+ *
+ * Read only. `COLLIE_SKIP_SERVE=1` means this Collie sits behind its own proxy, and it says so rather
+ * than asking `tailscale` about a door nobody published.
+ */
+export function cmdServeStatus(deps: Pick<ServeDeps, "ctx" | "io" | "exec">): number {
+  if (deps.ctx.env.COLLIE_SKIP_SERVE === "1") {
+    deps.io.out("  serve config: skipped (COLLIE_SKIP_SERVE=1)");
+    return EXIT.OK;
+  }
+  deps.io.out("  serve config:");
+  const r = deps.exec.capture("tailscale", ["serve", "status"], TAILSCALE_PROBE_MS);
+  if (!r.found || r.code !== 0) return EXIT.OK;
+  for (const line of r.stdout.replace(/\n$/, "").split("\n")) {
+    if (line !== "") deps.io.out(`    ${line}`);
+  }
   return EXIT.OK;
 }
 
@@ -357,7 +415,7 @@ function ensureRootAvailable(
   path: string,
 ): boolean {
   const name = mountName(path);
-  const r = deps.exec.capture("tailscale", ["serve", "status", "--json"]);
+  const r = deps.exec.capture("tailscale", ["serve", "status", "--json"], TAILSCALE_PROBE_MS);
   if (!r.found || r.code !== 0) {
     deps.io.err(
       `error: cannot inspect Tailscale serve status; refusing to overwrite the ${name} on :${port}`,
@@ -365,8 +423,10 @@ function ensureRootAvailable(
     return false;
   }
   let verdict: Availability;
+  let status: ServeStatus;
   try {
-    verdict = rootAvailability(parseServeStatus(r.stdout), port, protocol, expectedProxy, path);
+    status = parseServeStatus(r.stdout);
+    verdict = rootAvailability(status, port, protocol, expectedProxy, path);
   } catch {
     deps.io.err(
       `error: invalid Tailscale serve status; refusing to overwrite the ${name} on :${port}`,
@@ -387,6 +447,18 @@ function ensureRootAvailable(
     deps.io.out(`tailscale serve: adopting the existing Collie ${name} on :${port}`);
     // The record is written right after this gate returns, so from here `collie uninstall` and `collie unserve` own it.
     deps.io.out("note: adopted an existing tailscale serve mapping for this collie; `collie uninstall` or `collie unserve` removes it with the rest");
+  }
+  // A hand-made door on another listener is not ours to refuse over, but the operator should hear
+  // that `uninstall` will leave it standing. Only before an http publish, where the old recipe's
+  // port 80 is the likely guest.
+  if (protocol === "http") {
+    const stray = handMadeDoors(status, port, expectedProxy, path)[0];
+    if (stray !== undefined) {
+      deps.io.out(
+        `note: tailnet :${stray.listener} already proxies to ${expectedProxy}, made by hand on a port` +
+          " Collie does not manage; collie uninstall will not remove it (docs/windows.md)",
+      );
+    }
   }
   return true;
 }

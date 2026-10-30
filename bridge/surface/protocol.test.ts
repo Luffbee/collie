@@ -17,7 +17,7 @@ import { findInputFrame } from "../../web/src/lib/surface/frame.ts";
 import { surfaceOfScreen } from "../../web/src/lib/surface/fold.ts";
 import { isFree, type Surface, type SurfaceTurn } from "../../web/src/lib/surface/surface.ts";
 import { KeyGate } from "./key-gate.ts";
-import { BOUNDS, BOX_CHANGED, boxMatches, COMMAND_SETTLE_MS, boxMatchesTail, commandBoxMatches, GENERIC_PROBE, wholePaste, LOCK_BOUND_MS, locateText, neverHeldEntry, probeLanding, RowRing, runsInTurnEntry, SendProtocol, SessionLocks, STALE_SCREEN, steadyRow, type SendDeps, type SendRequest } from "./protocol.ts";
+import { BOUNDS, BOX_CHANGED, boxMatches, COMMAND_SETTLE_MS, boxMatchesTail, commandBoxMatches, GENERIC_PROBE, uploadAlone, wholePaste, LOCK_BOUND_MS, locateText, neverHeldEntry, probeLanding, RowRing, runsInTurnEntry, SendProtocol, SessionLocks, STALE_SCREEN, steadyRow, type SendDeps, type SendRequest } from "./protocol.ts";
 import { RequestStore } from "./requests.ts";
 import { SurfaceLedger } from "./counters.ts";
 import { HoldStore } from "./holds.ts";
@@ -105,6 +105,8 @@ class FakePane {
   blockLiteralLines = 3;
   /** The image files a {@link pasteBlock} paste takes off, each drawn as `[Image #N]` before the rest. */
   imageFiles: readonly string[] = [];
+  /** Claude Code 2.1.312 (lab, 2026-10-30): an upload path is attached only when it is the whole paste; among other text it stays text. */
+  imagesOnlyAlone = false;
   pastes = 0;
   readFails = false;
   readsSeen = 0;
@@ -209,7 +211,10 @@ class FakePane {
     }
     // Muse mode: the queued block between the running rows and the box (muse--queued-input-1410.txt).
     const museQueued = this.mode === "muse" && this.queued.length > 0 ? ["", "◆ Queued input · ↑ to edit", ...this.queued.map((text) => `└ ${text}`)] : [];
-    rows.push(...this.over, ...museQueued, RULE, ...this.boxRows(), RULE);
+    // Claude Code paints its rules grey, so a Claude read is styled even while the box holds a typed
+    // draft: the read-with-no-styling paths (M78 spec 06) stay off unless a test strips the colour.
+    const rule = this.mode === "claude" ? `\u001b[38;2;136;136;136m${RULE}\u001b[0m` : RULE;
+    rows.push(...this.over, ...museQueued, rule, ...this.boxRows(), rule);
     if (this.mode === "generic") rows.push(this.footer);
     else rows.push(...(this.popup ?? (this.box.length > 0 && this.statusWithText !== null ? this.statusWithText : this.status)));
     return (this.height === null ? rows : rows.slice(-this.height)).join("\n");
@@ -262,7 +267,13 @@ class FakePane {
     const held = this.beforeWrite?.(this, `paste:${text}`);
     if (held !== undefined) return held.then(() => muxAck());
     this.calls.push(`paste:${text}`);
-    this.take(text, true);
+    // A paste that is one image file and nothing else is attached, on 2.1.305 and 2.1.312 alike.
+    if (this.imageFiles.includes(text.trim()) && this.dialog === null && !this.swallow) {
+      this.box += `[Image #${String(++this.pastes)}]`;
+      this.bump();
+    } else {
+      this.take(text, true);
+    }
     this.afterInput?.(this, `paste:${text}`);
     return Promise.resolve(muxAck());
   };
@@ -280,7 +291,7 @@ class FakePane {
     // Claude cuts the paste at each newline and at a space before an absolute path, and attaches the
     // pieces that are image files (lab, 2.1.305); the kept pieces stay, joined by newlines.
     const pieces = text.split(/\n| (?=\/)/u);
-    const kept = pieces.filter((piece) => !this.imageFiles.includes(piece.trim()));
+    const kept = this.imagesOnlyAlone && pieces.length > 1 ? pieces : pieces.filter((piece) => !this.imageFiles.includes(piece.trim()));
     for (let i = kept.length; i < pieces.length; i++) this.box += `[Image #${String(++this.pastes)}]`;
     if (kept.length < pieces.length) text = kept.join("\n");
     const breaks = text.split("\n").length - 1;
@@ -688,6 +699,91 @@ describe("a send that goes through", () => {
     const { send } = rig({ block: true, pane, imageFiles: [shot] });
     expect((await send(`line one\n${shot}\nline three`)).receipt?.outcome).toBe("sent");
     expect(pane.transcript.at(-1)).toBe("> [Image #1]line one line three");
+  });
+
+  test("a two-paragraph message that ends its first paragraph with an upload path is sent when Claude Code keeps the path as text (2.1.312, the field case of 2026-10-29)", async () => {
+    const shot = "/home/me/.local/state/collie/uploads/w1_p1-mf3x9q-0a1b2c3d.jpg";
+    const pane = new FakePane("claude");
+    pane.imageFiles = [shot];
+    pane.imagesOnlyAlone = true;
+    // Three short lines land literally in Claude Code (215 characters in the lab); the fake folds at 120 by default.
+    pane.collapseOver = 1000;
+    const { send } = rig({ block: true, pane, imageFiles: [shot] });
+    const text = `also mobile looks off ${shot}\n\nmenu should be a bottom sheet on the phone`;
+    expect((await send(text)).receipt).toMatchObject({ outcome: "sent", keys: ["Enter"] });
+    expect(pane.transcript.at(-1)).toBe(`> ${text.replaceAll("\n", " ")}`);
+  });
+
+  test("a long message with an upload path in it folds with every typed line break when Claude Code keeps the path (2.1.312), and is sent", async () => {
+    const shot = "/home/me/.local/state/collie/uploads/w1_p1-mf3x9q-0a1b2c3d.jpg";
+    const pane = new FakePane("claude");
+    pane.imageFiles = [shot];
+    pane.imagesOnlyAlone = true;
+    const { send } = rig({ block: true, pane, imageFiles: [shot] });
+    const lines = Array.from({ length: 10 }, (_, i) => `line ${String(i)}`);
+    expect((await send([...lines.slice(0, 5), shot, ...lines.slice(5)].join("\n"))).receipt?.outcome).toBe("sent");
+    expect(pane.transcript.at(-1)).toBe("> [Pasted text #1 +10 lines]");
+  });
+
+  test("a message that is only an upload path is sent when Claude Code attaches it as [Image #1] (2.1.312, live check 2026-10-30), on tmux and on Herdr", async () => {
+    const shot = "/home/me/.local/state/collie/uploads/_0-mvu6nr4p-8ab21b25.png";
+    for (const block of [false, true]) {
+      const pane = new FakePane("claude");
+      pane.imageFiles = [shot];
+      pane.imagesOnlyAlone = true;
+      const { send } = rig({ block, pane, imageFiles: [shot] });
+      expect((await send(shot)).receipt).toMatchObject({ outcome: "sent", keys: ["Enter"] });
+      expect(pane.transcript.at(-1)).toBe("> [Image #1]");
+      expect(pane.calls).toEqual(block ? [`block:${shot}`] : [`paste:${shot}`]);
+    }
+  });
+
+  test("a message that is only an upload path is sent when the harness keeps the path as text", async () => {
+    const shot = "/home/me/.local/state/collie/uploads/_0-mvu6nr4p-8ab21b25.png";
+    for (const block of [false, true]) {
+      // The pane attaches nothing; the protocol still knows the file is on disk.
+      const { pane, send } = rig({ block, imageFiles: [shot] });
+      expect((await send(shot)).receipt).toMatchObject({ outcome: "sent", keys: ["Enter"] });
+      expect(pane.transcript.at(-1)).toBe(`> ${shot}`);
+    }
+  });
+
+  test("a message that is only an upload path stays typed when the box holds anything but the token or the path", async () => {
+    const shot = "/home/me/.local/state/collie/uploads/_0-mvu6nr4p-8ab21b25.png";
+    const pane = new FakePane("claude");
+    pane.imageFiles = [shot];
+    // The harness attaches the path and adds a word: neither exact form.
+    pane.afterInput = (p, what) => {
+      if (what.startsWith("paste:")) p.box += " x";
+    };
+    const { send } = rig({ pane, imageFiles: [shot] });
+    expect((await send(shot)).receipt).toMatchObject({ outcome: "typed_not_submitted", reason: "mismatch" });
+    expect(pane.keysSeen).not.toContain("Enter");
+  });
+
+  test("an upload path that is no file on this disk is compared as text only: an attached token leaves the send typed", async () => {
+    const shot = "/home/me/.local/state/collie/uploads/_0-mvu6nr4p-8ab21b25.png";
+    const pane = new FakePane("claude");
+    pane.imageFiles = [shot];
+    const { send } = rig({ pane });
+    expect((await send(shot)).receipt?.outcome).toBe("typed_not_submitted");
+    expect(pane.keysSeen).not.toContain("Enter");
+  });
+
+  test("a short one-line message with an upload path inside is compared as its literal text only", async () => {
+    const shot = "/home/me/.local/state/collie/uploads/_0-mvu6nr4p-8ab21b25.png";
+    const text = `menu should be centered ${shot}`;
+    // 2.1.312 keeps a path among other text as text: sent.
+    const kept = rig({ imageFiles: [shot] });
+    expect((await kept.send(text)).receipt).toMatchObject({ outcome: "sent", keys: ["Enter"] });
+    // A box that shows the image form of that text is not what 2.1.312 draws there: no Enter.
+    const pane = new FakePane("claude");
+    pane.afterInput = (p, what) => {
+      if (what.startsWith("paste:")) p.box = "[Image #1]menu should be centered";
+    };
+    const { send } = rig({ pane, imageFiles: [shot] });
+    expect((await send(text)).receipt?.outcome).toBe("typed_not_submitted");
+    expect(pane.keysSeen).not.toContain("Enter");
   });
 
   test("Discard finds and clears a box that holds the image token and the folded paste", async () => {
@@ -1390,6 +1486,14 @@ describe("a command (M56 spec 06)", () => {
     expect(pane.readsSeen).toBe(0);
   });
 
+  test("the path of a saved upload is no command: a plain send of it is not refused reserved_lead", async () => {
+    const { send } = rig();
+    const path = "/home/me/.local/state/collie/uploads/w7C_pF-mvtrpn7j-e4f81595.png";
+    expect((await send(path)).receipt?.reason).not.toBe("reserved_lead");
+    expect((await send(`${path} what is wrong here?`)).receipt?.reason).not.toBe("reserved_lead");
+    expect((await send("/usr")).receipt).toMatchObject({ outcome: "refused", reason: "reserved_lead" });
+  });
+
   test("a shell line whose bang turns into the prompt glyph matches the box without its lead", async () => {
     const { pane, send } = rig();
     pane.bangPrompt = true;
@@ -1858,6 +1962,15 @@ describe("muse: Tab queues in a turn, Enter steers it (MUSE-06/07, #519)", () =>
     expect(answer.receipt).toMatchObject({ outcome: "sent", profileId: "muse", keys: ["probe", "Backspace", "Enter"] });
     expect(answer.receipt && "queued" in answer.receipt).toBe(false);
     expect(pane.transcript.at(-1)).toBe("> please list the files in this folder");
+    expect(pane.keysSeen).not.toContain("Tab");
+    neverEscape(pane);
+  });
+
+  test("a multiline Muse draft is the box's own wrapped text, not a dialog: Enter sends (live 2026-10-21)", async () => {
+    const { pane, send } = muse();
+    const answer = await send("first line of a long draft\nsecond line continues here\nthird line continues here");
+    expect(answer.receipt).toMatchObject({ outcome: "sent", profileId: "muse", keys: ["probe", "Backspace", "ctrl+j", "ctrl+j", "Enter"] });
+    expect(pane.transcript.at(-1)).toBe("> first line of a long draft second line continues here third line continues here");
     expect(pane.keysSeen).not.toContain("Tab");
     neverEscape(pane);
   });
@@ -2860,6 +2973,87 @@ describe("the probe", () => {
     await send("hello there");
     expect(probeReads).toBeLessThanOrEqual(3);
   });
+
+  // A herdr-core crew member on minibuch (2026-10-30): keys ["probe", "Backspace"], `probe_failed`,
+  // "Collie could not confirm the box was clean". One write there opens a socket, attaches and paints
+  // the screen, so the two writes ate the probe's read bound and the Backspace half never read.
+  describe("on a multiplexer whose writes are slow (herdr-core, 2026-10-30)", () => {
+    /** Every text write and key press costs `ms` on the rig's clock; reads cost nothing. */
+    const slowWrites = (r: Rig, ms: number): void => {
+      r.pane.beforeWrite = () => {
+        r.clock.now += ms;
+      };
+    };
+    /** The probe character shows in the box on the second read after its write, not the first. */
+    const lateEcho = (pane: FakePane): void => {
+      let held = false;
+      let reads = 0;
+      pane.afterInput = (p, what) => {
+        if (what !== `type:${PROBE}`) return;
+        p.box = p.box.slice(0, -PROBE.length);
+        held = true;
+        reads = 0;
+      };
+      pane.beforeRead = (p) => {
+        if (!held || ++reads < 2) return;
+        p.box += PROBE;
+        held = false;
+      };
+    };
+
+    test("writes of 300 ms each stay outside the probe's read bound: the Backspace read passes and the send goes on", async () => {
+      const r = rig({ version: "2.1.999" });
+      slowWrites(r, 300);
+      lateEcho(r.pane);
+      const answer = await r.send("hello there");
+      expect(answer.receipt).toMatchObject({ outcome: "sent", keys: ["probe", "Backspace", "Enter"] });
+      expect(answer.receipt?.detail).toBeUndefined();
+      // The two writes are their own lap; the probe's own gap is its reads (80 + 160, then 80).
+      expect(answer.receipt?.gapsMs.probeWrite).toBe(600);
+      expect(answer.receipt?.gapsMs.probe).toBe(320);
+    });
+
+    test("a Backspace held three seconds behind the raw probe write (herdr-core 0.1.14, measured 2026-10-30) still reads", async () => {
+      // On a private hc session `terminal.keys` answered about 3030 ms after a `typeRaw`, whatever the gap
+      // between them; a raw write took 1 ms. Before the fix this was the minibuch receipt word for word.
+      const r = rig({ version: "2.1.999" });
+      r.pane.beforeWrite = (_p, what) => {
+        if (what.startsWith("keys:")) r.clock.now += 3000;
+      };
+      const answer = await r.send("hello there");
+      expect(answer.receipt).toMatchObject({ outcome: "sent", keys: ["probe", "Backspace", "Enter"] });
+      expect(answer.receipt?.gapsMs.probeWrite).toBe(3000);
+      expect(answer.receipt?.gapsMs.probe).toBeLessThanOrEqual(BOUNDS.probe.ms);
+    });
+
+    test("a Backspace half that starts with almost no time left still reads once", async () => {
+      const r = rig({ version: "2.1.999" });
+      // The read that shows the probe takes 800 ms: the typed half spends 880 of its 900, 20 are left.
+      let slow = true;
+      let backReads = 0;
+      r.pane.beforeRead = (p) => {
+        if (p.box.endsWith(PROBE) && slow) {
+          slow = false;
+          r.clock.now += 800;
+        }
+        if (p.keysSeen.length === 1 && p.keysSeen[0] === "Backspace") backReads++;
+      };
+      const answer = await r.send("hello there");
+      expect(answer.receipt).toMatchObject({ outcome: "sent", keys: ["probe", "Backspace", "Enter"] });
+      expect(backReads).toBeGreaterThanOrEqual(1);
+    });
+
+    test("a failed probe's receipt says where the time went: its reads and its writes", async () => {
+      const r = rig({ version: "2.1.999" });
+      slowWrites(r, 300);
+      r.pane.backspaceRestores = false;
+      const answer = await r.send("hello there");
+      expect(answer.receipt).toMatchObject({ outcome: "refused", reason: "probe_failed", keys: ["probe", "Backspace"] });
+      expect(answer.receipt?.gapsMs.probeWrite).toBe(600);
+      expect(answer.receipt?.gapsMs.probe).toBeGreaterThan(0);
+      expect(answer.receipt?.gapsMs.probe).toBeLessThanOrEqual(BOUNDS.probe.ms);
+    });
+  });
 });
 
 describe("the write and S1", () => {
@@ -3460,7 +3654,7 @@ describe("pure helpers", () => {
   test("boxMatches takes ONE collapse form for a whole multi-line text only when it claims the text's line breaks", () => {
     const collapse = /\[Pasted text #(?<n>\d+)(?: \+(?<lines>\d+) lines)?\]/uy;
     const three = ["a", "b", "c"];
-    const whole = { images: 0, image: null, lines: three };
+    const whole = { images: 0, image: null, lines: three, literal: three };
     expect(boxMatches("[Pasted text #4 +2 lines]", "", three, collapse, whole)).toBe(true);
     expect(boxMatches(" [Pasted text #4 +2 lines] ", "", three, collapse, whole)).toBe(true);
     expect(boxMatches("[Pasted text #4 +3 lines]", "", three, collapse, whole)).toBe(false);
@@ -3475,16 +3669,77 @@ describe("pure helpers", () => {
   test("boxMatches reads a whole paste's image tokens before its text, as many as were taken off", () => {
     const collapse = /\[Pasted text #(?<n>\d+)(?: \+(?<lines>\d+) lines)?\]/uy;
     const image = /\[Image #\d+\]/uy;
-    const one = { images: 1, image, lines: ["look at this"] };
+    const shot = "/srv/collie/uploads/w1_p1-mf3x9q-0a1b2c3d.jpg";
+    const one = { images: 1, image, lines: ["look at this"], literal: [`look at this ${shot}`] };
     expect(boxMatches("[Image #3]look at this", "", one.lines, collapse, one)).toBe(true);
     expect(boxMatches("look at this", "", one.lines, collapse, one)).toBe(false);
-    const two = { images: 2, image, lines: ["a", "b"] };
+    const two = { images: 2, image, lines: ["a", "b"], literal: ["a", shot, "b", shot] };
     expect(boxMatches("[Image #9] [Image #10][Pasted text #11 +1 lines]", "", two.lines, collapse, two)).toBe(true);
     expect(boxMatches("[Image #9][Pasted text #11 +1 lines]", "", two.lines, collapse, two)).toBe(false);
     // The box may wrap inside a token (ADR 0010): the row break reads as white space.
     expect(boxMatches("draft [Image #1][Pasted text #2 +1 li nes]", "draft", two.lines, collapse, { ...two, images: 1 })).toBe(true);
-    expect(boxMatches("[Ima ge #1][Pasted text #2]", "", ["one long line"], collapse, { images: 1, image, lines: ["one long line"] })).toBe(true);
-    expect(boxMatches("[Pasted text #2 +1 lines]", "", ["one long line"], collapse, { images: 0, image, lines: ["one long line"] })).toBe(false);
+    expect(boxMatches("[Ima ge #1][Pasted text #2]", "", ["one long line"], collapse, { images: 1, image, lines: ["one long line"], literal: [`one long line ${shot}`] })).toBe(true);
+    expect(boxMatches("[Pasted text #2 +1 lines]", "", ["one long line"], collapse, { images: 0, image, lines: ["one long line"], literal: ["one long line"] })).toBe(false);
+  });
+
+  test("boxMatches also takes the literal form of a paste whose images the harness kept as text (Claude Code 2.1.312)", () => {
+    const collapse = /\[Pasted text #(?<n>\d+)(?: \+(?<lines>\d+) lines)?\]/uy;
+    const image = /\[Image #\d+\]/uy;
+    const shot = "/srv/collie/uploads/w1_p1-mf3x9q-0a1b2c3d.jpg";
+    // The field case of 2026-10-29: the first paragraph ends with the upload path, a blank line, a second paragraph.
+    const literal = [`also mobile looks off ${shot}`, "", "menu should be a bottom sheet"];
+    const whole = { images: 1, image, lines: ["also mobile looks off", "", "menu should be a bottom sheet"], literal };
+    // 2.1.305 took the path off the paste; 2.1.312 leaves it in, on a row of its own (the frame joins rows with a space).
+    expect(boxMatches("[Image #1]also mobile looks off menu should be a bottom sheet", "", whole.lines, collapse, whole)).toBe(true);
+    expect(boxMatches(`also mobile looks off ${shot} menu should be a bottom sheet`, "", whole.lines, collapse, whole)).toBe(true);
+    // Neither form: the path gone AND no token, or a token AND the path.
+    expect(boxMatches("also mobile looks off menu should be a bottom sheet", "", whole.lines, collapse, whole)).toBe(false);
+    expect(boxMatches(`[Image #1]also mobile looks off ${shot} menu should be a bottom sheet`, "", whole.lines, collapse, whole)).toBe(false);
+    // A folded literal paste counts every typed line break (lab: 42 lines with the path in them fold to +41); the images form one fewer.
+    const three = { images: 1, image, lines: ["see", "b"], literal: ["see", shot, "b"] };
+    expect(boxMatches("[Image #1][Pasted text #2 +1 lines]", "", three.lines, collapse, three)).toBe(true);
+    expect(boxMatches("[Pasted text #1 +2 lines]", "", three.lines, collapse, three)).toBe(true);
+    expect(boxMatches("[Pasted text #1 +1 lines]", "", three.lines, collapse, three)).toBe(false);
+    expect(boxMatches("[Pasted text #1 +3 lines]", "", three.lines, collapse, three)).toBe(false);
+    // Without images there is no second form.
+    const none = { images: 0, image, lines: ["see", "b"], literal: ["see", "b"] };
+    expect(boxMatches("[Pasted text #1 +1 lines]", "", none.lines, collapse, none)).toBe(true);
+    expect(boxMatches("[Pasted text #1 +2 lines]", "", none.lines, collapse, none)).toBe(false);
+  });
+
+  test("uploadAlone: a lone upload path takes the image form or the literal path, nothing else", () => {
+    const match = profileFor("claude", "2.1.312", { log: () => undefined });
+    const collapse = /\[Pasted text #(?<n>\d+)(?: \+(?<lines>\d+) lines)?\]/uy;
+    const shot = "/srv/collie/uploads/_0-mvu6nr4p-8ab21b25.png";
+    const windows = String.raw`C:\Users\Me Too\collie\uploads\w1-mf3x9q-0a1b2c3d.PNG`;
+    const isShot = (path: string): boolean => path === shot || path === windows || path === "/srv/shots/a.png";
+    const alone = uploadAlone(match, [shot], isShot);
+    expect(alone).toMatchObject({ images: 1, lines: [""], literal: [shot], folds: false });
+    // wholePaste reads it the same way, under its 800-character floor.
+    expect(wholePaste(match, [shot], isShot)).toMatchObject({ images: 1, lines: [""], literal: [shot] });
+    expect(wholePaste(match, [`  ${shot} `], isShot)).toMatchObject({ images: 1 });
+    expect(uploadAlone(match, [windows], isShot)).toMatchObject({ images: 1 });
+    for (const box of ["[Image #1]", " [Image #12] ", "[Ima ge #1]", shot, `${shot.slice(0, 40)} ${shot.slice(40)}`]) {
+      expect(boxMatches(box, "", alone?.lines ?? [], collapse, alone)).toBe(true);
+    }
+    for (const box of ["", "[Image #1] x", "[Image #1][Image #2]", `[Image #1]${shot}`, "[Pasted text #1]", "[Image #1][Pasted text #2]", `${shot} x`, shot.slice(1)]) {
+      expect(boxMatches(box, "", alone?.lines ?? [], collapse, alone)).toBe(false);
+    }
+    // Add to a draft: the draft, then either form.
+    expect(boxMatches("draft [Image #1]", "draft", alone?.lines ?? [], collapse, alone)).toBe(true);
+    expect(boxMatches(`draft ${shot}`, "draft", alone?.lines ?? [], collapse, alone)).toBe(true);
+    // Not alone: words around the path, two lines, a missing file, another image path, no image token.
+    expect(uploadAlone(match, [`see ${shot}`], isShot)).toBeNull();
+    expect(wholePaste(match, [`see ${shot}`], isShot)).toBeNull();
+    expect(uploadAlone(match, [shot, "b"], isShot)).toBeNull();
+    expect(uploadAlone(match, ["/srv/collie/uploads/_0-mvu6nr4p-ffffffff.png"], isShot)).toBeNull();
+    expect(uploadAlone(match, ["/srv/shots/a.png"], isShot)).toBeNull();
+    expect(uploadAlone(match, ["/srv/collie/uploads/_0-mvu6nr4p-8ab21b25.txt"], () => true)).toBeNull();
+    expect(uploadAlone(match === null ? null : { ...match, profile: { ...match.profile, paste: { bracketed: true } } }, [shot], isShot)).toBeNull();
+    expect(uploadAlone(null, [shot], isShot)).toBeNull();
+    // A path inside a short line is compared as written: the literal text, never an image form.
+    expect(boxMatches(`see ${shot}`, "", [`see ${shot}`], collapse, null)).toBe(true);
+    expect(boxMatches("[Image #1]see", "", [`see ${shot}`], collapse, null)).toBe(false);
   });
 
   test("wholePaste: only a profile that measured it, only a long or multi-line text without a reserved lead, upload images taken off", () => {
@@ -3500,7 +3755,7 @@ describe("pure helpers", () => {
     expect(wholePaste(match, ["a", "b"], isShot)).toMatchObject({ images: 0, lines: ["a", "b"] });
     for (const lead of ["/", "!", "@"]) expect(wholePaste(match, [`${lead}x`, "b"], isShot)).toBeNull();
     expect(wholePaste(match, ["see", shot], isShot)).toMatchObject({ images: 1, lines: ["see"] });
-    expect(wholePaste(match, [`see ${shot}`, "b"], isShot)).toMatchObject({ images: 1, lines: ["see", "b"] });
+    expect(wholePaste(match, [`see ${shot}`, "b"], isShot)).toMatchObject({ images: 1, lines: ["see", "b"], literal: [`see ${shot}`, "b"] });
     expect(wholePaste(match, [`see ${shot} here`, "b"], isShot)).toMatchObject({ images: 0 });
     expect(wholePaste(match, ["see /srv/collie/uploads/w1_p1-mf3x9q-ffffffff.jpg", "b"], isShot)).toMatchObject({ images: 0 });
     // Any other image file on the disk stays text: only Collie's own upload shape is taken off.
@@ -3751,6 +4006,45 @@ describe("real screens from the fixture corpus", () => {
       expect(answer.cause).toBe("notice_key");
       expect(answer.offers).toEqual(["commit", "keys"]);
       expect(captured.pane.calls).toEqual([]);
+    });
+  }
+
+  const AUTH_BOX_FIXTURES = [
+    "claude--v2307-auth-refresh-before-output--w61.txt",
+    "claude--v2307-auth-refresh-output--w61.txt",
+    "claude--v2309-auth-refresh-locked--w120.txt",
+    "claude--v2309-auth-refresh-locked--w52.txt",
+    "claude--v2309-auth-refresh-locked--w80.txt",
+    "claude--v2309-auth-refresh-output--w40.txt",
+    "claude--v2309-auth-refresh-output--w52.txt",
+    "claude--v2309-auth-refresh-output--w64.txt",
+    "claude--v2309-auth-refresh-output--w120.txt",
+  ];
+
+  function authBoxRowsOf(name: string): string[] {
+    const rows = splitLines(parseAnsi(fixture(name))).map((line) => lineText(line).trimEnd());
+    const top = rows.findIndex((row) => row.startsWith("╭"));
+    const bottom = rows.findIndex((row, i) => i > top && row.startsWith("╰"));
+    return rows.slice(top, bottom + 1);
+  }
+
+  for (const name of AUTH_BOX_FIXTURES) {
+    test(`over the Authentication box in ${name}: hello and 1 go on one tap`, async () => {
+      for (const text of ["hello", "1"]) {
+        const { pane, send } = rig();
+        pane.over = authBoxRowsOf(name);
+        const answer = await send(text);
+        expect(answer.receipt, text).toMatchObject({ outcome: "sent" });
+        expect(answer.cause, text).toBeUndefined();
+        expect(pane.transcript.at(-1)).toBe(`> ${text}`);
+      }
+    });
+
+    test(`a capture of the Authentication box in ${name} reads free at the first look`, async () => {
+      const { protocol } = rig({ pane: still(fixture(name)) });
+      const prepared = await protocol.handle({ id: "fixture-auth-box", text: "", mode: "prepare" }, { session: "main", paneId: "%1", harness: "claude" });
+      expect(prepared.surface).toMatchObject({ turn: "idle", modal: "none", composer: "empty" });
+      expect(prepared.offers).toEqual([]);
     });
   }
 
@@ -7513,6 +7807,26 @@ describe("omp 18.11's box composer (issue 497)", () => {
     return { answer, pane };
   };
 
+  // M78 spec 06, pinned and not fixed: on a read with no styling (herdr-core) omp's ghost word `ed` has
+  // no grey to mark it, so S1 reads `please pushed` after `please push` was typed. The box holds more than
+  // was typed and the send stops before its submit key, the text left in the box for the person.
+  test("the ghost word on a read with no styling: typed_not_submitted, no submit key (M78 spec 06, pinned)", async () => {
+    const name = "omp--v18-11-ghost-word--w130.txt";
+    const pane = new FakePane("generic");
+    const { send } = rig({ pane, harness: "omp", version: VERSION });
+    scene(pane, name, "please push");
+    const styled = pane.beforeRead!;
+    pane.beforeRead = async (p, n) => {
+      await styled(p, n);
+      if (p.fixed !== null) p.fixed = p.fixed.split("\n").map(plain).join("\n");
+    };
+    const answer = await send("please push");
+    expect(answer.receipt).toMatchObject({ outcome: "typed_not_submitted", reason: "mismatch", keys: ["probe", "Backspace"] });
+    expect(pane.keysSeen).not.toContain("ctrl+q");
+    expect(pane.keysSeen).not.toContain("Enter");
+    expect(pane.box).toBe("please push");
+  });
+
   test("a wrapped 202-character line, at 130 and at 80 columns: sent with ctrl+q", async () => {
     for (const w of [130, 80]) {
       const { answer, pane } = await sendOn(`omp--v18-11-nerd-box-wrapped--w${String(w)}.txt`, WRAP, "send");
@@ -10239,6 +10553,142 @@ describe("a command on a fresh Codex 0.163.0 screen, whose welcome picture hides
     const pane = welcome();
     const answer = await rig({ pane, harness: "codex", version: "0.163.0", edit: noLosesText }).send("/status", { mode: "command" });
     expect(answer.receipt).toMatchObject({ outcome: "typed_not_submitted", reason: "changed" });
+    expect(pane.keysSeen).not.toContain("Enter");
+  });
+});
+
+describe("a probed message into a tall Codex 0.166.0 pane (harness lab drift, 2026-10-29)", () => {
+  // eslint-disable-next-line no-control-regex
+  const plain = (row: string): string => row.replace(/\u001b\[[0-9;:?]*[ -/]*[@-~]/gu, "");
+  const pane = (name: string): string[] => readFileSync(join(import.meta.dirname, "..", "..", "web", "src", "fixtures", "panes", name), "utf8").replace(/\n$/u, "").split("\n");
+  /**
+   * The captures as Codex draws them: `empty` until the first key, `typed` with its box row redrawn while
+   * the box holds text, and `back` once the box is empty again (the logo returns after the probe's Backspace).
+   */
+  const codex0166 = (empty: string, typed: string, back: string): FakePane => {
+    const before = pane(empty);
+    const holding = pane(typed);
+    const after = pane(back);
+    const at = holding.findLastIndex((row) => plain(row).startsWith("› "));
+    const fake = new FakePane("codex");
+    let touched = false;
+    fake.afterInput = () => {
+      touched = true;
+    };
+    fake.render = () => (fake.box !== "" ? holding.map((row, i) => (i === at ? `\u001b[1m›\u001b[0m ${fake.box}` : row)) : touched ? after : before).join("\n");
+    return fake;
+  };
+  const logo = (): FakePane => codex0166("codex--v0166-art-empty--w120.txt", "codex--v0166-art-typed--w120.txt", "codex--v0166-art-backspace--w120.txt");
+  const warning = (): FakePane => codex0166("codex--v0166-warning-art-empty--w120.txt", "codex--v0166-warning-typed--w120.txt", "codex--v0166-warning-art-empty--w120.txt");
+  const noLosesText = (profile: Profile): Profile => ({ ...profile, idle: { ...profile.idle, volatile: { ...profile.idle.volatile, above: { maxRows: profile.idle.volatile.above.maxRows } } } });
+  /** The Codex profile as it was before the warning row of its own took a hint. */
+  const noWarningHint = (profile: Profile): Profile => ({
+    ...profile,
+    idle: {
+      ...profile.idle,
+      volatile: { ...profile.idle.volatile, below: { ...profile.idle.volatile.below, hints: (profile.idle.volatile.below.hints ?? []).filter((hint) => !hint.includes("⚠")) } },
+    },
+  });
+
+  test("the 17-row logo hides at the probe character and returns after Backspace: the rows above only lost text, so the probe passes and Tab sends", async () => {
+    const fake = logo();
+    const answer = await rig({ pane: fake, harness: "codex", version: "0.166.0" }).send("reply with one word: ready");
+    expect(answer.receipt).toMatchObject({ outcome: "sent", profileStatus: "provisional", keys: ["probe", "Backspace", "Tab"] });
+    expect(fake.transcript.at(-1)).toBe("› reply with one word: ready");
+  });
+
+  test("a message's probe reads only the box and the rows under it (Codex takes text in a turn): the logo is no factor, with or without losesText", async () => {
+    const answer = await rig({ pane: logo(), harness: "codex", version: "0.166.0", edit: noLosesText }).send("reply with one word: ready");
+    expect(answer.receipt).toMatchObject({ outcome: "sent", keys: ["probe", "Backspace", "Tab"] });
+  });
+
+  test("a command compares the rows above too: the logo only lost its rows (idle.volatile.above.losesText), so /status goes in", async () => {
+    const fake = logo();
+    const answer = await rig({ pane: fake, harness: "codex", version: "0.166.0" }).send("/status", { mode: "command" });
+    expect(answer.receipt).toMatchObject({ outcome: "sent", keys: ["probe", "Backspace", "Enter"] });
+  });
+
+  test("without losesText the logo going reads as a moved screen for a command, and its probe is refused", async () => {
+    const fake = logo();
+    const answer = await rig({ pane: fake, harness: "codex", version: "0.166.0", edit: noLosesText }).send("/status", { mode: "command" });
+    expect(answer.receipt).toMatchObject({ outcome: "refused", reason: "probe_failed" });
+    expect(fake.keysSeen).not.toContain("Enter");
+  });
+
+  test("a lone `⚠ 1 warning · f2 to view` row under the box once it holds text is a hint, so the probe passes and Tab sends", async () => {
+    const fake = warning();
+    const answer = await rig({ pane: fake, harness: "codex", version: "0.166.0" }).send("reply with one word: ready");
+    expect(answer.receipt).toMatchObject({ outcome: "sent", profileStatus: "provisional", keys: ["probe", "Backspace", "Tab"] });
+    expect(fake.transcript.at(-1)).toBe("› reply with one word: ready");
+  });
+
+  test("without the warning hint the lone warning row counts as a screen that moved, and the probe is refused, as it was in the lab", async () => {
+    const fake = warning();
+    const answer = await rig({ pane: fake, harness: "codex", version: "0.166.0", edit: noWarningHint }).send("reply with one word: ready");
+    expect(answer.receipt).toMatchObject({ outcome: "refused", reason: "probe_failed" });
+    expect(fake.keysSeen.filter((key) => key === "Tab" || key === "Enter")).toEqual([]);
+  });
+
+  test("the warning hint takes the full and the narrow notice, and no other row", () => {
+    const hints = (loadProfiles().get("codex")?.idle.volatile.below.hints ?? []).map((source) => new RegExp(source, "u"));
+    const isHint = (row: string): boolean => hints.some((hint) => hint.test(row));
+    expect(isHint(`${" ".repeat(95)}⚠ 1 warning · f2 to view`)).toBe(true);
+    expect(isHint(`${" ".repeat(20)}⚠ 12 warnings · f2 to view`)).toBe(true);
+    expect(isHint("  ⚠ 1 · f2")).toBe(true);
+    expect(isHint("  ⚠ 1 warning · f2 to view the diff")).toBe(false);
+    expect(isHint("  GPT-6.1-Sol default · ~/project")).toBe(false);
+    expect(isHint("  ⚠ Heads up, you have less than 5% of your weekly limit left")).toBe(false);
+  });
+});
+
+// Live check 2026-10-30, Claude Code 2.1.312 over tmux (release 1.25.0): a fresh pane draws a usage
+// row under the footer (claude--v2312-weekly-limit-row--w120) and drops it once the box holds two
+// rows. The rows under the box went from 2 to 1, and the send ended typed_not_submitted (changed),
+// keys probe, Backspace, ctrl+j, ctrl+j. The profile names the row a hint (`idle.volatile.below.hints`).
+describe("the usage-limit row under a fresh Claude Code box (2.1.312)", () => {
+  const FOOTER = "  ⏸ manual mode on · ? for shortcuts";
+  const LIMIT = "   You've used 75% of your weekly limit · resets Nov 4, 2am (Europe/Lisbon) · /usage-credits to keep using Claude Code";
+  /** The row stands at S0 and through the probe, and goes when the box grows to a second row, as live. */
+  const fresh = (pane: FakePane): void => {
+    pane.status = [FOOTER, LIMIT];
+    pane.afterInput = (p) => {
+      p.status = p.box === "" ? [FOOTER, LIMIT] : p.box.includes("\n") ? ["  ⏸ manual mode on                ctrl+g to edit in VS Code"] : ["  ⏸ manual mode on", LIMIT];
+    };
+  };
+  const text = "also mobile looks off\n\nmenu should be centered";
+
+  test("the row present at S0 and gone after the probe: sent", async () => {
+    const pane = new FakePane("claude");
+    fresh(pane);
+    const { send } = rig({ pane });
+    expect((await send(text)).receipt).toMatchObject({ outcome: "sent", keys: ["ctrl+j", "ctrl+j", "Enter"] });
+    expect(pane.transcript.at(-1)).toBe("> also mobile looks off  menu should be centered");
+  });
+
+  test("the row gone at the first character: sent", async () => {
+    const pane = new FakePane("claude");
+    pane.status = [FOOTER, LIMIT];
+    pane.statusWithText = ["  ⏸ manual mode on"];
+    const { send } = rig({ pane });
+    expect((await send("hello there")).receipt).toMatchObject({ outcome: "sent" });
+  });
+
+  test("without the profile's hint the same pair ends typed_not_submitted (changed): the defect", async () => {
+    const pane = new FakePane("claude");
+    fresh(pane);
+    const { send } = rig({ pane, edit: (profile) => ({ ...profile, idle: { ...profile.idle, volatile: { ...profile.idle.volatile, below: { ...profile.idle.volatile.below, hints: [] } } } }) });
+    expect((await send(text)).receipt).toMatchObject({ outcome: "typed_not_submitted", reason: "changed" });
+    expect(pane.keysSeen).not.toContain("Enter");
+  });
+
+  test("a row that is no hint still counts: a new row under the box keeps Enter back", async () => {
+    const pane = new FakePane("claude");
+    fresh(pane);
+    pane.afterInput = (p) => {
+      p.status = p.box.includes("\n") ? [FOOTER, LIMIT, "  Do you want to proceed?"] : [FOOTER, LIMIT];
+    };
+    const { send } = rig({ pane });
+    expect((await send(text)).receipt?.outcome).toBe("typed_not_submitted");
     expect(pane.keysSeen).not.toContain("Enter");
   });
 });

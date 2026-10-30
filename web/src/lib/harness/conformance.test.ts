@@ -29,6 +29,14 @@ const PANES_DIR = join(import.meta.dirname, "..", "..", "fixtures", "panes");
 // `claude--working.txt` left this set on 2026-10-19: the rating survey over its box is a notice now
 // (ADR 0109), and lifts its card.
 const NEUTRAL = new Set([
+  // herdr-core captures (M78 spec 04), plain text: an empty box, a draft, two paragraphs and a running
+  // turn, each under a live box. Composer chrome, never a dialog.
+  "claude--v21314-core-idle--w120.txt",
+  "claude--v21314-core-idle--w60.txt",
+  "claude--v21314-core-draft--w120.txt",
+  "claude--v21314-core-draft--w60.txt",
+  "claude--v21314-core-draft-two-paragraphs--w120.txt",
+  "claude--v21314-core-working--w120.txt",
   // The default footer's own hints ("esc to interrupt", "↓ to manage") sit under a live box.
   "claude--working-esc-to-interrupt.txt",
   "claude--idle-background-shell.txt",
@@ -123,6 +131,10 @@ const NEUTRAL = new Set([
   "claude--v2301-usage-panel-over-box--w82.txt",
   "claude--v2301-working-draft--w100.txt",
   "claude--v2301-working-queued-message--w100.txt",
+  // Claude Code 2.1.312: a two-paragraph draft with an upload path kept as text (2026-10-30 lab). A draft, no dialog.
+  "claude--v2312-draft-upload-path--w100.txt",
+  // Claude Code 2.1.312: a fresh empty box with the usage row under its footer (live check 2026-10-30). No dialog.
+  "claude--v2312-weekly-limit-row--w120.txt",
   // Claude Code 2.1.309 after Escape and after a refused permission (live rerun 2026-10-23):
   // `Interrupted · What should Claude do instead?` over an empty box. An ordinary box, no dialog.
   "claude--v2-1-309-interrupted--w120.txt",

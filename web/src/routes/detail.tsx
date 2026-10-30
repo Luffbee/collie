@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef } from "react";
-import { useLoaderData, useLocation, useParams } from "react-router";
+import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useLoaderData, useLocation, useMatch, useParams } from "react-router";
 
 import { AgentChat } from "@/components/agent-chat";
 import { WalkyLogProvider } from "@/components/walky-log";
@@ -13,7 +13,8 @@ import { usePaneFold } from "@/hooks/use-fold-posture";
 import { useWidthClass } from "@/hooks/use-width-class";
 import { type PaneData } from "@/lib/loaders";
 import { GLIDE_PAIRS, glideBack } from "@/lib/glide";
-import { canStepBack, homePath, panePath, readFrom, upTarget } from "@/lib/nav";
+import { canStepBack, homePath, panePath, readFrom, upTarget, zoomPath } from "@/lib/nav";
+import { readAgentLaunch } from "@/lib/agent-startup";
 import { paneScopeKey } from "@/lib/scope";
 import { findPane, paneScope } from "@/lib/hosts";
 import { setStatus } from "@/lib/status";
@@ -47,8 +48,8 @@ export function DetailRoute() {
   const fold = usePaneFold(widthClass);
 
   // SAFETY: `location.state` is whatever the navigation that got here attached — `unknown` by
-  // definition. The only shape Collie ever puts there is `{ freshPane }` (components/agent-list's
-  // optimistic open), and the optional chain means any other state reads as "not carried".
+  // definition. Collie puts `{ freshPane }` there (components/agent-list's optimistic open), beside
+  // an agent launch's intent, and the optional chain means any other state reads as "not carried".
   const fresh = (location.state as { freshPane?: AgentView } | null)?.freshPane;
   const inSnapshot =
     root.agents.some((a) => a.paneId === paneId) ||
@@ -65,6 +66,17 @@ export function DetailRoute() {
   const seenPaneId = useRef<string | null>(null);
   if (inSnapshot) seenPaneId.current = paneId;
   const seen = seenPaneId.current === paneId;
+  // A launch the phone started keeps Send gated until the agent's first screen is read (AgentChat).
+  // Once it is, the intent is retired from this entry, so Back and Forward never gate the pane again.
+  const agentLaunch = readAgentLaunch(location.state, paneId, scope);
+  const launchReady = useCallback(() => {
+    // SAFETY: the same `location.state` the launch above was read from; only its intent is dropped,
+    // so the optimistic row stays and `side` carries `from` over.
+    const state = location.state as { agentLaunch?: unknown; freshPane?: AgentView } | null;
+    if (state?.agentLaunch === undefined) return;
+    const { agentLaunch: _retired, ...rest } = state;
+    nav.side(`${location.pathname}${location.search}`, rest);
+  }, [location.state, location.pathname, location.search, nav]);
 
   // Looked up WITHIN the scope's host: `w1:p1` exists on every machine in a crew, so a match by id
   // alone could hand this view another machine's pane — rendering its space, tab and cwd around a
@@ -88,9 +100,20 @@ export function DetailRoute() {
   // transient poll failure or reconnect doesn't evict a still-valid pane. Up, not a replace onto
   // Home: the dead pane must not stay in history for the next swipe to land on (ADR 0067). Once per
   // pane, because an up can be a step back, and a second one would climb a level too far.
+  //
+  // From the zoomed output the first up only closes it, back onto this pane, and is not counted: the
+  // effect runs again on the pane itself and climbs from there.
+  //
+  // The output, zoomed (`/pane/:id/zoom`, a child of this route): opening it is a step down, its ✕ an
+  // up, so the ✕ steps back onto this pane and the phone's back does the same (ADR 0067).
+  const zoomed = useMatch("/pane/:paneId/zoom") !== null;
   const exited = useRef<string | null>(null);
   useEffect(() => {
     if (gone && root.bridge === "connected" && !root.error && exited.current !== paneId) {
+      if (zoomed) {
+        nav.up(panePath(paneId, scope));
+        return;
+      }
       exited.current = paneId;
       // The operator did not close this pane from this phone. It went away under them — from
       // another device, from the terminal itself, or because the agent exited — and a poll is what
@@ -99,7 +122,7 @@ export function DetailRoute() {
       setStatus("Pane closed", "info");
       nav.up(homePath(scope));
     }
-  }, [gone, root.bridge, root.error, nav, scope, paneId]);
+  }, [gone, root.bridge, root.error, nav, scope, paneId, zoomed]);
 
   // Up one level: to the space or the dashboard the pane was opened from (ADR 0067). A pane with no screen
   // is a durable program's conversation, and its way up is the machine's home, which is the conversation
@@ -142,6 +165,8 @@ export function DetailRoute() {
         paneId={paneId}
         scope={scope}
         agent={agent}
+        agentLaunch={agentLaunch}
+        onLaunchReady={launchReady}
         agents={root.agents}
         shellPanes={root.shellPanes}
         tabs={root.tabs}
@@ -160,6 +185,11 @@ export function DetailRoute() {
         // The pane's read got no answer and the phone keeps no text for it.
         noSavedCopy={pane.error && pane.text === ""}
         onBack={up}
+        zoom={{
+          open: zoomed,
+          onOpen: () => nav.down(zoomPath(paneId, scope)),
+          onClose: () => nav.up(panePath(paneId, scope)),
+        }}
         onBackArrow={backArrow}
         inStrip={widthClass !== "compact"}
         // Tabletop: the belt and the reply box stand in the bottom segment, under the fold.

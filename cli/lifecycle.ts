@@ -1,15 +1,18 @@
 import { join } from "node:path";
 
 import type { Host } from "../bridge/host.ts";
+import type { CrewMode } from "../bridge/types.ts";
 import { ensureBuild } from "./build.ts";
 import { collieVersion, type CliContext, type Environment, type EnvVars } from "./context.ts";
 import { binaryLayout, publishedRoot } from "./install-kind.ts";
 import { EXIT, type Io } from "./io.ts";
 import type { LinkReader } from "./link.ts";
-import { ensureMuxChosen } from "./mux.ts";
+import { ensureMuxChosen, pickHostOf } from "./mux.ts";
+import { resolveMux } from "../bridge/mux/herdr-core/pick.ts";
 import type { StatusView, Ui } from "./render.ts";
-import { cmdUnserve, crewModeOnDisk, type ServeDeps } from "./serve.ts";
-import { SETUP_CLOSING, setupFindings, setupLines } from "./setup-findings.ts";
+import { censusLines, type CensusReader } from "./census.ts";
+import { cmdServeStatus, cmdUnserve, crewModeOnDisk, type ServeDeps } from "./serve.ts";
+import { phoneBlocked, SETUP_CLOSING, setupFindings, setupLines } from "./setup-findings.ts";
 import { pairedRegistryOf } from "./pairing.ts";
 import { type Exec, type Files, PROCESS_QUERY_SLOW_START_MS, type ProcessLookup, type ProcessRow } from "./sys.ts";
 import {
@@ -30,6 +33,7 @@ import {
   dialableBridgeHost,
   localBridgeHostPort,
   localBridgeUrl,
+  TAILNET_NAME_UNAVAILABLE,
   tailnetHosts,
 } from "./tailnet.ts";
 import {
@@ -1106,25 +1110,29 @@ async function launchBridge(deps: LifecycleDeps): Promise<number> {
   // `serve` reports its own reason, and says itself when it publishes nothing on purpose
   // (`COLLIE_SKIP_SERVE=1`, a crew peer). Every supervisor takes this path, Task Scheduler too:
   // since 2026-10-28 Windows publishes through the same `cli/serve.ts` (ADR 0075, addendum).
-  if ((await deps.serve(deps.io)) !== EXIT.OK) {
+  const doorUp = (await deps.serve(deps.io)) === EXIT.OK;
+  if (!doorUp) {
     deps.io.err(
       `note: the tailnet front door did not come up; the bridge is still on ${localBridgeHostPort(deps.ctx.env, deps.ctx.port)}`,
     );
   }
-  await printStatusBanner(deps);
+  await printStatusBanner(deps, { doorUp });
   return EXIT.OK;
 }
 
 /**
  * Print each setup row that needs the operator, as the lines of {@link setupLines}. Returns whether
- * any row printed, so `cmdStart` can close with {@link SETUP_CLOSING} after the banner. Nothing is
- * printed when every row is fine. `skipped` rows stay with `doctor`: they are a check that could not
- * run, or a front door the operator chose not to use, and neither is something to fix.
+ * the PHONE is blocked ({@link phoneBlocked}: a Tailscale row is open), so `cmdStart` can close with
+ * {@link SETUP_CLOSING} after the banner. Every open row prints, `path-link` and `mux` too, but only
+ * a Tailscale row makes the closing sentence true. Nothing is printed when every row is fine.
+ * `skipped` rows stay with `doctor`: they are a check that could not run, or a front door the
+ * operator chose not to use, and neither is something to fix.
  */
 function reportSetup(deps: LifecycleDeps): boolean {
-  const open = setupFindings(deps).filter((f) => f.status === "warn" || f.status === "error");
+  const findings = setupFindings(deps);
+  const open = findings.filter((f) => f.status === "warn" || f.status === "error");
   for (const f of open) for (const line of setupLines(f)) deps.io.err(line);
-  return open.length > 0;
+  return phoneBlocked(findings, deps.host);
 }
 
 export async function cmdStop(deps: LifecycleDeps, verb: StopVerb = "stop"): Promise<number> {
@@ -1205,20 +1213,37 @@ export async function cmdRestart(deps: LifecycleDeps): Promise<number> {
   return startBridge(deps);
 }
 
-export async function cmdStatus(deps: LifecycleDeps): Promise<number> {
-  await printStatusBanner(deps);
-  if (deps.ctx.env.COLLIE_SKIP_SERVE === "1") {
-    deps.io.out("  serve config: skipped (COLLIE_SKIP_SERVE=1)");
+/**
+ * `collie status`: the head (the banner), then the census (members, devices, agent sessions).
+ *
+ * `--verbose` adds the `tailscale serve` dump after the census, which is also what `collie serve
+ * status` prints on its own. It used to be there always, and on a machine that runs eight instances
+ * it was most of the screen. `census` is the reader that fills the three blocks; absent, the head
+ * prints alone (the lifecycle tests that pin the banner pass none).
+ *
+ * `--json` keeps every key it ever had and adds `census`. It is stdout and nothing else: a program
+ * reads it.
+ */
+export async function cmdStatus(
+  deps: LifecycleDeps,
+  args: readonly string[] = [],
+  census: CensusReader | null = null,
+): Promise<number> {
+  const facts = await statusFacts(deps);
+  if (args.includes("--json")) {
+    const body = statusJson(facts);
+    const read = census === null ? null : await census({ running: facts.running, crew: facts.crew });
+    deps.io.out(JSON.stringify(read === null ? body : { ...body, census: read }));
     return EXIT.OK;
   }
-  deps.io.out("  serve config:");
-  const r = deps.exec.capture("tailscale", ["serve", "status"]);
-  if (r.found && r.code === 0) {
-    for (const line of r.stdout.replace(/\n$/, "").split("\n")) {
-      if (line !== "") deps.io.out(`    ${line}`);
-    }
+  await printStatusBanner(deps, {}, facts);
+  if (census !== null) {
+    const read = await census({ running: facts.running, crew: facts.crew });
+    for (const line of censusLines(read, facts.crew)) deps.io.out(line);
+    deps.io.out("");
   }
-  return EXIT.OK;
+  if (!args.includes("--verbose")) return EXIT.OK;
+  return cmdServeStatus(deps);
 }
 
 export function cmdUrl(deps: LifecycleDeps): number {
@@ -1296,41 +1321,40 @@ export async function statusBanner(deps: LifecycleDeps): Promise<string[]> {
   return bannerLines(await statusView(deps));
 }
 
+/** What the caller knows that the banner cannot read off the machine. */
+export interface StatusOptions {
+  /**
+   * False when `start` just tried to publish the front door and it did not come up. The `tailnet` row
+   * then says so, because the address it would print is not served. Absent reads as true: `status`
+   * and every other caller describe a door they did not just try to open.
+   */
+  readonly doorUp?: boolean;
+}
+
 /**
  * The banner as a value: one verdict and a label/value block. Both renderings read this — the plain
  * lines below, and the boxed terminal view in `cli/ui/` — so "is it up", the instance, the service
  * and the URLs can never say two different things depending on where you looked.
  */
-export async function statusView(deps: LifecycleDeps): Promise<StatusView> {
-  const version = collieVersion(deps.ctx.root);
-  // The bridge does not always bind loopback (a peer sets COLLIE_HOST to its tailnet address — the
-  // documented Variant-E shape). Probing 127.0.0.1 there would find nothing home and print "isn't
-  // answering" against a bridge that is in fact up; probe — and, in the warning, name — whatever
-  // address it actually bound.
-  //
-  // Resolved ONCE, through F13's `dialableBridgeHost`, which is also what the `local` row three
-  // lines down reads: the two halves of this banner must never name two different addresses, and a
-  // WILDCARD bind has to probe loopback rather than the literal `0.0.0.0` the operator wrote.
-  //
-  // It reads the env as it stands NOW. `collie leave` rewrites COLLIE_HOST out of both the `.env`
-  // and this process's env before it restarts (F12/F22), so the banner that closes a tear-down
-  // describes the machine the tear-down left behind — not the peer it used to be.
-  const host = dialableBridgeHost(deps.ctx.env);
-  const probedAddress = host === "127.0.0.1" ? `:${deps.ctx.port}` : `${host}:${deps.ctx.port}`;
-  const running = await deps.ready(deps.ctx.port, host);
+export async function statusView(
+  deps: LifecycleDeps,
+  options: StatusOptions = {},
+  known?: StatusFacts,
+): Promise<StatusView> {
+  const facts = known ?? (await statusFacts(deps));
   const rows: { label: string; value: string }[] = [];
   // Only a suffixed instance says so — a solo host's banner is unchanged, and on a host running two
   // this is the line that says WHICH Collie answered (the unit name on the next line agrees).
-  if (deps.ctx.instance !== null) rows.push({ label: "instance", value: deps.ctx.instance });
-  rows.push({ label: "service", value: serviceDescription(deps) });
+  if (facts.instance !== null) rows.push({ label: "instance", value: facts.instance });
+  rows.push({ label: "service", value: facts.service });
+  rows.push({ label: "mux", value: muxRowValue(facts) });
   // F13: the address the bridge BOUND, not a hardcoded loopback string — see `localBridgeUrl`.
   // A peer's main listener is mutual TLS only (ADR 0013), so an `http://` address there never
   // answers. Name it as the crew link it is.
-  const isPeer = crewModeOnDisk(deps) === "peer";
-  const localUrl = localBridgeUrl(deps.ctx.env, deps.ctx.port);
+  const isPeer = facts.crew === "peer";
   rows.push({
     label: "local",
-    value: isPeer ? `${localUrl.replace(/^http:/, "https:")} (crew link, mutual TLS only)` : localUrl,
+    value: isPeer ? `${facts.localUrl.replace(/^http:/, "https:")} (crew link, mutual TLS only)` : facts.localUrl,
   });
   // The front-door row, and the one machine that has no front door to describe. A PEER publishes
   // none (ADR 0013) — `cmdServe` refuses the publish and says so — so a `tailnet` row here was a row
@@ -1340,27 +1364,156 @@ export async function statusView(deps: LifecycleDeps): Promise<StatusView> {
   // do I point my phone?" still has an answer on a peer: the lead's (F24).
   if (isPeer) {
     rows.push({ label: "crew", value: "peer — no front door here; the lead's door serves the crew (ADR 0013)" });
-  } else if (deps.ctx.env.COLLIE_SKIP_SERVE === "1") {
-    const url = configuredPublicUrl(deps.ctx.env);
+  } else if (facts.skipServe) {
     rows.push({
       label: "proxy",
-      value: url ?? "(COLLIE_SKIP_SERVE=1 — set COLLIE_PUBLIC_URL to your reverse-proxy URL)",
+      value: facts.publicUrl ?? "(COLLIE_SKIP_SERVE=1 — set COLLIE_PUBLIC_URL to your reverse-proxy URL)",
     });
   } else {
-    rows.push({ label: "tailnet", value: bridgeUrl(deps.exec, deps.ctx) });
+    const url = facts.tailnetUrl ?? "";
+    rows.push({ label: "tailnet", value: options.doorUp === false ? `${url} (not published yet, see the lines above)` : url });
   }
   // Pairing is always on (ADR 0086): with nothing paired the URL above opens onto a pair screen and
   // nothing else, so the first start says what to run. Only then: a paired install's banner is
   // unchanged, and a peer has no door of its own to pair against.
-  if (crewModeOnDisk(deps) !== "peer" && pairedRegistryOf(deps.files, deps.ctx.stateDir).devices.length === 0) {
+  if (!isPeer && facts.pairedDevices === 0) {
     rows.push({ label: "pairing", value: "no device paired yet — run `collie pair` to pair your phone" });
   }
   return {
-    running,
-    headline: running
-      ? `✓ Collie is running  ·  v${version}`
-      : `⚠ Collie isn't answering on ${probedAddress} yet (v${version}) — check 'collie logs'`,
+    running: facts.running,
+    headline: facts.running
+      ? `✓ Collie is running  ·  v${facts.version}`
+      : `⚠ Collie isn't answering on ${facts.probedAddress} yet (v${facts.version}) — check 'collie logs'`,
     rows,
+  };
+}
+
+/**
+ * What the banner and `status --json` both say, read once. The banner's words are built from this in
+ * {@link statusView}; the JSON in {@link statusJson}. Neither reads the machine on its own, so the
+ * two can never describe two different bridges.
+ */
+export interface StatusFacts {
+  readonly running: boolean;
+  readonly version: string;
+  readonly instance: string | null;
+  readonly port: number;
+  /** `:8787` on loopback, `<host>:8787` on any other bind: what the cold headline names. */
+  readonly probedAddress: string;
+  readonly localUrl: string;
+  readonly service: string;
+  readonly crew: CrewMode;
+  readonly skipServe: boolean;
+  /** `COLLIE_PUBLIC_URL`, read only under `COLLIE_SKIP_SERVE=1` (the proxy row). */
+  readonly publicUrl: string | null;
+  /** `bridgeUrl`, asked only when Collie publishes the door itself and this is not a peer. */
+  readonly tailnetUrl: string | null;
+  readonly pairedDevices: number;
+  /** The multiplexer this instance drives, resolved as the bridge resolves it at boot. */
+  readonly mux: string;
+  /** Why {@link mux} was picked with no `COLLIE_MUX`, or `null` when it was named or is the default. */
+  readonly muxPickedBecause: string | null;
+  /** Why a herdr-core socket that is present was not picked, or `null`. */
+  readonly muxNotPickedBecause: string | null;
+  /** Did `COLLIE_MUX` name {@link mux}? */
+  readonly muxNamed: boolean;
+}
+
+async function statusFacts(deps: LifecycleDeps): Promise<StatusFacts> {
+  const version = collieVersion(deps.ctx.root);
+  // The bridge does not always bind loopback (a peer sets COLLIE_HOST to its tailnet address — the
+  // documented Variant-E shape). Probing 127.0.0.1 there would find nothing home and print "isn't
+  // answering" against a bridge that is in fact up; probe — and, in the warning, name — whatever
+  // address it actually bound.
+  //
+  // Resolved ONCE, through F13's `dialableBridgeHost`, which is also what the `local` row reads:
+  // the two halves of this banner must never name two different addresses, and a WILDCARD bind has
+  // to probe loopback rather than the literal `0.0.0.0` the operator wrote.
+  //
+  // It reads the env as it stands NOW. `collie leave` rewrites COLLIE_HOST out of both the `.env`
+  // and this process's env before it restarts (F12/F22), so the banner that closes a tear-down
+  // describes the machine the tear-down left behind — not the peer it used to be.
+  const host = dialableBridgeHost(deps.ctx.env);
+  const probedAddress = host === "127.0.0.1" ? `:${deps.ctx.port}` : `${host}:${deps.ctx.port}`;
+  const running = await deps.ready(deps.ctx.port, host);
+  const service = serviceDescription(deps);
+  const crew = crewModeOnDisk(deps);
+  const skipServe = deps.ctx.env.COLLIE_SKIP_SERVE === "1";
+  const asksTailnet = crew !== "peer" && !skipServe;
+  return {
+    running,
+    version,
+    instance: deps.ctx.instance,
+    port: deps.ctx.port,
+    probedAddress,
+    localUrl: localBridgeUrl(deps.ctx.env, deps.ctx.port),
+    service,
+    crew,
+    skipServe,
+    publicUrl: skipServe ? configuredPublicUrl(deps.ctx.env) : null,
+    tailnetUrl: asksTailnet ? bridgeUrl(deps.exec, deps.ctx) : null,
+    pairedDevices: crew === "peer" ? 0 : pairedRegistryOf(deps.files, deps.ctx.stateDir).devices.length,
+    ...statusMux(deps),
+  };
+}
+
+/** The mux rows' facts: `COLLIE_MUX`, or the bridge's own pick (`bridge/mux/herdr-core/pick.ts`). */
+function statusMux(deps: LifecycleDeps): Pick<StatusFacts, "mux" | "muxPickedBecause" | "muxNotPickedBecause" | "muxNamed"> {
+  const resolved = resolveMux(deps.ctx.socket, deps.ctx.env, pickHostOf(deps), deps.host.platform);
+  return {
+    mux: resolved.mux,
+    muxPickedBecause: resolved.pickedBecause === "" ? null : resolved.pickedBecause,
+    muxNotPickedBecause: resolved.notPickedBecause === "" ? null : resolved.notPickedBecause,
+    muxNamed: (deps.ctx.env.COLLIE_MUX ?? "").trim() !== "",
+  };
+}
+
+/** The banner's `mux` row: the name, and why when nobody named it. */
+function muxRowValue(facts: StatusFacts): string {
+  if (facts.muxNamed) return facts.mux;
+  if (facts.muxPickedBecause !== null) return `${facts.mux} · no COLLIE_MUX, picked: ${facts.muxPickedBecause}`;
+  const why = facts.muxNotPickedBecause === null ? "" : `; ${facts.muxNotPickedBecause}`;
+  return `${facts.mux} · no COLLIE_MUX, the default${why}`;
+}
+
+/**
+ * `collie status --json`: the banner's facts as one object, for a program to read (the herdr-app mod
+ * in `herdr-app-mod/collie/` is the first). `phoneUrl` is the URL a phone opens, or null where there
+ * is none to give: a peer (the lead's door serves it), `COLLIE_SKIP_SERVE=1` without
+ * `COLLIE_PUBLIC_URL`, or a tailnet name that is not known yet. Field names are a contract; add, do
+ * not rename.
+ */
+export interface StatusJson {
+  readonly running: boolean;
+  readonly version: string;
+  readonly instance: string | null;
+  readonly port: number;
+  readonly localUrl: string;
+  readonly phoneUrl: string | null;
+  readonly crew: CrewMode;
+  readonly service: string;
+  readonly pairedDevices: number;
+  /** The multiplexer this instance drives (`COLLIE_MUX`, or the bridge's own pick). */
+  readonly mux: string;
+  /** Why {@link mux} was picked with no `COLLIE_MUX`; `null` when it was named or is the default. */
+  readonly muxPickedBecause: string | null;
+}
+
+export function statusJson(facts: StatusFacts): StatusJson {
+  const door = facts.skipServe ? facts.publicUrl : facts.tailnetUrl;
+  const phoneUrl = door === null || door.includes(TAILNET_NAME_UNAVAILABLE) ? null : door;
+  return {
+    running: facts.running,
+    version: facts.version,
+    instance: facts.instance,
+    port: facts.port,
+    localUrl: facts.localUrl,
+    phoneUrl,
+    crew: facts.crew,
+    service: facts.service,
+    pairedDevices: facts.pairedDevices,
+    mux: facts.mux,
+    muxPickedBecause: facts.muxPickedBecause,
   };
 }
 
@@ -1378,8 +1531,8 @@ export function bannerLines(view: StatusView): string[] {
   ];
 }
 
-async function printStatusBanner(deps: LifecycleDeps): Promise<void> {
-  const view = await statusView(deps);
+async function printStatusBanner(deps: LifecycleDeps, options: StatusOptions = {}, known?: StatusFacts): Promise<void> {
+  const view = await statusView(deps, options, known);
   if (deps.ui != null) {
     await deps.ui.status(view);
     return;

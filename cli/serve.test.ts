@@ -16,9 +16,12 @@ import {
   type Scripted,
 } from "./fakes.ts";
 import { EXIT } from "./io.ts";
+import { TAILSCALE_PROBE_MS } from "./tailnet.ts";
 import {
   cmdServe,
+  cmdServeStatus,
   cmdServeVerb,
+  SERVE_SUBCOMMANDS,
   cmdUnserve,
   fingerprintRoot,
   formatRecord,
@@ -247,6 +250,39 @@ describe("serve — publishing", () => {
     expect(h.exec.calls).toContain("tailscale serve --bg --http=8787 --set-path=/ 8787");
     expect(h.files.read(HANDLER_FILE)).toBe("http:8787|host.example:8787|http://127.0.0.1:8787\n");
     expect(h.io.stdout.join("\n")).toContain("tailscale serve (http) → tailnet :8787");
+  });
+
+  describe("a hand-made door on another listener", () => {
+    const PORT_80 = JSON.stringify({
+      TCP: { "80": { HTTP: true } },
+      Web: { "host.example:80": { Handlers: { "/": { Proxy: "http://127.0.0.1:8787" } } } },
+    });
+    const NOTE =
+      "note: tailnet :80 already proxies to http://127.0.0.1:8787, made by hand on a port Collie does not" +
+      " manage; collie uninstall will not remove it (docs/windows.md)";
+
+    test("an http publish prints one note and still publishes", () => {
+      const h = harness({ serveMode: "http", serveStatus: PORT_80 });
+      expect(cmdServe(h.deps)).toBe(EXIT.OK);
+      expect(h.io.stdout.filter((l) => l.startsWith("note: tailnet"))).toEqual([NOTE]);
+      expect(h.exec.calls).toContain("tailscale serve --bg --http=8787 --set-path=/ 8787");
+    });
+
+    test("no such mapping, no note", () => {
+      const h = harness({ serveMode: "http" });
+      expect(cmdServe(h.deps)).toBe(EXIT.OK);
+      expect(h.io.stdout.some((l) => l.startsWith("note: tailnet"))).toBe(false);
+    });
+  });
+
+  test("the child's stdout goes to stderr only when the Io says its own stdout is data", () => {
+    const plain = harness({ serveMode: "http" });
+    expect(cmdServe(plain.deps)).toBe(EXIT.OK);
+    expect(plain.exec.stdoutToStderr).toEqual([]);
+
+    const data = harness({ serveMode: "http" });
+    expect(cmdServe({ ...data.deps, io: { ...data.deps.io, childOutToErr: true } })).toBe(EXIT.OK);
+    expect(data.exec.stdoutToStderr).toEqual(["tailscale serve --bg --http=8787 --set-path=/ 8787"]);
   });
 
   test("https publishes on :443 while the proxy target stays the bridge port", () => {
@@ -766,5 +802,34 @@ describe("serve — under a mount (COLLIE_BASE_PATH)", () => {
     expect(rootAvailability(both, 8787, "http", OURS)).toBe("occupied");
     expect(rootAvailability(both, 8787, "http", OURS, "/collie/")).toBe("adoptable");
     expect(rootAvailability(both, 8787, "http", OURS, "/other/")).toBe("free");
+  });
+});
+
+describe("serve status, the dump `collie status` used to print", () => {
+  test("prints what tailscale serve publishes, indented, and changes nothing", () => {
+    const h = harness({ answers: [["tailscale serve status", { stdout: "https://host (tailnet only)\n|-- / proxy http://127.0.0.1:8787\n\n" }]] });
+    expect(cmdServeStatus(h.deps)).toBe(EXIT.OK);
+    expect(h.io.stdout).toEqual(["  serve config:", "    https://host (tailnet only)", "    |-- / proxy http://127.0.0.1:8787"]);
+    expect(h.exec.timeouts).toContainEqual({ call: "tailscale serve status", ms: TAILSCALE_PROBE_MS });
+    // A read: no publish, no teardown, no record written.
+    expect(h.exec.calls.filter((c) => c.startsWith("tailscale serve") && c !== "tailscale serve status")).toEqual([]);
+    expect(h.files.ops).toEqual([]);
+  });
+
+  test("COLLIE_SKIP_SERVE says it was skipped and does not ask tailscale", () => {
+    const h = harness({ env: { COLLIE_SKIP_SERVE: "1" } });
+    expect(cmdServeStatus(h.deps)).toBe(EXIT.OK);
+    expect(h.io.stdout).toEqual(["  serve config: skipped (COLLIE_SKIP_SERVE=1)"]);
+    expect(h.exec.calls).toEqual([]);
+  });
+
+  test("a missing tailscale prints the heading and exits 0, as the dump always did", () => {
+    const h = harness({ absent: ["tailscale"] });
+    expect(cmdServeStatus(h.deps)).toBe(EXIT.OK);
+    expect(h.io.stdout).toEqual(["  serve config:"]);
+  });
+
+  test("the sub-verb list is status", () => {
+    expect([...SERVE_SUBCOMMANDS]).toEqual(["status"]);
   });
 });

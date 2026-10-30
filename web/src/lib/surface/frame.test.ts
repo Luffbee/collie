@@ -451,6 +451,49 @@ describe("findInputFrame", () => {
     expect(nearMiss.placeholder).toBe(false);
   });
 
+  it("marks Claude Code's rotating `Try \"…\"` hint by its shape on a plain-text read (herdr-core, 2026-10-30)", () => {
+    // herdr-core reads the screen as plain text: the hint's faint attribute is gone, so only its shape
+    // tells it from typed text. Live on Claude Code 2.1.314; a walky talky delivery stayed held.
+    const capture = readFileSync(join(FIXTURES_DIR, "surface", "claude--v2-1-314-placeholder-plain--w120.txt"), "utf8");
+    const live = findInputFrame(splitLines(parseAnsi(capture)), IDLE)!;
+    expect(live.interior.text).toBe('Try "refactor <filepath>"');
+    expect(live.placeholder).toBe(true);
+    expect(live.anchorsHit).toContain("placeholder-text");
+    for (const hint of ['Try "fix lint errors"', 'Try "how do I log an error?"', 'Try ""']) {
+      expect(findInputFrame(lines(RULE, `❯ ${hint}`, RULE), IDLE)!.placeholder).toBe(true);
+      expect(findInputFrame(lines(RULE, `❯\u00a0${hint}`, RULE), IDLE)!.placeholder).toBe(true);
+    }
+    // Typed text around the shape, or a quote inside it, is a draft.
+    for (const draft of ['Try "fix lint errors" now', 'please Try "fix lint errors"', 'Try "a" and "b"', 'Try "unclosed', "Try fix lint errors"]) {
+      expect(findInputFrame(lines(RULE, `❯ ${draft}`, RULE), IDLE)!.placeholder).toBe(false);
+    }
+  });
+
+  it("counts the `Try \"…\"` shape only on a read with no styling: a typed one on a coloured read stays a draft", () => {
+    // tmux, zellij and the Herdr TUI hand out colour. Typed text is default ink there, with no colour or
+    // flag of its own, but the prompt marker and the rules carry colour, so the read is styled and the
+    // shape rule stands down. Only a read with no styling anywhere (herdr-core) lets the shape decide.
+    const GREY = "rgb(153,153,153)";
+    const rule: FrameRow = { segments: [{ text: RULE, fg: GREY }] };
+    const marker: FrameRun = { text: "❯ ", fg: GREY };
+    const hint = 'Try "fix lint errors"';
+
+    const typed = findInputFrame([rule, { segments: [marker, { text: hint }] }, rule], IDLE)!;
+    expect(typed.placeholder).toBe(false);
+    expect(typed.interior.text).toBe(hint);
+    expect(typed.anchorsHit).not.toContain("placeholder-text");
+
+    const faint = findInputFrame([rule, { segments: [marker, { text: hint, dim: true }] }, rule], IDLE)!;
+    expect(faint.placeholder).toBe(true);
+    expect(faint.interior.text).toBe(hint);
+    expect(faint.anchorsHit).toContain("placeholder-sgr");
+    expect(faint.anchorsHit).not.toContain("placeholder-text");
+
+    const plain = findInputFrame(plainRows([RULE, `❯ ${hint}`, RULE]), IDLE)!;
+    expect(plain.placeholder).toBe(true);
+    expect(plain.anchorsHit).toContain("placeholder-text");
+  });
+
   it("a faint marker in front of a real draft is not a placeholder", () => {
     const frame = findInputFrame([styled(plainRun(RULE)), styled(dim("❯ "), plainRun("real draft")), styled(plainRun(RULE))], IDLE)!;
     expect(frame.placeholder).toBe(false);

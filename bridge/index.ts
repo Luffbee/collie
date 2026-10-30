@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { classifyInstall, probeInstall } from "../cli/install-kind.ts";
 import { realLinkFs } from "../cli/link.ts";
 import { packageCommand } from "../cli/package-command.ts";
+import { sendsReportRows } from "../cli/send-findings.ts";
 import { realExec, realFiles } from "../cli/sys.ts";
 import { collieBinary as collieBinaryOf, HOST, surfacePlatform } from "./host.ts";
 import { ActivityLedger } from "./activity.ts";
@@ -111,6 +112,7 @@ import { commitCrewChange, CREW_PROTOCOL_VERSION } from "./crew/enrollment.ts";
 import { CrewLead } from "./crew/lead.ts";
 import { leadLabel } from "./crew/merge.ts";
 import { crewStatusBody } from "./crew/status-wire.ts";
+import { machineHost } from "./crew/machine-host.ts";
 import { herdPushGate, PeerNotifier } from "./crew/notify.ts";
 import {
   crewHelloBudget,
@@ -1340,6 +1342,8 @@ const muxRegistry = buildMuxRegistry();
 // silent — the log named one only when it could not be reached — so `collie logs` could not answer
 // the first question a tmux or zellij operator asks (docs/multiplexers.md → "Did it work?").
 console.log(`[bridge] mux: ${describeMux(muxRegistry, cfg.mux, cfg.muxEndpoint)}`);
+if (cfg.muxPickedBecause !== "") console.log(`[bridge] mux: no COLLIE_MUX, so ${cfg.mux}: ${cfg.muxPickedBecause}`);
+if (cfg.muxNotPickedBecause !== "") console.log(`[bridge] mux: no COLLIE_MUX, so ${cfg.mux}: ${cfg.muxNotPickedBecause}`);
 // And each program beside it, one line each, from the source's own settings. Never the token.
 for (const source of programs.others) {
   console.log(`[bridge] program "${source.name}": ${DURABLE_MUX}, ${describeDurableTarget(sourceTransportEnv(source))}`);
@@ -1352,19 +1356,22 @@ for (const source of programs.others) {
 const hooksInstalled = hooksInstalledProbe({ home: homedir(), env: process.env });
 
 /**
- * The adapter, with agent beacons around it when the multiplexer cannot see agents on its own.
+ * The adapter, with agent beacons around it when the multiplexer cannot see agents, or cannot see
+ * their sessions, on its own.
  *
  * A multiplexer that reports the agent and its session from its own wire is left ALONE — it has the
  * stronger source of truth, and the decorator refuses to wrap it anyway (bridge/beacon/decorate.ts).
- * The two conditions are the same one, read from two sides: an adapter contributes a beacon matcher
- * exactly when it is blind, and the decorator refuses exactly when it is not.
+ * The condition is the decorator's own, read from the caller's side: it refuses exactly an adapter
+ * that declares `agentSessionRef`, and one that declares only `agentDetection` gets the session ref
+ * alone.
  */
 function withBeaconsIfBlind(adapter: MuxAdapter, target: MuxTarget): MuxAdapter {
   const matcher = factoryFor(muxRegistry, adapter.mux)?.beaconMatcher?.(target);
-  // Herdr has a matcher too since M56 spec 11, for the hook edges, but it sees agents on its own wire:
-  // the decorator wraps only an adapter that cannot.
-  const blind = matcher !== undefined && !adapter.capabilities.supports.agentDetection && !adapter.capabilities.supports.agentSessionRef;
-  const seeing = blind ? withAgentBeacons(adapter, beaconReader(cfg.stateDir), { matcher, hooksInstalled }) : adapter;
+  // Herdr has a matcher too since M56 spec 11, for the hook edges, but it sees agents and their sessions
+  // on its own wire: the decorator wraps only an adapter that cannot see a session. One that names its
+  // agent but not the session (herdr-core, M74 spec 04) is wrapped in session-only mode.
+  const needsSession = matcher !== undefined && !adapter.capabilities.supports.agentSessionRef;
+  const seeing = needsSession ? withAgentBeacons(adapter, beaconReader(cfg.stateDir), { matcher, hooksInstalled }) : adapter;
   // The hint tier sits OUTSIDE the decorator, so it reads the DECORATED declaration and retires
   // itself the moment that declaration says agents are visible (M11/05). Applied to every adapter,
   // including one that was never decorated: it suppresses itself there for the same reason.
@@ -1600,6 +1607,14 @@ const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
     notifications.onTransition(agent, from, to);
   });
   engine.onRemove((paneId) => notifications.onRemove(paneId));
+  engine.onUpdate((s) =>
+    notifications.retractSeen(
+      s.agents.map(({ paneId }) => {
+        const a = activity.get(name, paneId);
+        return { paneId, lastActiveAt: a?.activeAt, lastSeenAt: a?.seenAt };
+      }),
+    ),
+  );
   if (guarded) {
     engine.onUpdate((s) =>
       askPush.observe(
@@ -1644,6 +1659,9 @@ const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
   // The held sends (M56 spec 15) ride the same poll: once the Surface has read the panes, a pane that
   // reads free releases its oldest held request, and the queue ends what expired or lost its pane.
   // `send` is declared below; the poll's first update comes after `engine.start()`.
+  // The screen wins for an ask (M78 spec 07): a pane whose last read shows an ask is `blocked` on the
+  // phone and in the push, also where the multiplexer says `working` (herdr-core with pi's question).
+  if (surface !== undefined) engine.liftScreenAsks((paneId) => surface.askOnScreen(paneId));
   if (surface !== undefined) {
     engine.onUpdate((s) => {
       void surface.observe(s.agents).then(() => {
@@ -1655,11 +1673,13 @@ const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
         }
         // A queued send whose text a read shows back in the box (ADR 0122): its card says so.
         send?.tickQueued(name, (paneId) => surface.boxOf(paneId));
-        // The box text rides along: a box that holds only Collie's own probe characters is no draft.
+        // The box text rides along: a box that holds only Collie's own probe characters is no draft. So
+        // does whether the read carried no styling: there a draft may be the placeholder (M78 spec 06).
         return send?.tickHolds(
           name,
           (paneId) => surface.surfaceOf(paneId),
           (paneId) => surface.boxOf(paneId)?.box ?? null,
+          (paneId) => surface.boxOf(paneId)?.plain === true,
         );
       });
     });
@@ -1864,7 +1884,10 @@ edgeRouter?.start();
 // registry finds the socket listening. A bridge that cannot own the socket (another bridge holds it,
 // or the path is not safe) runs with no holds: every permission stays a screen ask.
 if (holdServer !== null && (await holdServer.start())) console.log(`[surface] hold socket at ${holdSocketPath(cfg.stateDir)}`);
-hookTarget = edgeRouter === null ? null : registerHookTarget(cfg.stateDir);
+// The target file also says which multiplexer this bridge drives, under which instance, on which port,
+// so `collie mux list` reads the live bridges without dialling them (M76 spec 02).
+hookTarget =
+  edgeRouter === null ? null : registerHookTarget(cfg.stateDir, undefined, undefined, { mux: cfg.mux, instance: collieInstance, port: cfg.port });
 
 // Walky talky (M62): messages between agent sessions. The log is `<stateDir>/walky/`, the local
 // socket `<stateDir>/walky/sock` (0600). A message is logged first, then typed through the pane's
@@ -1942,7 +1965,7 @@ const walkyRoute: RouteRemote | undefined =
   walkyMemberId === null
     ? undefined
     : crew.mode === "lead"
-      ? (message, members) => (walkyLeadHalf === null ? Promise.reject(new Error("the crew is not wired yet")) : walkyLeadHalf.route(message, members))
+      ? (message, members, panes) => (walkyLeadHalf === null ? Promise.reject(new Error("the crew is not wired yet")) : walkyLeadHalf.route(message, members, panes))
       : memberRouteRemote({ self: walkyMemberId, post: (payload) => walkyToLead(payload) });
 const walky = new WalkyService({
   log: walkyLog,
@@ -1957,6 +1980,12 @@ const walky = new WalkyService({
   routeRemote: walkyRoute,
   remoteTargets: crew.mode === "lead" ? () => walkyLeadHalf?.targets() ?? [] : undefined,
   outcomesOnLead: crew.mode === "peer",
+  // A bare word that names one of these is a member, never a folder (M75): this machine, its lead, its roster.
+  knownMembers: () => {
+    const held = trustStore.current();
+    if (held === null) return [];
+    return [held.self.memberId, ...(held.lead === null ? [] : [held.lead.memberId]), ...held.peers.map((member) => member.memberId)];
+  },
   leadName: () => trustStore.current()?.lead?.memberId ?? null,
   remoteSkipped: crew.mode === "lead" ? () => walkyLeadHalf?.skipped() ?? [] : undefined,
 });
@@ -2213,6 +2242,12 @@ if (warnsOnWildcardBind(crew.mode, cfg.host)) {
  * which is not a roster member and would collide visually with every peer's per-machine label — see
  * `leadLabel`'s doc for the hostname/fallback rule.
  */
+/** The lead's own host name as `crewStatusBody` takes it: the key is absent where the OS gives none. */
+function hostSource(): { readonly host?: string } {
+  const host = machineHost();
+  return host === null ? {} : { host };
+}
+
 function crewSelfOf(data: TrustStoreData) {
   return { id: data.self.memberId, name: leadLabel(hostname(), data.self.memberId) };
 }
@@ -2265,6 +2300,11 @@ const crewLead = (() => {
     // (§10.1's 2026-09-08 amendment), and a write's WRITE_BUDGET_MS must not be a wiring detail.
     proxy: (link, route, params, init, budgetMs) => client.proxy(link, route, params, init, budgetMs),
     self: crewSelfOf(data),
+    // The multiplexer this lead drives, for its `servers` row: the primary session's adapter, the
+    // same one `hello` publishes.
+    selfMux: () => registry.get()?.herdr.mux ?? null,
+    // This machine's own host name, for the same row (M77 spec 01).
+    selfHost: machineHost,
     // Notifications for a peer's panes, derived on the lead from the body this sweep just parsed and
     // pushed through the same coordinator machinery a local session uses (M4/06).
     onPeerSnapshot: (memberId, body) => {
@@ -2467,6 +2507,8 @@ const crewStatus =
           // The same string `hello` answers with (§7.1) — resolved once at boot, like the crew
           // router's, so the two surfaces cannot name this build two different versions.
           version: crewVersion,
+          mux: cfg.mux,
+          ...hostSource(),
           peers: crewLead.contributions(),
           now: Date.now(),
         });
@@ -2901,6 +2943,10 @@ const server = startServer({
   // string, resolved once, so the detached updater's health gate and a peer can never be told two
   // different things about this machine (M15/04).
   version: crewVersion,
+  // Report a problem's doctor rows (M71 spec 05): the same sends section `collie doctor` prints, over
+  // this bridge's own state dir, read when the route is called. Read-only: it lists and reads
+  // `sends/` and `held/` and builds no store. None with the Send Protocol off.
+  sendHealth: cfg.sendProtocol ? () => sendsReportRows({ ctx: { stateDir: cfg.stateDir }, files: realFiles, now: Date.now }) : undefined,
   // The Surface counters' totals for `/api/health` (M56 spec 09); null with no ledger.
   surfaceTotals: () => surfaceLedger?.totals() ?? null,
   audit,

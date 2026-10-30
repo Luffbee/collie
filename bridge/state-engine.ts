@@ -337,6 +337,8 @@ type TransitionListener = (agent: AgentView, from: AgentStatus, to: AgentStatus)
 type RemoveListener = (paneId: string) => void;
 type UpdateListener = (snap: EngineSnapshot) => void;
 type TickListener = () => void;
+/** Whether the newest read of a pane's screen shows an ask the person must answer. */
+export type ScreenAsk = (paneId: string) => boolean;
 
 export class StateEngine {
   private agents: AgentView[] = [];
@@ -404,6 +406,9 @@ export class StateEngine {
   // Absent — every test, and a bridge with transcripts off — muse panes are never probed and
   // carry no sessionName, exactly as before the reader existed.
   private readonly museNameProbe: MuseSessionNameProbe | undefined;
+  // The screen's ask, when the bridge reads screens (see liftScreenAsks). Absent: the mux's status
+  // stands as reported.
+  private screenAsk: ScreenAsk | undefined;
   constructor(
     private readonly mux: MuxAdapter,
     private readonly pollMs: number,
@@ -412,6 +417,18 @@ export class StateEngine {
     this.cadenceMs = pollMs;
     this.baseCadenceMs = pollMs;
     this.museNameProbe = opts.museSessionName;
+  }
+
+  /**
+   * The screen wins for an ask (M78 spec 07). A pane whose newest screen read shows an ask is
+   * `blocked` whatever its multiplexer says: herdr-core reports pi `working` while pi's question
+   * waits, because pi has no blocked state for an extension's question. Lifted before the
+   * transitions are taken, so the "Needs you" mark and the push follow the screen. The read is the
+   * previous poll's (the Surface reads after each poll), so the mark trails the screen by one poll
+   * either way. Only ever raises to `blocked`; a status the mux reports is never lowered.
+   */
+  liftScreenAsks(fn: ScreenAsk): void {
+    this.screenAsk = fn;
   }
 
   onTransition(fn: TransitionListener): () => void {
@@ -697,15 +714,6 @@ export class StateEngine {
         if (tabPanes.get(v.tabId) === 1 && raw?.tabNamed === true && label) v.soleTabName = label;
       }
 
-      // Detect transitions against the previous poll. First sighting of a pane never fires a
-      // transition (so we don't notify for agents already blocked when the bridge starts).
-      for (const a of agents) {
-        const prev = this.prevStatus.get(a.paneId);
-        if (prev !== undefined && prev !== a.status) {
-          for (const fn of this.transitionListeners) fn(a, prev, a.status);
-        }
-        this.prevStatus.set(a.paneId, a.status);
-      }
       const live = new Set(agents.map((a) => a.paneId));
       for (const id of this.prevStatus.keys()) {
         if (live.has(id)) continue;
@@ -725,6 +733,24 @@ export class StateEngine {
         if (p.revision !== undefined) revisions.set(p.paneId, p.revision);
       }
       await this.enrichSessionNames(agents, revisions);
+
+      // The screen's ask wins for `blocked` (see liftScreenAsks).
+      const screenAsk = this.screenAsk;
+      if (screenAsk !== undefined) {
+        for (const a of agents) if (a.status !== "blocked" && screenAsk(a.paneId)) a.status = "blocked";
+      }
+
+      // Detect transitions against the previous poll. First sighting of a pane never fires a
+      // transition (so we don't notify for agents already blocked when the bridge starts). This runs
+      // AFTER the enrichment above: a listener reads the pane on the spot (the push coordinator takes
+      // its push name there), so the session name must already be on it.
+      for (const a of agents) {
+        const prev = this.prevStatus.get(a.paneId);
+        if (prev !== undefined && prev !== a.status) {
+          for (const fn of this.transitionListeners) fn(a, prev, a.status);
+        }
+        this.prevStatus.set(a.paneId, a.status);
+      }
 
       this.agents = agents;
       fresh = agents;

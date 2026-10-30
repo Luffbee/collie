@@ -44,6 +44,8 @@ export interface HerdSummary {
   paneId?: string;
   /** Re-alert (buzz) the device — true when a new alert arrived, false on a silent retraction update. */
   renotify: boolean;
+  /** How many alerts are outstanding: this slot's share of the app icon's badge. */
+  badge: number;
 }
 
 export interface NotifySink {
@@ -105,6 +107,7 @@ export function makeNotifySink(
         tag: herdTag,
         paneId: s.paneId,
         renotify: s.renotify,
+        badge: s.badge,
       };
       if (s.titleCode !== undefined) msg.titleCode = s.titleCode;
       if (s.titleDetail !== undefined) msg.titleDetail = s.titleDetail;
@@ -130,16 +133,52 @@ export function makeNotifySink(
 // (`push.ts` § redactPushMessage), but the title stays out by rule, not by luck. Written down in
 // docs/security.md too.
 
+const CONTROL_AND_BIDI_CHARS = /[\p{Cc}\p{Bidi_Control}]+/gu;
+
+/**
+ * Strip C0/C1 control characters and Unicode bidirectional overrides/isolates from notification
+ * strings so embedded RLO/LRO or control bytes in a label, place or description cannot reorder
+ * lock-screen text.
+ */
+export function stripControlChars(value: string): string {
+  return value.replace(CONTROL_AND_BIDI_CHARS, "");
+}
+
 /**
  * What a push calls a pane: the operator's label (`paneLabel`), Claude's `/rename` name, or the
  * operator's name for a one-pane tab; else `shell` or the harness word. Never `terminalTitle`.
  */
 export function pushName(pane: NameableP): string {
-  if (pane.paneLabel) return pane.paneLabel;
-  if (pane.sessionName) return pane.sessionName;
+  if (pane.paneLabel) {
+    const clean = stripControlChars(pane.paneLabel);
+    if (clean) return clean;
+  }
+  if (pane.sessionName) {
+    const clean = stripControlChars(pane.sessionName);
+    if (clean) return clean;
+  }
   const tab = soleTabName(pane);
-  if (tab !== null) return tab;
-  return pane.kind === "shell" ? "shell" : pane.agent;
+  if (tab !== null) {
+    const clean = stripControlChars(tab);
+    if (clean) return clean;
+  }
+  return pane.kind === "shell" ? "shell" : stripControlChars(pane.agent);
+}
+
+function cleanAskText(askText: AskPushText): AskPushText {
+  const title = askText.title === undefined ? undefined : stripControlChars(askText.title);
+  const line = askText.line === undefined ? undefined : stripControlChars(askText.line);
+  if (title !== undefined && line !== undefined) return { title, line };
+  if (title !== undefined) return { title };
+  if (line !== undefined) return { line };
+  return {};
+}
+
+/** A pane's two activity timestamps, as a snapshot carries them. */
+export interface SeenStamps {
+  paneId: string;
+  lastActiveAt?: number;
+  lastSeenAt?: number;
 }
 
 interface Alert {
@@ -205,9 +244,9 @@ export class NotificationCoordinator<H = unknown> {
     // (Re)arm the debounce. A blocked→done flip lands here too, so only the latest verb survives.
     this.cancelPending(id);
     const alert: Alert = {
-      agent: agent.agent,
+      agent: stripControlChars(agent.agent),
       label: pushName(agent),
-      place: panePlace(agent),
+      place: stripControlChars(panePlace(agent)),
       // SAFETY: `onTransition` is only reached for a status the prefs call notifiable, and the
       // notifiable set IS `NotifiableStatus` (blocked/done) — `isNotifiable` returns false for
       // every other member of `AgentStatus`, so this branch cannot be entered with one.
@@ -215,7 +254,7 @@ export class NotificationCoordinator<H = unknown> {
     };
     if (cause === "ask" && to === "blocked") {
       alert.ask = true;
-      if (askText !== undefined) alert.askText = askText;
+      if (askText !== undefined) alert.askText = cleanAskText(askText);
     }
     const handle = this.clock.schedule(() => {
       this.pending.delete(id);
@@ -246,6 +285,25 @@ export class NotificationCoordinator<H = unknown> {
     for (const [id, a] of this.outstanding) {
       if (!this.isNotifiable(a.status)) {
         this.outstanding.delete(id);
+        removed = true;
+      }
+    }
+    if (removed) this.emit(false);
+  }
+
+  /**
+   * Retract the finished alerts of panes opened since they finished, from each poll's timestamps
+   * (bridge/activity.ts). A finished pane stays `done` or `idle` after you read it, so no transition
+   * would ever retract its alert, and it would sit on the lock screen and in the icon's count. A
+   * blocked alert stays: only an answer clears it. A pane without both timestamps is left alone.
+   */
+  retractSeen(panes: Iterable<SeenStamps>): void {
+    let removed = false;
+    for (const { paneId, lastActiveAt, lastSeenAt } of panes) {
+      if (lastActiveAt === undefined || lastSeenAt === undefined || lastSeenAt < lastActiveAt) continue;
+      if (this.pending.get(paneId)?.status === "done") this.cancelPending(paneId);
+      if (this.outstanding.get(paneId)?.status === "done") {
+        this.outstanding.delete(paneId);
         removed = true;
       }
     }
@@ -305,6 +363,7 @@ export class NotificationCoordinator<H = unknown> {
         body: a.ask === true && a.askText?.line !== undefined ? a.askText.line : a.place,
         paneId,
         renotify,
+        badge: 1,
       };
     }
     const alerts = entries.map(([, a]) => a);
@@ -312,7 +371,7 @@ export class NotificationCoordinator<H = unknown> {
     const allBlocked = alerts.every((a) => a.status === "blocked");
     const allDone = alerts.every((a) => a.status === "done");
     const code = allBlocked ? "herd.blocked" : allDone ? "herd.done" : "herd.mixed";
-    return { ...pushTitle(code, { count: n }), body: digestLabels(alerts).join(", "), renotify };
+    return { ...pushTitle(code, { count: n }), body: digestLabels(alerts).join(", "), renotify, badge: n };
   }
 
   private cancelPending(id: string): void {

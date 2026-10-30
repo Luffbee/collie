@@ -208,6 +208,38 @@ describe("mergeSnapshot — reachable / unreachable / incompatible, never confla
     expect(merged.agents.every((p) => p.host === "desk")).toBe(true);
   });
 
+  test("each row carries the multiplexer it drives: the lead's own, and a member's banked one", () => {
+    const merged = mergeSnapshot(localBody(), {
+      self: { ...SELF, mux: "herdr" },
+      peers: [
+        contribution({ state: state({ memberId: "laptop", mux: "herdr-core" }) }),
+        contribution({ state: state({ memberId: "old-box" }) }),
+      ],
+      now: NOW,
+    });
+    expect(merged.servers!.find((s) => s.id === "desk")!.mux).toBe("herdr");
+    expect(merged.servers!.find((s) => s.id === "laptop")!.mux).toBe("herdr-core");
+    // A member that never said, and a lead that names none, carry no `mux` key at all.
+    expect("mux" in merged.servers!.find((s) => s.id === "old-box")!).toBe(false);
+    expect("mux" in mergeSnapshot(localBody(), { self: SELF, peers: [], now: NOW }).servers![0]!).toBe(false);
+  });
+
+  test("each row carries the host name: the lead's own, and a member's banked one (M77 spec 01)", () => {
+    const merged = mergeSnapshot(localBody(), {
+      self: { ...SELF, host: "bluefin" },
+      peers: [
+        contribution({ state: state({ memberId: "laptop", host: "minibuch" }) }),
+        contribution({ state: state({ memberId: "old-box" }) }),
+      ],
+      now: NOW,
+    });
+    expect(merged.servers!.find((s) => s.id === "desk")!.host).toBe("bluefin");
+    expect(merged.servers!.find((s) => s.id === "laptop")!.host).toBe("minibuch");
+    // A member that never said, and a lead whose OS gives no name, carry no `host` key at all.
+    expect("host" in merged.servers!.find((s) => s.id === "old-box")!).toBe(false);
+    expect("host" in mergeSnapshot(localBody(), { self: SELF, peers: [], now: NOW }).servers![0]!).toBe(false);
+  });
+
   test("the lead's own entry is present, first, and always current", () => {
     const merged = mergeSnapshot(localBody(), { self: SELF, peers: [], now: NOW });
     expect(merged.servers![0]).toEqual({
@@ -590,6 +622,30 @@ describe("parsePeerSnapshot — a peer contributes rows, never claims", () => {
     expect(parsed.agents.map((p) => p.instance)).toEqual(["k3f9", undefined, undefined]);
     expect("instance" in parsed.agents[1]!).toBe(false);
     expect(parsed.shellPanes[0]!.instance).toBe("zz00");
+  });
+
+  test("a session's display label is kept only as a string, cleaned and capped by the lead's rule", () => {
+    const parsed = parsePeerSnapshot({
+      sessions: [
+        { ...session({ name: "a" }), label: "Видео" },
+        { ...session({ name: "b" }), label: `x‮y${"z".repeat(100)}` },
+        { ...session({ name: "c" }), label: { evil: true } },
+        { ...session({ name: "d" }), label: "​" },
+        session({ name: "e" }),
+      ],
+      agents: [],
+      shellPanes: [],
+    })!;
+    expect(parsed.sessions.map((s) => s.label)).toEqual(["Видео", `x y${"z".repeat(45)}`, undefined, undefined, undefined]);
+    expect("label" in parsed.sessions[2]!).toBe(false);
+
+    // The label survives the merge beside the lead's host tag; the name is still the identity.
+    const merged = mergeSnapshot(localBody(), {
+      self: SELF,
+      peers: [contribution({ state: state({ memberId: "laptop" }), body: parsed })],
+      now: NOW,
+    });
+    expect(merged.sessions.find((s) => s.host === "laptop" && s.name === "a")?.label).toBe("Видео");
   });
 
   test("a body missing any of the three PANE lists is not a snapshot to salvage", () => {

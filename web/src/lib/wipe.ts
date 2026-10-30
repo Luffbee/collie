@@ -42,7 +42,9 @@
 // it posts on the `collie-wipe` BroadcastChannel, so another open tab closes its store connection
 // and the database delete is not blocked by it (lib/store.ts listens).
 
+import { showBadge } from "@/lib/app-badge";
 import { mounted } from "@/lib/base-path";
+import { forgetAllDiffComments } from "@/lib/diff-comment-store";
 import { clearAllDrafts, clearDraft } from "@/lib/drafts";
 import { forgetAgain } from "@/lib/new-page";
 import { forgetNoPromptsConfirms } from "@/lib/no-prompts";
@@ -145,6 +147,13 @@ async function clearCaches(): Promise<void> {
 /** The built-in cleaners, in the order they run. The password reason touches only session text. */
 const BUILT_IN: readonly (readonly [string, WipeCleaner])[] = [
   [
+    // The icon's count says how many panes wait on you, which is this device's to know no more.
+    "badge",
+    (context) => {
+      if (context.reason !== "password") void showBadge(globalThis.navigator, 0);
+    },
+  ],
+  [
     "token",
     (context) => {
       if (context.reason !== "password") clearDeviceToken();
@@ -155,6 +164,13 @@ const BUILT_IN: readonly (readonly [string, WipeCleaner])[] = [
     (context) => {
       if (context.reason === "password") clearDraft(context.pane.scope, context.pane.paneId);
       else clearAllDrafts();
+    },
+  ],
+  [
+    // The Changes screen's batch of diff comments (sessionStorage): quoted lines and the notes on them.
+    "diff-comments",
+    (context) => {
+      if (context.reason !== "password") forgetAllDiffComments();
     },
   ],
   [

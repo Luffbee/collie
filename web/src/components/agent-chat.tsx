@@ -24,6 +24,8 @@ import { useNoPromptsGuard } from "@/hooks/use-no-prompts-guard";
 import { buzz } from "@/lib/haptics";
 import { handOf, mirrorFont, paneNavOf, useDisplayPrefs } from "@/hooks/use-display-prefs";
 import { useChatWindow } from "@/hooks/use-chat-window";
+import { useStartupReadiness } from "@/hooks/use-startup-readiness";
+import type { AgentLaunch } from "@/lib/agent-startup";
 import { useChatReady } from "@/hooks/use-chat-ready";
 import { usePaneStart } from "@/hooks/use-pane-start";
 import { useHandover, useHeldBody } from "@/hooks/use-handover";
@@ -53,6 +55,7 @@ import { RouteHeader } from "@/components/app-header";
 import { HeaderStatus } from "@/components/header-status";
 import { AgentStart } from "@/components/agent-start";
 import { AnsiOutput } from "@/components/ansi-output";
+import { OutputZoom } from "@/components/output-zoom";
 import { CardDock, hasDialogCard } from "@/components/card-dock";
 import { HookHoldCard } from "@/components/hook-hold-card";
 import { MIRROR_SPACE, MIRROR_INVERT, MUSE_MIRROR, segmentStyle } from "@/components/mirror-space";
@@ -158,6 +161,10 @@ interface AgentChatProps {
   /** Which machine + which named session this pane lives in — scopes every read/write + the safety chip. */
   scope?: Scope;
   agent: AgentView | undefined;
+  /** A launch this phone started, scoped to this pane: Send stays gated until its first screen is read. */
+  agentLaunch?: AgentLaunch;
+  /** Retires {@link agentLaunch} once its gate opens. Sends nothing. */
+  onLaunchReady?: () => void;
   agents: AgentView[];
   shellPanes: AgentView[];
   tabs: TabView[];
@@ -203,6 +210,12 @@ interface AgentChatProps {
    * `onBack` and never glides.
    */
   onBackArrow?: () => void;
+  /**
+   * The output, zoomed (components/output-zoom.tsx): `open` while the route is `/pane/:id/zoom`,
+   * `onOpen` the belt's Zoom pill (a step down), `onClose` its ✕ (an up). Absent, no pill and no view:
+   * a caller that is not the pane route, as in this component's own tests.
+   */
+  zoom?: { open: boolean; onOpen: () => void; onClose: () => void };
   onSelect: (paneId: string) => void;
   /**
    * Drawn as the focused column of a large screen's strip (ADR 0120): the view fills the column it is
@@ -250,6 +263,8 @@ export function AgentChat({
   paneId,
   scope,
   agent,
+  agentLaunch,
+  onLaunchReady,
   agents,
   shellPanes,
   tabs,
@@ -267,6 +282,7 @@ export function AgentChat({
   noSavedCopy = false,
   onBack,
   onBackArrow,
+  zoom,
   onSelect,
   inStrip = false,
   tabletop = false,
@@ -730,6 +746,16 @@ export function AgentChat({
   // badge its row wears in the Spaces list. A terminal session's header is untouched.
   const experimental = wearsExperimental(useSessionCard(scope));
   const gridless = !paneGrid.capable;
+  const paneLive = useLive(paneId, scope);
+  // A launch this phone started: Send waits for the bridge to read the agent's first screen, the read
+  // that also ends the bridge's launch window, so the button never offers a send the bridge refuses.
+  const startup = useStartupReadiness({
+    launch: gridless ? undefined : agentLaunch,
+    agent: agent?.agent,
+    surface: agent?.surface,
+    live: paneLive && !connecting && !stale && !noSavedCopy && hostBlock === undefined,
+    onReady: onLaunchReady,
+  });
   // In a large screen's strip the space header holds the tabs and the sidebar the panes (ADR 0120).
   const stripsExist = !inStrip && !gridless && (canFold || tabPanes.length > 1);
   const folded = canFold && stripsFolded;
@@ -1053,7 +1079,13 @@ export function AgentChat({
   const warming = historyAvailable && switchSheetOpen;
   // `savedCopy`: when the loaders drew the mirror from the saved copy, an empty Chat window reads its
   // own saved copy at once rather than waiting for its read to fail (M46 pass 3).
-  const chatFeed = useChatWindow({ paneId, scope, enabled: chatFetch || warming, savedCopy: stale });
+  const chatFeed = useChatWindow({
+    paneId,
+    scope,
+    instance: agent?.instance,
+    enabled: chatFetch || warming,
+    savedCopy: stale,
+  });
   const chatStatus = chatFeed.window.status;
   const journal: JournalReading = journalReadingOf(chatStatus);
   // What this view has seen of how the agent began, for the gate (hooks/use-pane-start.ts): the
@@ -1765,7 +1797,6 @@ export function AgentChat({
   // Resolves false when no key went out, which is the card's cue to drop its pending face at once.
   const dialogPresentRef = useRef(dialogPresent);
   dialogPresentRef.current = dialogPresent;
-  const paneLive = useLive(paneId, scope);
   // The same fact for the structural writes: the tab and pane sheets (rename, close, focus) take it
   // as `savedCopy`, and the create hook above reads it through the ref. Nothing saved can act.
   const savedCopyWrites = actsDisabledByCache || !paneLive;
@@ -3159,6 +3190,7 @@ export function AgentChat({
                   // What owns the agent's keyboard, as the bridge read it (M56 spec 06). See
                   // `composerSurface` above for the facts folded in before any read.
                   surface={composerSurface}
+                  starting={startup.starting}
                   unreachableNote={unreachableNote}
                   scope={scope}
                   stale={actsDisabledByCache}
@@ -3225,6 +3257,22 @@ export function AgentChat({
                   changesPill={
                     agent?.cwd
                       ? { onClick: () => nav.down(filesEntryPath), label: t("chat.changes.label") }
+                      : undefined
+                  }
+                  // The output, zoomed: the pill beside the switcher mark opens it full screen. A text
+                  // field gives up focus first, so the soft keyboard is not left standing over a view
+                  // with no input in it (the reason `enterZen` blurs). Any other focus stays, so the
+                  // view hands it back to the pill when it closes.
+                  zoomPill={
+                    zoom
+                      ? {
+                          onClick: () => {
+                            const active = document.activeElement;
+                            if (active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement) active.blur();
+                            zoom.onOpen();
+                          },
+                          label: t("zoom.open"),
+                        }
                       : undefined
                   }
                   draftNoticeSlot={draftNoticeSlot}
@@ -3296,7 +3344,7 @@ export function AgentChat({
                         closeDrawer();
                         // Beside THIS pane — the switcher's launch always opens a tab in this pane's
                         // Space, on this pane's own host (server.ts resolves `paneId` there).
-                        void launch(command, paneId);
+                        void launch(command, paneId, row?.kind === "agent" ? row.harness : undefined);
                       },
                     });
                   }
@@ -3509,6 +3557,24 @@ export function AgentChat({
         />
         {/* "Start without prompts?" for a Launch row that skips permission prompts. */}
         {noPromptsSheet}
+        {/* The output, zoomed (`/pane/:id/zoom`). Mounted here, a sibling of the sheets, for their
+            reason: it is a `fixed` element with no portal, so it must not sit inside the animating
+            Collapse or the sticky header. It reads the LIVE text, not the mirror's frozen `display`:
+            a reader who scrolled the mirror up still gets the pane as it is now. The grammars do not
+            run there, so a dialog the dock lifted reads in place as the rows it was. */}
+        {zoom?.open && !gridless && (
+          <OutputZoom
+            text={text}
+            logicalText={logicalText}
+            fontSize={prefs.fontSize}
+            agent={agent?.agent}
+            nativeMirror={mirrorOverride}
+            face={mirrorFace}
+            title={name}
+            hand={handOf(prefs)}
+            onClose={zoom.onClose}
+          />
+        )}
       </div>
     </CompactStripLabels>
   );

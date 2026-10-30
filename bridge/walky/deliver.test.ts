@@ -11,11 +11,15 @@ import { muxAck, muxOk, type MuxAck, type MuxGrid, type MuxOutcome } from "../mu
 import { HoldStore } from "../surface/holds.ts";
 import { KeyGate } from "../surface/key-gate.ts";
 import { RowRing, SendProtocol, SessionLocks } from "../surface/protocol.ts";
+import { SurfaceShadow } from "../surface/shadow.ts";
+import type { AgentView } from "../types.ts";
 import { RequestStore } from "../surface/requests.ts";
 import { CANCELLED_BY_SENDER, DROPPED_BY_OWNER, HELD_LIMIT_MS, HELD_POLL_MS, reasonOf, sendIdOf, type SendResult, type WalkyHold, type WalkyHost, type WalkyPane } from "./deliver.ts";
 import { WalkyLog } from "./log.ts";
 import { RateLimiter } from "./rate.ts";
+import { OUT_OF_SCOPE } from "./refusals.ts";
 import { NOT_THE_SENDER, WalkyService, type WalkyServiceDeps } from "./service.ts";
+import type { WalkyTarget } from "./types.ts";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -731,6 +735,8 @@ describe("a draft holds the message (M62 spec 02)", () => {
 
 const RULE = "─".repeat(40);
 const WIDTH = 38;
+/** The Claude profile's probe character. */
+const PROBE = loadProfiles().get("claude")!.probe.char;
 /** The Claude range the Send Protocol tests pin (protocol.test.ts `CLAUDE_TEST_RANGE`). */
 const TEST_RANGE: readonly [VersionRange] = [{ range: "2.1.0 - 2.1.296", low: "2.1.0", high: "2.1.296", status: "verified", verifiedThrough: "2.1.296", verifiedOn: "2026-10-12" }];
 
@@ -743,8 +749,25 @@ class BoxPane {
   running = false;
   calls: string[] = [];
   keysSeen: string[] = [];
+  /**
+   * Set: the empty box shows these hints as plain text, the next one on each read, as Claude Code
+   * rotates them and herdr-core reads them (no faint attribute, live 2026-10-30). Null: one faint hint.
+   */
+  plainHints: readonly string[] | null = null;
+  /**
+   * The screen as herdr-core reads it (M78 spec 06): no styling anywhere, so the grey rules and a faint
+   * suggestion come as plain text. False: Claude Code's colours, as a coloured multiplexer reads them.
+   */
+  plain = false;
+  /** Set: the empty box shows Claude Code's prompt suggestion in free words (faint, or plain with {@link plain}). */
+  suggestion: string | null = null;
+  /** The box does not take the probe character: it never shows (a deaf box). */
+  deaf = false;
+  private reads = 0;
 
   private boxRows(): string[] {
+    if (this.box === "" && this.plainHints !== null) return [`❯ ${this.plainHints[this.reads % this.plainHints.length]!}`];
+    if (this.box === "" && this.suggestion !== null) return [this.plain ? `❯ ${this.suggestion}` : `❯ \u001b[2m${this.suggestion}\u001b[0m`];
     if (this.box === "") return ['❯ \u001b[2mTry "fix the failing tests"\u001b[0m'];
     const rows: string[] = [];
     this.box.split("\n").forEach((line, li) => {
@@ -760,8 +783,12 @@ class BoxPane {
     return { revision: this.revision, turn: "idle", modal: "none", composer: this.box === "" ? "empty" : "draft" };
   }
 
-  readGrid = (paneId: string): Promise<MuxOutcome<MuxGrid>> =>
-    Promise.resolve(muxOk({ paneId, text: [...this.transcript, "", RULE, ...this.boxRows(), RULE, "  sonnet · project · main"].join("\n"), truncated: false, revision: this.revision }));
+  readGrid = (paneId: string): Promise<MuxOutcome<MuxGrid>> => {
+    this.reads++;
+    // Claude Code paints its rules grey; a plain-text read (herdr-core) has no colour at all.
+    const rule = this.plain || this.plainHints !== null ? RULE : `\u001b[38;2;136;136;136m${RULE}\u001b[0m`;
+    return Promise.resolve(muxOk({ paneId, text: [...this.transcript, "", rule, ...this.boxRows(), rule, "  sonnet · project · main"].join("\n"), truncated: false, revision: this.revision }));
+  };
 
   private take(text: string): void {
     this.box += text;
@@ -770,6 +797,7 @@ class BoxPane {
 
   typeText = (_paneId: string, text: string): Promise<MuxAck> => {
     this.calls.push(`type:${text}`);
+    if (this.deaf && text === PROBE) return Promise.resolve(muxAck());
     this.take(text);
     return Promise.resolve(muxAck());
   };
@@ -824,7 +852,7 @@ describe("a draft holds the message, through the Send Protocol (M62 spec 02)", (
    * the bridge wires them (index.ts): the send is marked, a held one reads what holds it from its hold
    * file, and the release asks walky first. Each walky poll is one Surface poll of the pane.
    */
-  function wired(): Wired {
+  function wired(options: { readonly realSurface?: boolean; readonly version?: string } = {}): Wired {
     const root = mkdtempSync(join(tmpdir(), "walky-protocol-"));
     roots.push(root);
     const clock = { now: 1_786_000_000_000 };
@@ -840,7 +868,7 @@ describe("a draft holds the message, through the Send Protocol (M62 spec 02)", (
       store,
       locks: new SessionLocks(),
       ring: new RowRing(),
-      profile: () => Promise.resolve(profileFor("claude", "2.1.200", { log: () => undefined, profiles: new Map([["claude", { ...base, versions: TEST_RANGE }]]) })),
+      profile: () => Promise.resolve(profileFor("claude", options.version ?? "2.1.200", { log: () => undefined, profiles: new Map([["claude", { ...base, versions: TEST_RANGE }]]) })),
       generation: () => "claude:s1",
       holds,
       releaseCheck: (id, session, paneId) => check(id, session, paneId),
@@ -865,6 +893,15 @@ describe("a draft holds the message, through the Send Protocol (M62 spec 02)", (
       cancelHeld: (session, paneId, sendId) => void protocol.cancelHeld(session, paneId, sendId),
     };
     const polls: Surface[] = [];
+    // With `realSurface` each poll reads the pane through the bridge's own Surface poll (shadow.ts over
+    // fold.ts and the Claude profile), as index.ts wires it, instead of the box's own word.
+    const shadow = options.realSurface === true ? new SurfaceShadow({ mux: { readGrid: box.readGrid }, pollMs: 1000, log: () => undefined, now, version: () => Promise.resolve("2.1.200"), compare: false }) : null;
+    const view: AgentView = { paneId: "%1", workspaceId: "w1", workspaceLabel: "one", workspaceNumber: 1, tabId: "w1:t1", agent: "claude", status: "idle", cwd: "/x", focused: false };
+    const pollSurface = async (): Promise<Surface> => {
+      if (shadow === null) return box.surface();
+      await shadow.observe([view]);
+      return shadow.surfaceOf("%1")!;
+    };
     const log = new WalkyLog(join(root, "walky"), now);
     const service = new WalkyService({
       log,
@@ -879,9 +916,16 @@ describe("a draft holds the message, through the Send Protocol (M62 spec 02)", (
         clock.now += ms;
         wiredRig.desk(polls.length);
         await state.hold;
-        const surface = box.surface();
+        const surface = await pollSurface();
         polls.push(surface);
-        await Promise.all(protocol.tickHolds("main", () => surface));
+        await Promise.all(
+          protocol.tickHolds(
+            "main",
+            () => surface,
+            shadow === null ? undefined : (paneId) => shadow.boxOf(paneId)?.box ?? null,
+            shadow === null ? undefined : (paneId) => shadow.boxOf(paneId)?.plain === true,
+          ),
+        );
       },
     });
     check = (id, session, paneId) => service.deliverer.stillMeant(id, session, paneId);
@@ -938,6 +982,56 @@ describe("a draft holds the message, through the Send Protocol (M62 spec 02)", (
     expect(r.polls.length).toBe(emptiedAt + 2);
     expect(r.box.calls.filter((call) => call.includes(header))).toHaveLength(1);
     expect(r.box.transcript.at(-1)).toContain(header);
+    expect(r.holds.list()).toEqual([]);
+  });
+
+  // Live 2026-10-30, Claude Code 2.1.314 on herdr-core: the core reads the screen as plain text, so the
+  // empty box's faint `Try "…"` hint came as typed text and a delivery stayed `held: draft present`.
+  const HINTS = ['Try "refactor <filepath>"', 'Try "fix lint errors"', 'Try "how do I log an error?"'];
+
+  test("an empty box that shows only Claude Code's plain-text hint takes the message at once: typed, never held", async () => {
+    const r = wired({ realSurface: true });
+    r.box.plainHints = HINTS;
+    await r.service.send(send(ID, "local/%1"), operator);
+    await r.service.deliverer.settled();
+    expect(r.service.status(ID).receipts[0]).toMatchObject({ state: "delivered" });
+    expect(r.box.calls.filter((call) => call.includes(header))).toHaveLength(1);
+    expect(r.box.transcript.at(-1)).toContain(header);
+    expect(r.polls).toEqual([]);
+    expect(r.holds.list()).toEqual([]);
+  });
+
+  test("on a version past the verified range the probe runs over the plain-text hint: its character and Backspace, the box read clean", async () => {
+    // Claude Code 2.1.314 sat past the profile's verified range on 2026-10-30, so each send probed.
+    const r = wired({ realSurface: true, version: "2.1.314" });
+    r.box.plainHints = HINTS;
+    await r.service.send(send(ID, "local/%1"), operator);
+    await r.service.deliverer.settled();
+    expect(r.service.status(ID).receipts[0]).toMatchObject({ state: "delivered" });
+    expect(r.box.keysSeen[0]).toBe("Backspace");
+    expect(r.box.calls.filter((call) => call.includes(header))).toHaveLength(1);
+    expect(r.box.transcript.at(-1)).toContain(header);
+    expect(r.polls).toEqual([]);
+  });
+
+  test("a draft cleared back to the plain-text hint releases the held message on two reads, the Surface poll reading it as empty", async () => {
+    const r = wired({ realSurface: true });
+    r.box.plainHints = HINTS;
+    r.box.box = "half a thought";
+    let emptiedAt = -1;
+    r.desk = (poll) => {
+      if (poll === 2) {
+        r.box.box = "";
+        emptiedAt = poll;
+      }
+    };
+    await r.service.send(send(ID, "local/%1"), operator);
+    await r.service.deliverer.settled();
+    expect(r.service.status(ID).receipts[0]).toMatchObject({ state: "delivered" });
+    expect(r.polls.slice(0, emptiedAt).every((surface) => surface.composer === "draft")).toBe(true);
+    expect(r.polls.slice(emptiedAt).every((surface) => surface.composer === "empty")).toBe(true);
+    expect(r.polls.length).toBe(emptiedAt + 2);
+    expect(r.box.calls.filter((call) => call.includes(header))).toHaveLength(1);
     expect(r.holds.list()).toEqual([]);
   });
 
@@ -1021,6 +1115,111 @@ describe("a draft holds the message, through the Send Protocol (M62 spec 02)", (
     expect(r.box.calls).toEqual([]);
     expect(r.box.box).toBe("a long thought");
     expect(r.holds.list()).toEqual([]);
+  });
+
+  describe("a held message and Claude Code's suggestion on a plain-text read (M78 spec 06)", () => {
+    const GHOST_ID = "wt_ghostghost01";
+    const ghostHeader = `[walky-talky ${GHOST_ID}] from operator (cli)`;
+    // Live 2026-10-30, Claude Code 2.1.314 on herdr-core: after a turn the empty box showed this suggestion,
+    // plain, and the bridge read it as a draft.
+    const SUGGESTION = "Tell me what you'd like to work on";
+    /** The probe characters typed into the box so far. */
+    const probes = (r: { readonly box: BoxPane }): number => r.box.calls.filter((call) => call === `type:${PROBE}`).length;
+
+    test("the suggestion showing when the message comes: one probe lands at the start of the box, and it is typed at once", async () => {
+      const r = wired({ realSurface: true });
+      r.box.plain = true;
+      r.box.suggestion = SUGGESTION;
+      await r.service.send(send(GHOST_ID, "local/%1"), operator);
+      await r.service.deliverer.settled();
+      expect(r.service.status(GHOST_ID).receipts[0]).toMatchObject({ state: "delivered" });
+      expect(probes(r)).toBe(1);
+      expect(r.box.transcript.at(-1)).toContain(ghostHeader);
+      expect(r.polls).toEqual([]);
+      expect(r.holds.list()).toEqual([]);
+    });
+
+    test("a held delivery whose draft was cleared back to the suggestion goes out at the next check, after one probe", async () => {
+      const r = wired({ realSurface: true });
+      r.box.plain = true;
+      r.box.suggestion = SUGGESTION;
+      r.box.box = "half a thought";
+      let clearedAt = -1;
+      let during: unknown;
+      r.desk = (poll) => {
+        if (poll === 1) during = r.service.status(GHOST_ID).receipts[0];
+        // The person clears the draft; the box shows Claude's suggestion again, as plain text.
+        if (poll === 2) {
+          r.box.box = "";
+          clearedAt = poll;
+        }
+      };
+      await r.service.send(send(GHOST_ID, "local/%1"), operator);
+      await r.service.deliverer.settled();
+      expect(during).toMatchObject({ state: "accepted", reason: "draft present" });
+      expect(r.service.status(GHOST_ID).receipts[0]).toMatchObject({ state: "delivered" });
+      // The bridge's own poll reads the suggestion as a draft; the second poll of the same text releases it.
+      expect(r.polls.slice(clearedAt).every((surface) => surface.composer === "draft")).toBe(true);
+      expect(r.polls.length).toBe(clearedAt + 2);
+      // One probe proved the typed draft when the message came, one proved the suggestion at the check.
+      expect(probes(r)).toBe(2);
+      expect(r.box.calls.filter((call) => call.includes(ghostHeader))).toHaveLength(1);
+      expect(r.holds.list()).toEqual([]);
+    });
+
+    test("a typed draft on a plain-text read stays held: one probe proves it, the same text is never probed again", async () => {
+      const r = wired({ realSurface: true });
+      r.box.plain = true;
+      r.box.suggestion = SUGGESTION;
+      r.box.box = "a long thought";
+      await r.service.send(send(GHOST_ID, "local/%1"), operator);
+      await r.service.deliverer.settled();
+      expect(r.service.status(GHOST_ID).receipts[0]).toMatchObject({ state: "inbox-only", reason: "held past 60 minutes" });
+      expect(r.polls.length).toBeGreaterThan(100);
+      expect(probes(r)).toBe(1);
+      expect(r.box.keysSeen).toEqual(["Backspace"]);
+      expect(r.box.box).toBe("a long thought");
+      expect(r.box.calls.some((call) => call.includes(ghostHeader))).toBe(false);
+    });
+
+    test("a probe that fails keeps the hold: never inbox-only before the hour, and the same text is tried again only after 30 seconds", async () => {
+      const r = wired({ realSurface: true });
+      r.box.plain = true;
+      r.box.suggestion = SUGGESTION;
+      r.box.deaf = true;
+      const reasons: string[] = [];
+      r.desk = (poll) => {
+        reasons.push(`${r.service.status(GHOST_ID).receipts[0]?.state ?? "-"}:${r.service.status(GHOST_ID).receipts[0]?.reason ?? "-"}`);
+        // The box takes keys again after a minute.
+        if (poll === 30) r.box.deaf = false;
+      };
+      await r.service.send(send(GHOST_ID, "local/%1"), operator);
+      await r.service.deliverer.settled();
+      expect(reasons.slice(0, 30).every((reason) => reason === "accepted:draft present")).toBe(true);
+      // Polls are 2 s apart: while it fails, one probe when it came and one every 30 s after, never one
+      // per poll (60 s deaf: three failed probes); the fourth lands and proves the suggestion.
+      expect(probes(r)).toBe(4);
+      expect(r.service.status(GHOST_ID).receipts[0]).toMatchObject({ state: "delivered" });
+      expect(r.box.transcript.at(-1)).toContain(ghostHeader);
+    });
+
+    test("a styled read behaves as today: the faint suggestion is the empty box, and a typed draft is held with no extra write", async () => {
+      const free = wired({ realSurface: true });
+      free.box.suggestion = SUGGESTION;
+      await free.service.send(send(GHOST_ID, "local/%1"), operator);
+      await free.service.deliverer.settled();
+      expect(free.service.status(GHOST_ID).receipts[0]).toMatchObject({ state: "delivered" });
+      expect(probes(free)).toBe(0);
+      expect(free.box.keysSeen).not.toContain("Backspace");
+      const held = wired({ realSurface: true });
+      held.box.suggestion = SUGGESTION;
+      held.box.box = "a long thought";
+      await held.service.send(send(GHOST_ID, "local/%1"), operator);
+      await held.service.deliverer.settled();
+      expect(held.service.status(GHOST_ID).receipts[0]).toMatchObject({ state: "inbox-only", reason: "held past 60 minutes" });
+      expect(held.box.calls).toEqual([]);
+      expect(held.box.keysSeen).toEqual([]);
+    });
   });
 });
 
@@ -1225,5 +1424,196 @@ describe("a held message is taken back (M62 spec 03)", () => {
     expect(after.get("wt_aaaaaaaaaaa1", TARGET)?.receipt).toMatchObject({ state: "inbox-only", reason: CANCELLED_BY_SENDER });
     expect(after.get("wt_aaaaaaaaaaa2", TARGET)?.receipt).toMatchObject({ state: "inbox-only", reason: DROPPED_BY_OWNER });
     expect(after.pending()).toEqual([]);
+  });
+});
+
+describe("a workspace scope (M75 spec 02)", () => {
+  const ws = (paneId: string, label: string, over: Partial<WalkyPane> = {}) => pane(paneId, { label, ...over });
+  const agentOf = (from: WalkyPane) => ({ kind: "agent" as const, pane: from });
+  /** A target the lead's sweep holds for another member, as `who` lists it. */
+  const far = (memberId: string, paneId: string, label: string, state = "idle"): WalkyTarget => ({
+    address: `${memberId}/${paneId}#bbbb`,
+    memberId,
+    machine: memberId,
+    harness: "agent-x",
+    label,
+    state,
+  });
+  const targetsOf = (answer: Awaited<ReturnType<WalkyService["send"]>>) => (answer.ok ? answer.receipts.map((receipt) => `${receipt.target} ${receipt.state}`) : [answer.error]);
+
+  test("`<repo>` reaches every agent pane in that folder on any branch, one receipt each, never the sender, a shell or another folder", async () => {
+    const panes = [ws("w1:p1", "collie-workspace#main"), ws("w1:p2", "collie-workspace#feat"), ws("w1:p3", "other#main"), ws("w1:p4", "collie-workspace#main", { agent: false })];
+    const r = rig(panes);
+    const answer = await r.service.send(send("wt_aaaaaaaaaaa1", "collie-workspace"), agentOf(panes[0]!));
+    expect(targetsOf(answer)).toEqual(["local/w1:p2 accepted"]);
+    await r.service.deliverer.settled();
+    expect(r.host.sends.map((sent) => sent.pane)).toEqual(["w1:p2"]);
+    // The signed `to` is the scope as typed: the recipient reads that it was sent to the folder.
+    expect(r.service.status("wt_aaaaaaaaaaa1").message?.to).toBe("collie-workspace");
+    const fromPhone = await r.service.send(send("wt_aaaaaaaaaaa2", "collie-workspace"), operator);
+    expect(targetsOf(fromPhone)).toEqual(["local/w1:p1 accepted", "local/w1:p2 accepted"]);
+  });
+
+  test("`<repo>#<branch>` narrows to one branch", async () => {
+    const r = rig([ws("w1:p1", "collie-workspace#main"), ws("w1:p2", "collie-workspace#feat")]);
+    expect(targetsOf(await r.service.send(send("wt_aaaaaaaaaaa1", "collie-workspace#feat"), operator))).toEqual(["local/w1:p2 accepted"]);
+  });
+
+  test("`here` is the sender's folder on every branch, without the sender's own pane", async () => {
+    const panes = [ws("w1:p1", "collie-workspace#main"), ws("w1:p2", "collie-workspace#feat"), ws("w1:p3", "other#main")];
+    const r = rig(panes);
+    expect(targetsOf(await r.service.send(send("wt_aaaaaaaaaaa1", "here"), agentOf(panes[0]!)))).toEqual(["local/w1:p2 accepted"]);
+  });
+
+  test("the status of the parent lists every delivery, its member and outcome, and the totals", async () => {
+    const r = rig([ws("w1:p1", "collie-workspace#main"), ws("w1:p2", "collie-workspace#feat")]);
+    await r.service.send(send("wt_aaaaaaaaaaa1", "collie-workspace"), operator);
+    await r.service.deliverer.settled();
+    const status = r.service.status("wt_aaaaaaaaaaa1");
+    expect(status.deliveries).toEqual([
+      { address: "local/w1:p1", member: "local", outcome: "delivered", id: sendIdOf("wt_aaaaaaaaaaa1", "local/w1:p1") },
+      { address: "local/w1:p2", member: "local", outcome: "delivered", id: sendIdOf("wt_aaaaaaaaaaa1", "local/w1:p2") },
+    ]);
+    expect(status.totals).toEqual({ delivered: 2 });
+    // A one-pane message keeps its old answer: no delivery list.
+    await r.service.send(send("wt_aaaaaaaaaaa2", "local/w1:p1"), operator);
+    expect(r.service.status("wt_aaaaaaaaaaa2").deliveries).toBeUndefined();
+  });
+
+  test("`cancel <parent>` takes back every held delivery", async () => {
+    const panes = [ws("w1:p1", "collie-workspace#main"), ws("w1:p2", "collie-workspace#main"), ws("w1:p3", "collie-workspace#main")];
+    // The hold watchers wait on this gate, so both deliveries stay held until the cancel.
+    const gate = Promise.withResolvers<void>();
+    const r = rig(panes, { sleep: () => gate.promise });
+    r.host.answer = { outcome: "held", reason: "turn_running" };
+    await r.service.send(send("wt_aaaaaaaaaaa1", "here"), agentOf(panes[0]!));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const answer = r.service.cancel("wt_aaaaaaaaaaa1", { kind: "agent", pane: panes[0]! });
+    expect(answer.ok && answer.results.map((result) => `${result.target} ${result.result}`)).toEqual(["local/w1:p2 taken", "local/w1:p3 taken"]);
+    gate.resolve();
+    await r.service.deliverer.settled();
+    expect(r.service.status("wt_aaaaaaaaaaa1").totals).toEqual({ "inbox-only": 2 });
+  });
+
+  test("a scope send takes one token from the sender, and each delivery one from its pair", async () => {
+    const panes = [ws("w1:p1", "repo#main"), ws("w1:p2", "repo#main"), ws("w1:p3", "repo#main")];
+    const pairs = new RateLimiter(1);
+    const r = rig(panes, { rate: new RateLimiter(2), pairs });
+    // Two deliveries, one sender token: a second send still fits the sender's two.
+    expect(targetsOf(await r.service.send(send("wt_aaaaaaaaaaa1", "here"), agentOf(panes[0]!)))).toEqual(["local/w1:p2 accepted", "local/w1:p3 accepted"]);
+    // Every pair is full now: each delivery is refused on its own, and the send itself is counted.
+    const second = await r.service.send(send("wt_aaaaaaaaaaa2", "here"), agentOf(panes[0]!));
+    expect(targetsOf(second)).toEqual(["local/w1:p2 refused", "local/w1:p3 refused"]);
+    expect(second.ok && second.receipts.every((receipt) => receipt.reason === "pair limit")).toBe(true);
+    // The third has no sender token left.
+    expect(await r.service.send(send("wt_aaaaaaaaaaa3", "here"), agentOf(panes[0]!))).toMatchObject({ ok: true, receipts: [{ target: "here", state: "refused", reason: "rate limit" }] });
+  });
+
+  test("on a lead: one delivery per matching pane on every member, one leg per pane, and an unreachable member is listed, not dialled", async () => {
+    const legs: string[] = [];
+    const lead = [ws("w1:p1", "collie-workspace#main"), ws("w1:p2", "elsewhere#main")];
+    const r = rig(lead, {
+      memberId: "desk",
+      knownMembers: () => ["desk", "laptop", "other", "gone"],
+      remoteTargets: () => [
+        far("laptop", "w1:p8", "collie-workspace#main"),
+        far("laptop", "w1:p9", "collie-workspace#feat"),
+        far("laptop", "w1:p7", "elsewhere#main"),
+        far("other", "w2:p1", "collie-workspace#main"),
+        far("gone", "w3:p1", "collie-workspace#main", "unreachable"),
+      ],
+      routeRemote: async (m, members, panes) => {
+        legs.push(`${members} ${(panes ?? []).join(",")}`);
+        return (panes ?? []).map((paneId) => ({ id: m.id, target: `${members}/${paneId}`, state: "accepted" as const, verified: "lead" as const, at: 1, by: members }));
+      },
+    });
+    const answer = await r.service.send(send("wt_aaaaaaaaaaa1", "collie-workspace"), operator);
+    expect(targetsOf(answer)).toEqual(["desk/w1:p1 accepted", "gone/all refused", "laptop/w1:p8 accepted", "laptop/w1:p9 accepted", "other/w2:p1 accepted"]);
+    expect(legs).toEqual(["laptop w1:p8,w1:p9", "other w2:p1"]);
+    // Each delivery is a target of its own under the one parent id; the far ones are the members' word.
+    expect(r.log.get("wt_aaaaaaaaaaa1", "laptop/w1:p9")?.receipt).toMatchObject({ state: "accepted", by: "laptop" });
+    await r.service.deliverer.settled();
+    const status = r.service.status("wt_aaaaaaaaaaa1");
+    expect(status.deliveries?.map((delivery) => `${delivery.address} ${delivery.member} ${delivery.outcome}`)).toEqual([
+      "desk/w1:p1 desk delivered",
+      "gone/all gone unreachable",
+      "laptop/w1:p8 laptop accepted",
+      "laptop/w1:p9 laptop accepted",
+      "other/w2:p1 other accepted",
+    ]);
+    expect(status.totals).toEqual({ delivered: 1, unreachable: 1, accepted: 3 });
+    // The same id again answers what it holds and dials nothing more.
+    await r.service.send(send("wt_aaaaaaaaaaa1", "collie-workspace"), operator);
+    expect(legs).toHaveLength(2);
+  });
+
+  test("on a lead, `here` from a member's pane reaches its siblings on every machine, the sender's own machine included, never the sender", async () => {
+    const legs: string[] = [];
+    const r = rig([ws("w1:p1", "collie-workspace#main")], {
+      memberId: "desk",
+      remoteTargets: () => [far("laptop", "w1:p8", "collie-workspace#main"), far("laptop", "w1:p9", "collie-workspace#feat")],
+      routeRemote: async (_message, members, panes) => {
+        legs.push(`${members} ${(panes ?? []).join(",")}`);
+        return [];
+      },
+    });
+    const message = {
+      v: 1 as const,
+      id: "wt_aaaaaaaaaaa1",
+      kind: "agent" as const,
+      from: { memberId: "laptop", address: "laptop/w1:p8#bbbb", harness: "agent-x", label: "collie-workspace#main" },
+      to: "here",
+      replyTo: null,
+      at: 1_786_000_000_000,
+      body: "hello",
+      signer: "laptop",
+      signature: "c2ln",
+    };
+    const receipts = await r.service.receive(message, "origin", false, "laptop");
+    expect(receipts.map((receipt) => `${receipt.target} ${receipt.state}`)).toEqual(["desk/w1:p1 accepted", "laptop/w1:p9 accepted"]);
+    expect(legs).toEqual(["laptop w1:p9"]);
+  });
+
+  test("a member hands the scope to its lead whole, and delivers nothing itself", async () => {
+    const routed: string[] = [];
+    const panes = [ws("w1:p8", "collie-workspace#main"), ws("w1:p9", "collie-workspace#main")];
+    const r = rig(panes, {
+      memberId: "laptop",
+      outcomesOnLead: true,
+      routeRemote: async (m, members, legPanes) => {
+        routed.push(`${m.to} ${members} ${legPanes === undefined ? "-" : legPanes.join(",")}`);
+        return [{ id: m.id, target: "desk/w1:p1", state: "accepted", verified: "origin", at: 1, by: "desk" }];
+      },
+    });
+    const answer = await r.service.send(send("wt_aaaaaaaaaaa1", "here"), agentOf(panes[0]!));
+    expect(routed).toEqual(["here here -"]);
+    expect(targetsOf(answer)).toEqual(["desk/w1:p1 accepted"]);
+    expect(r.host.sends).toEqual([]);
+    // The scope's own line is the leg, hidden once a pane answers for it.
+    expect(r.log.get("wt_aaaaaaaaaaa1", "here")?.receipt.state).toBe("accepted");
+    expect(r.service.status("wt_aaaaaaaaaaa1")).toMatchObject({ receipts: [{ target: "desk/w1:p1" }], deliveries: [{ address: "desk/w1:p1", member: "desk", outcome: "accepted" }], elsewhere: ["desk/w1:p1"] });
+  });
+
+  test("a member delivers a routed scope only to the pane the route names, and only while its label sits in the scope", async () => {
+    const r = rig([ws("w1:p8", "collie-workspace#main"), ws("w1:p9", "other#main"), ws("w1:p7", "collie-workspace#main", { agent: false })], { memberId: "laptop" });
+    const message = (id: string, to: string) => ({
+      v: 1 as const,
+      id,
+      kind: "operator" as const,
+      from: { memberId: "desk", address: null, harness: null, label: "phone" },
+      to,
+      replyTo: null,
+      at: 1_786_000_000_000,
+      body: "hello",
+      signer: "desk",
+      signature: "c2ln",
+    });
+    expect(await r.service.receive(message("wt_aaaaaaaaaaa1", "collie-workspace"), "lead", true, undefined, "w1:p8")).toMatchObject([{ target: "laptop/w1:p8", state: "accepted" }]);
+    // A pane outside the scope cannot ride it, whatever the route names.
+    expect(await r.service.receive(message("wt_aaaaaaaaaaa2", "collie-workspace"), "lead", true, undefined, "w1:p9")).toMatchObject([{ target: "laptop/w1:p9", state: "refused", reason: OUT_OF_SCOPE }]);
+    expect(await r.service.receive(message("wt_aaaaaaaaaaa3", "collie-workspace"), "lead", true, undefined, "w1:p7")).toMatchObject([{ state: "refused", reason: "not an agent pane" }]);
+    expect(await r.service.receive(message("wt_aaaaaaaaaaa4", "collie-workspace"), "lead", true, undefined, "w9:p9")).toMatchObject([{ state: "refused", reason: "no such pane" }]);
+    await r.service.deliverer.settled();
+    expect(r.host.sends.map((sent) => sent.pane)).toEqual(["w1:p8"]);
   });
 });

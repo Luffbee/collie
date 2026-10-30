@@ -81,6 +81,13 @@ import { useHostLabel } from "@/components/crew-provider";
 import { fitsDraftStore, loadDraftEntry, saveDraft } from "@/lib/drafts";
 import { wipeDevice } from "@/lib/wipe";
 import { AttachmentChip, type ComposerAttachment } from "@/components/attachment-chip";
+import { ImageEditor } from "@/components/image-editor";
+import {
+  canvasAvailable,
+  isEditableImage,
+  sameEditTarget,
+  type EditTarget,
+} from "@/lib/image-edit";
 import { useHoldReload } from "@/lib/reload-guard";
 import { isSelfEcho, normalizeDraft } from "@/hooks/use-terminal-draft";
 import { adapterFor } from "@/lib/harness";
@@ -144,6 +151,11 @@ interface ComposerProps {
    * cannot reach, a bridge whose Send Protocol is off), and names the reason in `unreachableNote`.
    */
   surface: Surface;
+  /**
+   * A launch this phone started has not shown its first screen to the bridge yet: the draft stays
+   * editable and on the phone, and nothing sends it. The keys and Type here stay as they are.
+   */
+  starting?: boolean;
   /** Why the box cannot be reached, for the placeholder, when `surface.composer` is `unreachable`. */
   unreachableNote?: string;
   /** Which machine + which named session the pane lives in — scopes every write to the right Herdr. */
@@ -271,6 +283,10 @@ interface ComposerProps {
   /** EXPERIMENT (operator, 2026-09-23): the Changes pill on the belt's pinned block, beside the
    *  switcher mark (actions-row.tsx's `changes`). Absent when the pane reports no folder. */
   changesPill?: { onClick: () => void; label: string };
+
+  /** The output, zoomed: the Zoom pill on the belt's pinned block, directly left of the switcher
+   *  mark (actions-row.tsx's `zoom`). Absent where there is no screen to zoom. */
+  zoomPill?: { onClick: () => void; label: string };
 
   /**
    * The parent drew this pane from the on-device cache (M46 spec 10), so nothing it shows is proven
@@ -456,7 +472,7 @@ interface ClearedDraft {
 
 
 export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Composer(
-  { paneId, instance, surface, unreachableNote, scope, stopOffered = false, agent, canSteer, returnedDraft = false, isShell, cwd, gone, readOnly, composing, onAnswerDialog, dialogCard = false, text, terminalDraft, rawTerminalDraft, prefs, display, onSent, onOpenMessages, held: heldRows, chatEntries, pullHandle, draftNoticeSlot, changesPill, stale, hand = "right", aboveBelt, floatingHint, screen, todos, subagents },
+  { paneId, instance, surface, starting = false, unreachableNote, scope, stopOffered = false, agent, canSteer, returnedDraft = false, isShell, cwd, gone, readOnly, composing, onAnswerDialog, dialogCard = false, text, terminalDraft, rawTerminalDraft, prefs, display, onSent, onOpenMessages, held: heldRows, chatEntries, pullHandle, draftNoticeSlot, changesPill, zoomPill, stale, hand = "right", aboveBelt, floatingHint, screen, todos, subagents },
   ref,
 ) {
   const revalidator = useRevalidator();
@@ -509,6 +525,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // The field itself is off only when nothing typed here can ever leave for this pane: a gone pane,
   // a read-only device, a box out of reach. Derived from the slot, never passed in.
   const locked = fieldLocked(slot);
+  const lockedRef = useRef(locked);
+  lockedRef.current = locked;
   // Clear (ADR 0116) is offered while the box holds a draft and no dialog owns the keys. The Surface's own
   // words, so a stale or unreadable read greys it; the keys door and the link are `way.keysSendable`.
   const clearOffered = way.keysSendable && shownSurface.composer === "draft" && shownSurface.modal === "none";
@@ -567,6 +585,22 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const reportOn = isLead(scope) && reportOfferOf(prefs);
   const reportCount = useTroubleOffer(reportKey);
   const draftPaneRef = useRef({ scope, scopeId, paneId });
+  // The image editor's open session. Epoch bumps on pane/scope change, lock, or unmount so a confirm
+  // that resolves after the operator has moved on cannot upload into the pane now on screen.
+  const [editSession, setEditSession] = useState<{ id: number; file: File; startInEdit: boolean } | null>(null);
+  const editSessionSeq = useRef(0);
+  const editResolveRef = useRef<((result: File | "cancel") => void) | null>(null);
+  const editEpoch = useRef(0);
+  const editTargetRef = useRef<(EditTarget & { epoch: number }) | null>(null);
+  // A chip edit's session carries the picked file; "Use this image" with no change hands the same
+  // object back, and that means: nothing to upload, nothing to replace.
+  const editReplaceRef = useRef<File | null>(null);
+  // The bytes behind each photo chip made in this page session, so Edit needs no re-download. The
+  // bridge's CSP (`connect-src 'self'`) blocks fetching the chip's blob: URL. Keyed by the chip
+  // object, so a chip that leaves takes its file with it, and a restored chip has none (no Edit).
+  const attachmentFilesRef = useRef(new WeakMap<ComposerAttachment, File>());
+  const mountedRef = useRef(true);
+  const abortEditRef = useRef<() => void>(() => {});
   // THE BELT'S X AND ITS UNDO (M40 spec 04, issue #291). The X empties this box in one tap
   // (`clearByHand`); until the operator's next act the same slot is Undo, and this is what Undo puts
   // back. NO TIMER (Altan, 2026-09-27): a slot that left on a clock would narrow the pinned block
@@ -635,6 +669,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     // So does an open Undo window from the belt's X: it held the outgoing pane's draft, and it
     // never outlives that pane's view.
     endUndoWindowRef.current();
+    abortEditRef.current();
     draftPaneRef.current = { scope, scopeId, paneId };
     const restored = loadDraftEntry(scope, paneId);
     inputValueRef.current = restored?.text ?? "";
@@ -662,6 +697,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   clearComposedDraftRef.current = clearComposedDraft;
   const [protocolOffer, setProtocolOffer] = useState<{ text: string; isDraft: boolean; rowsHash: string | null; offers: readonly SendOffer[]; capAck: boolean } | null>(null);
   const [uploading, setUploading] = useState(false);
+  const activeUploadsRef = useRef(0);
   // Pending-send preview: set on a successful send, cleared when the mirror catches up (next text
   // update) or after a 6s safety timeout. Shows "You sent: …" so the user knows the message landed.
   const [lastSent, setLastSent] = useState<string | null>(null);
@@ -979,7 +1015,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const micIsPrimary = micShown && !direct.active && !hasDraft;
   // The Send button's hold (M62). Offered only where a message could leave: not on a locked field, not
   // offline, not while Type mode owns the button as its Stop control, and not mid-send.
-  const canMessage = hasDraft && !locked && !offline && !direct.active && !sending && !walky.sending;
+  const canMessage = hasDraft && !starting && !locked && !offline && !direct.active && !sending && !walky.sending;
   // M69: the Steer row of that menu. Only while the turn reads running, only where the bridge says the
   // profile has a steer key, and never for a reply in message mode (a walky message always queues).
   const steerRow = canSteer === true && shownSurface.turn === "running" && walky.aim === null;
@@ -1055,7 +1091,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   function acceptTranscript(transcript: string) {
     const draftEmpty = inputValueRef.current.trim() === "" && attachmentsRef.current.length === 0;
     const mayHandsFree =
-      handsFree && draftEmpty && noEchoRef.current === null && !locked && !offline && slot !== "answer";
+      handsFree && draftEmpty && noEchoRef.current === null && !starting && !locked && !offline && slot !== "answer";
     if (mayHandsFree) {
       void send(transcript, false);
       return;
@@ -1168,7 +1204,13 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // still one tap from coming back, and a reload would take that tap away.
   useHoldReload(
     `composer:${paneId}`,
-    hasDraft || clearedDraft !== null || direct.active || direct.value !== "" || direct.busy || uploading,
+    hasDraft ||
+      clearedDraft !== null ||
+      direct.active ||
+      direct.value !== "" ||
+      direct.busy ||
+      uploading ||
+      editSession !== null,
   );
 
   // Preview appearance latch. A STABLE, non-echo, not-already-handled draft flips the preview on —
@@ -1540,7 +1582,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     // check and the mode read the fully trimmed text on both, so neither sees a difference.
     const trimmed = value.trim();
     const t = isShell ? value.trimEnd() : trimmed;
-    if (!trimmed || locked || sending) return false;
+    if (!trimmed || starting || locked || sending) return false;
     if (offlineRef.current) {
       setSendRefusal(phoneRefusal(translate("composer.send.reconnect")));
       return false;
@@ -1562,6 +1604,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // `resend` is a resend of an ended held row: the request carries the old id and an empty text, the
   // bridge takes the row's own text, and `shown` (the row's text, maybe masked) is only for the preview.
   async function sendThroughProtocol(t: string, isDraft: boolean, mode: SendMode, rowsHash: string | null, capAck = false, resend?: { oldId: string; shown: string }, when?: SendWhen): Promise<boolean> {
+    if (starting) return false;
     setSending(true);
     setSendRefusal(null);
     setPendingUnknown(null); // a new send supersedes the last one's open question (#511)
@@ -1636,13 +1679,14 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // the box holds). Never a draft, so the box keeps whatever the person is typing now. True when the
   // bridge took it.
   function resendHeld(row: HeldRow, action: HeldAction): Promise<boolean> {
-    if (sending || locked) return Promise.resolve(false);
+    if (starting || sending || locked) return Promise.resolve(false);
     if (action === "resend") return sendThroughProtocol("", false, row.mode, null, false, { oldId: row.requestId, shown: row.text });
     return sendThroughProtocol(row.text, false, action, null);
   }
 
   // A tap on an offer the last answer made: a new request with a new id, or nothing (`cancel`).
   function onProtocolOffer(offer: SendOffer) {
+    if (starting) return;
     const held = protocolOffer;
     setProtocolOffer(null);
     setSendRefusal(null);
@@ -1665,6 +1709,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // turn. A destructive line arms "Really send?", and the confirming tap must send what was armed, so
   // `armedWhen` keeps the choice across the two taps (the confirm button calls this with it).
   function onSendClick(when?: SendWhen) {
+    if (starting) return;
     // A reply in message mode goes to the other session through the bridge's walky route, and is not
     // typed into this pane by us, so the destructive-command guard (a shell concern) does not apply.
     if (walky.aim !== null) {
@@ -1836,8 +1881,66 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // questions again on arrival, and its answer is the one that counts (it can read the bytes, which
   // is the only way to catch a binary wearing a `.md` name). Spending a phone's uplink on 40 MB to
   // be told 10 is the limit is the thing worth not doing.
-  async function uploadFile(file: File) {
-    if (locked) return;
+  function beginUpload() {
+    activeUploadsRef.current += 1;
+    if (mountedRef.current) setUploading(true);
+  }
+
+  function endUpload() {
+    activeUploadsRef.current = Math.max(0, activeUploadsRef.current - 1);
+    if (mountedRef.current && activeUploadsRef.current === 0) setUploading(false);
+  }
+
+  function finishEdit(result: File | "cancel") {
+    const resolve = editResolveRef.current;
+    editResolveRef.current = null;
+    editTargetRef.current = null;
+    editReplaceRef.current = null;
+    // Batch `uploading = true` into the same commit that clears `editSession` so `useHoldReload`
+    // never drops to false during the Promise microtask between `finishEdit` and `uploadFile`.
+    const acquiredUpload = mountedRef.current && result !== "cancel" && resolve !== null;
+    if (acquiredUpload) beginUpload();
+    if (mountedRef.current) setEditSession(null);
+    resolve?.(acquiredUpload ? result : "cancel");
+  }
+
+  function abortEdit() {
+    editEpoch.current += 1;
+    finishEdit("cancel");
+  }
+
+  // Epoch stays put while an edit is open. Abort is the only thing that moves it, so a confirm
+  // callback captured by the dialog can see that it no longer belongs to this pane.
+  function requestEdit(file: File, startInEdit = false): Promise<File | "cancel"> {
+    const epoch = editEpoch.current;
+    const target = draftPaneRef.current;
+    editTargetRef.current = { paneId: target.paneId, scopeId: target.scopeId, epoch };
+    editReplaceRef.current = startInEdit ? file : null;
+    editSessionSeq.current += 1;
+    const sessionId = editSessionSeq.current;
+    return new Promise((resolve) => {
+      editResolveRef.current = resolve;
+      setEditSession({ id: sessionId, file, startInEdit });
+    });
+  }
+
+  function confirmEdit(file: File) {
+    const target = editTargetRef.current;
+    if (target === null || target.epoch !== editEpoch.current) return;
+    if (!sameEditTarget(target, draftPaneRef.current)) return;
+    if (lockedRef.current) return;
+    if (editReplaceRef.current !== null && file === editReplaceRef.current) {
+      finishEdit("cancel");
+      return;
+    }
+    if (offlineRef.current) {
+      setStatus(translate("composer.send.reconnect"), "error");
+      return;
+    }
+    if (file.size === 0) {
+      setStatus(translate("composer.imageEdit.failed"), "error");
+      return;
+    }
     const refusal = rejectAttachment(file, limits);
     if (refusal === "tooLarge") {
       setStatus(translate("composer.upload.tooLarge", { max: limitMb(limits) }), "error");
@@ -1847,12 +1950,49 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
       setStatus(translate("composer.upload.badType", { name: file.name }), "error");
       return;
     }
-    setUploading(true);
+    finishEdit(file);
+  }
+
+  useEffect(() => {
+    mountedRef.current = true;
+    // Assigned here, not during render: abort only touches refs, so the first closure stays valid.
+    abortEditRef.current = abortEdit;
+    return () => {
+      mountedRef.current = false;
+      abortEditRef.current();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (editSession !== null && locked) abortEditRef.current();
+  }, [editSession, locked]);
+
+  // Upload an attachment. `targetPaneId` is the pane the file was accepted for: an edit confirmed
+  // after the operator switched panes must not follow the closure's latest paneId.
+  async function uploadFile(
+    file: File,
+    targetPaneId = paneId,
+    targetScope = scope,
+    alreadyHeld = false,
+    replaceN?: number,
+  ) {
+    if (lockedRef.current) return;
+    const refusal = rejectAttachment(file, limits);
+    if (refusal === "tooLarge") {
+      setStatus(translate("composer.upload.tooLarge", { max: limitMb(limits) }), "error");
+      return;
+    }
+    if (refusal === "badType") {
+      setStatus(translate("composer.upload.badType", { name: file.name }), "error");
+      return;
+    }
+    if (!alreadyHeld) beginUpload();
     try {
-      const res = await api.uploadFile(paneId, file, scope);
+      const res = await api.uploadFile(targetPaneId, file, targetScope);
       if (res.ok) {
         direct.deactivateSilently();
-        addAttachment(file, res.path);
+        if (replaceN === undefined) addAttachment(file, res.path);
+        else if (draftPaneRef.current.paneId === targetPaneId) replaceAttachment(replaceN, file, res.path);
         setStatus(translate("composer.upload.success"), "success");
       } else {
         setStatus(describeApiError(res), "error");
@@ -1860,7 +2000,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     } catch (err) {
       setStatus(describeThrownError(err), "error");
     } finally {
-      setUploading(false);
+      if (!alreadyHeld) endUpload();
     }
   }
 
@@ -1880,6 +2020,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     if (kind === "image") {
       const previewUrl = makePreview(file);
       if (previewUrl !== undefined) attachment.previewUrl = previewUrl;
+      attachmentFilesRef.current.set(attachment, file);
     }
     const field = inputRef.current;
     const caret =
@@ -1890,6 +2031,47 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     caretRef.current = placed.caret;
     updateInput(placed.text);
     focusInputAt(placed.caret);
+  }
+
+  /**
+   * The chip's Edit, after a finished upload: the same chip (its number, so its marker in the text
+   * stays where it is) now points at the new path and shows the new picture. The old upload is not
+   * deleted: the bridge has no delete route, and the file is only a path in the pane's folder that
+   * nothing refers to any more. A chip the person removed while the upload ran is not brought back.
+   */
+  function replaceAttachment(n: number, file: File, path: string) {
+    const old = attachmentsRef.current.find((a) => a.n === n);
+    if (old === undefined) return;
+    revokePreview(old);
+    const next: ComposerAttachment = { n, path, name: file.name, kind: old.kind };
+    const previewUrl = makePreview(file);
+    if (previewUrl !== undefined) next.previewUrl = previewUrl;
+    attachmentFilesRef.current.set(next, file);
+    attachmentsRef.current = attachmentsRef.current.map((a) => (a.n === n ? next : a));
+    setAttachments(attachmentsRef.current);
+    persistDraft();
+  }
+
+  /** The chip's Edit: open the editor on the chip's own bytes, on the tools. A result that is a new
+   *  file uploads once and replaces the chip. The same file back means nothing changed. */
+  async function editAttachment(attachment: ComposerAttachment) {
+    const file = attachmentFilesRef.current.get(attachment);
+    if (file === undefined || editSession !== null || lockedRef.current) return;
+    if (offlineRef.current) {
+      setStatus(translate("composer.send.reconnect"), "error");
+      return;
+    }
+    const epoch = editEpoch.current;
+    const edited = await requestEdit(file, true);
+    if (edited === "cancel") return;
+    try {
+      if (!mountedRef.current || epoch !== editEpoch.current) return;
+      if (lockedRef.current || offlineRef.current) return;
+      const target = draftPaneRef.current;
+      await uploadFile(edited, target.paneId, target.scope, true, attachment.n);
+    } finally {
+      endUpload();
+    }
   }
 
   /** The chip's x: the chip goes, and so does its marker (with one space beside it). Deleting the
@@ -2061,12 +2243,55 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     caretRef.current = e.currentTarget.selectionStart;
   }
 
+  // Images wait for the sheet: a preview with Attach (the original bytes) and Edit. Anything else keeps the old path: refuse locally, then upload.
+  // `announceBadType` is false for a paste, which has always swallowed a file it cannot take so the
+  // textarea can still receive a plain-text paste on the same clipboard.
+  async function presentFiles(files: File[], announceBadType: boolean) {
+    const epoch = editEpoch.current;
+    for (const file of files) {
+      if (!mountedRef.current || epoch !== editEpoch.current) return;
+      if (lockedRef.current) return;
+      const refusal = rejectAttachment(file, limits);
+      if (refusal === "tooLarge") {
+        setStatus(translate("composer.upload.tooLarge", { max: limitMb(limits) }), "error");
+        continue;
+      }
+      if (refusal === "badType") {
+        if (announceBadType) setStatus(translate("composer.upload.badType", { name: file.name }), "error");
+        continue;
+      }
+      if (isEditableImage(file, limits)) {
+        if (offlineRef.current) {
+          setStatus(translate("composer.send.reconnect"), "error");
+          return;
+        }
+        if (!canvasAvailable()) {
+          // No canvas, no editor: the picture goes up as it is, the way it did before the editor.
+          const target = draftPaneRef.current;
+          await uploadFile(file, target.paneId, target.scope);
+          continue;
+        }
+        const edited = await requestEdit(file);
+        if (edited === "cancel") continue;
+        try {
+          if (!mountedRef.current || epoch !== editEpoch.current) return;
+          if (lockedRef.current || offlineRef.current) return;
+          const target = draftPaneRef.current;
+          await uploadFile(edited, target.paneId, target.scope, true);
+        } finally {
+          endUpload();
+        }
+        continue;
+      }
+      const target = draftPaneRef.current;
+      await uploadFile(file, target.paneId, target.scope);
+    }
+  }
+
   async function onPickFile(e: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files ?? []);
     e.target.value = ""; // allow re-picking the same file(s)
-    for (const file of files) {
-      await uploadFile(file);
-    }
+    await presentFiles(files, true);
   }
 
   // Paste a file straight from the clipboard (e.g. a screenshot) the same way the picker does.
@@ -2085,7 +2310,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
       if (!file) continue;
       if (rejectAttachment(file, limits) === "badType") continue;
       e.preventDefault();
-      void uploadFile(file);
+      void presentFiles([file], false);
       return;
     }
     const pastedText = e.clipboardData?.getData?.("text/plain") ?? "";
@@ -2447,6 +2672,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
                 }
               : undefined
           }
+          // The output, zoomed: a pill directly left of the Switch mark (actions-row.tsx's `zoom`).
+          zoom={zoomPill}
           hand={hand}
           // The X on the pinned block while the box holds a draft, then Undo in its place until
           // the next act (M40 spec 04). See `clearSlot` for when it shows.
@@ -2471,6 +2698,11 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             reason and shares that place, one notice at a time, and so does the held-send card
             (amended 2026-10-18), above the notice. See `floating` above; it renders here. */}
         {draftNoticeSlot ? createPortal(floating, draftNoticeSlot) : floating}
+        {/* A launch this phone started, before the bridge has read its first screen: Send waits, and
+            this says why for as long as it is true. */}
+        <Collapse open={starting && !locked && !direct.active}>
+          <Notice variant="box" tone="info" announce="status">{translate("newPage.starting")}</Notice>
+        </Collapse>
         {/* The Send Protocol's offers (M56 spec 05), at the thumb: Add / Replace / Cancel on a draft,
             Submit / Discard on text that was typed and not sent, and the second tap on a screen
             Collie cannot read. Each is a new request; the ✕ drops the strip and sends nothing. */}
@@ -2478,7 +2710,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
           {protocolOffer !== null && (
             <SendOfferStrip
               offers={protocolOffer.offers}
-              disabled={sending || locked}
+              disabled={starting || sending || locked}
               onOffer={onProtocolOffer}
               // The ✕ drops the strip and hides the notice over it: a notice that still says "tap Type
               // here" with no Type here to tap is a sentence about a button that is gone.
@@ -2717,6 +2949,14 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
                   key={attachment.n}
                   attachment={attachment}
                   onRemove={() => removeAttachment(attachment)}
+                  onEdit={
+                    attachment.kind === "image" &&
+                    !locked &&
+                    canvasAvailable() &&
+                    attachmentFilesRef.current.has(attachment)
+                      ? () => void editAttachment(attachment)
+                      : undefined
+                  }
                   onSelect={
                     attachment.kind === "paste"
                       ? () => setEditingPaste({ paneId, scopeId, n: attachment.n })
@@ -2970,7 +3210,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               variant="destructive"
               className={cn(TOOLBAR_TAP_TARGET, "h-9 shrink-0 rounded-md px-3 text-sm font-semibold")}
               onClick={() => onSendClick(armedWhen.current)}
-              disabled={locked || offline || !hasDraft || sending}
+              disabled={starting || locked || offline || !hasDraft || sending}
               title={offline ? translate("composer.send.reconnect") : undefined}
               aria-label={offline ? translate("composer.send.reconnect") : translate("composer.send.reallySend")}
             >
@@ -3009,7 +3249,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               {...sendHold}
               className={cn(TOOLBAR_TAP_TARGET, "size-9 shrink-0 select-none rounded-full [-webkit-touch-callout:none]")}
               onClick={direct.active ? () => direct.deactivate() : () => onSendClick()}
-              disabled={locked || sending || (offline && !direct.active)}
+              disabled={locked || sending || ((starting || offline) && !direct.active)}
               title={offline && !direct.active ? translate("composer.send.reconnect") : undefined}
               aria-label={
                 direct.active
@@ -3046,7 +3286,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
           hand={hand}
           padClassName={blockPad}
           keyboardOpened={openedByKeyboard.current}
-          sends={handsFree && !hasDraft && noEcho === null}
+          sends={!starting && handsFree && !hasDraft && noEcho === null}
           engine={recorder.engine}
           failure={recorder.failure}
           onSendToHost={recorder.canSendToHost ? recorder.sendToHost : null}
@@ -3109,6 +3349,23 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             />
           </div>
         </BottomSheet>
+      )}
+      {editSession !== null && (
+        <ImageEditor
+          key={editSession.id}
+          file={editSession.file}
+          startInEdit={editSession.startInEdit}
+          onConfirm={confirmEdit}
+          onCancel={() => finishEdit("cancel")}
+          onFail={(reason) => {
+            setStatus(
+              translate(reason === "unavailable" ? "composer.imageEdit.unavailable" : "composer.imageEdit.failed"),
+              "error",
+            );
+            finishEdit("cancel");
+          }}
+          onReject={() => setStatus(translate("composer.imageEdit.failed"), "error")}
+        />
       )}
     </>
   );

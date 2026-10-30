@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { isAbsolute, join } from "node:path";
 
 import { BEACON_DIR_MODE, beaconFileName, beaconKey, beaconsDir, EDGE_FILE, EDGE_MAX_AGE_MS, EDGE_SPOOL_MAX, edgesDir } from "../bridge/beacon/paths.ts";
-import { HOOK_TARGET_FILE, HOOK_TARGETS_MAX, hookTargetsDir, parseHookTarget } from "../bridge/beacon/hook-targets.ts";
+import { HOOK_TARGET_FILE, HOOK_TARGETS_MAX, hookTargetsDir, parseHookTarget, type HookTargetRecord } from "../bridge/beacon/hook-targets.ts";
 import { edgeModelOf } from "../bridge/beacon/parse.ts";
 import { parseProcStartTime, procStatPath } from "../bridge/beacon/liveness.ts";
 import { HOST } from "../bridge/host.ts";
@@ -90,6 +90,13 @@ export { privateDir };
 const HERDR_NAMESPACE = "herdr";
 
 /**
+ * The marker namespace of a herdr-core terminal, which is that adapter's registry key. A literal, not
+ * an import, because this verb runs on every hook event and must stay a handful of module loads;
+ * `cli/beacon.test.ts` pins it to the adapter's own constant.
+ */
+export const HERDR_CORE_NAMESPACE = "herdr-core";
+
+/**
  * Where a multiplexer's pane identity lives in the environment of a process running inside it.
  *
  * THE GATE IS THIS TABLE, and it is consulted BEFORE stdin is read. An agent in a plain terminal has
@@ -143,6 +150,15 @@ const MUX_ENV_MARKERS: readonly MuxEnvMarker[] = [
     namespace: HERDR_NAMESPACE,
     paneVar: "HERDR_PANE_ID",
     scopeVar: "HERDR_SOCKET_PATH",
+    scopeOf: (raw) => raw,
+  },
+  {
+    // The new Herdr core exports the terminal's address and the socket of the core that owns it
+    // (M74 spec 04, probed 2026-10-29 on hc 0.1.14). A core terminal started from inside the Herdr
+    // TUI inherits that TUI's variables too, so a pane can carry both markers; each names only its own.
+    namespace: HERDR_CORE_NAMESPACE,
+    paneVar: "HC_TERMINAL_ID",
+    scopeVar: "HC_TERMINAL_SOCKET",
     scopeOf: (raw) => raw,
   },
 ];
@@ -301,8 +317,8 @@ export function readPidStartTime(files: Files, pid: number): number | null {
  * this one, never half of either. The temp name carries the pid so two hooks firing at once in two
  * panes cannot collide on it.
  */
-function writeBeacon(deps: BeaconEmitDeps, record: BeaconRecord): void {
-  const dir = beaconsDir(deps.ctx.stateDir);
+function writeBeacon(deps: BeaconEmitDeps, stateDir: string, record: BeaconRecord): void {
+  const dir = beaconsDir(stateDir);
   const key = beaconKey(record.markers);
   const temp = join(dir, `.${key}.${record.pid}.tmp`);
   deps.files.mkdirp(dir, BEACON_DIR_MODE);
@@ -378,7 +394,11 @@ export function writeEdge(deps: BeaconEmitDeps, stateDir: string, record: EdgeRe
 /**
  * The prompt as Claude Code hands it, unwrapped. A collapsed paste arrives as
  * `\n\n<pasted_content id="f27a">\n<text>\n</pasted_content id="f27a">\n` (M56 spec 01 lab, Table 5),
- * so the wrapper is cut before the hash. Only this emitter knows that form.
+ * so the wrapper is cut before the hash. Only this emitter hashes that form.
+ *
+ * TWIN: `unwrapPastes` in bridge/journal/claude.ts takes the same wrapper off what the Chat and the
+ * queue row draw. It is stricter (hex ids, a tag at a line start, an unlabelled close allowed, ends
+ * trimmed); this one stays as it is because the hash it feeds must keep matching the send receipts.
  */
 export function unwrapPrompt(prompt: string): string {
   return prompt.replace(/<pasted_content id="[^"]*">\n?([\s\S]*?)\n?<\/pasted_content id="[^"]*">/gu, "$1");
@@ -405,23 +425,32 @@ export function promptHashOf(deps: BeaconEmitDeps, stateDir: string, payload: Js
  * the edge goes to this emitter's own state dir, as it did before the registry.
  */
 export function edgeStateDirs(deps: EdgeTargetDeps): string[] {
-  const dirs: string[] = [];
-  const registry = hookTargetsDir(deps.ctx.env, deps.ctx.home);
-  if (privateDir(deps, registry)) {
-    for (const name of deps.files.list(registry).filter((entry) => HOOK_TARGET_FILE.test(entry)).slice(0, HOOK_TARGETS_MAX)) {
-      const path = join(registry, name);
-      const target = parseHookTarget(deps.files.read(path) ?? "");
-      if (target === null) continue;
-      const start = readPidStartTime(deps.files, target.pid);
-      if (start === null || (target.pidStartTime !== null && start !== target.pidStartTime)) {
-        deps.files.remove(path);
-        continue;
-      }
-      dirs.push(target.stateDir);
-    }
-  }
+  const dirs = liveHookTargets(deps).map((target) => target.stateDir);
   if ((deps.ctx.env.COLLIE_STATE_DIR ?? "").trim() !== "" || dirs.length === 0) dirs.push(deps.ctx.stateDir);
   return [...new Set(dirs.map((dir) => deps.files.realpath(dir) ?? dir))];
+}
+
+/**
+ * The bridges in the hook target registry whose pid still runs as the same process, in file order. A
+ * dead or reused pid's file is deleted. Read by the emitter ({@link edgeStateDirs}) and by `collie
+ * mux list`, so both agree on what "live" means. A registry folder that is not private reads as empty.
+ */
+export function liveHookTargets(deps: EdgeTargetDeps): HookTargetRecord[] {
+  const live: HookTargetRecord[] = [];
+  const registry = hookTargetsDir(deps.ctx.env, deps.ctx.home);
+  if (!privateDir(deps, registry)) return live;
+  for (const name of deps.files.list(registry).filter((entry) => HOOK_TARGET_FILE.test(entry)).slice(0, HOOK_TARGETS_MAX)) {
+    const path = join(registry, name);
+    const target = parseHookTarget(deps.files.read(path) ?? "");
+    if (target === null) continue;
+    const start = readPidStartTime(deps.files, target.pid);
+    if (start === null || (target.pidStartTime !== null && start !== target.pidStartTime)) {
+      deps.files.remove(path);
+      continue;
+    }
+    live.push(target);
+  }
+  return live;
 }
 
 /** True when every marker is a Herdr one: Herdr names its agents itself, so no beacon is written. */
@@ -555,7 +584,9 @@ export async function cmdBeaconEmit(deps: BeaconEmitDeps): Promise<number> {
     const session = readField(payload, "session_id", SESSION_ID);
     if (session === null) return EXIT.OK;
 
-    writeBeacon(deps, {
+    // The beacon follows the edge: one per bridge that took the edge, so a bridge of another
+    // instance finds the session too. Each in its own guard, like the edges.
+    const beacon: BeaconRecord = {
       schemaVersion: BEACON_SCHEMA_VERSION,
       harness: BEACON_HARNESS,
       session: { kind: "id", value: session },
@@ -564,7 +595,14 @@ export async function cmdBeaconEmit(deps: BeaconEmitDeps): Promise<number> {
       pidStartTime,
       markers,
       heartbeatMs: now,
-    });
+    };
+    for (const stateDir of stateDirs()) {
+      try {
+        writeBeacon(deps, stateDir, beacon);
+      } catch {
+        // No beacon for this target. Its pane reads as having no session until the next event.
+      }
+    }
     return EXIT.OK;
   } catch {
     // Every failure is the same failure: there is no beacon for this pane right now.

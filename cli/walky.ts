@@ -5,9 +5,11 @@ import { readEnvMarkers, edgeStateDirs, type EdgeTargetDeps } from "./beacon.ts"
 import { holdSocketSafe } from "./hold.ts";
 import { EXIT, type Io } from "./io.ts";
 import type { JsonObject, JsonValue } from "../bridge/json.ts";
-import { asJsonObject, asJsonString, parseJsonObject } from "../web/src/lib/json.ts";
-import { LOCAL_MEMBER, parseAddress } from "../bridge/walky/address.ts";
+import { asJsonNumber, asJsonObject, asJsonString, parseJsonObject } from "../web/src/lib/json.ts";
+import { inScope, labelScope, LOCAL_MEMBER, parseAddress, type WalkyScope } from "../bridge/walky/address.ts";
 import { readMessage, readReceipt } from "../bridge/walky/parse.ts";
+import { BARE_BAD_REQUEST, UNREAD_BY_OLDER_BRIDGE } from "../bridge/walky/refusals.ts";
+import type { WalkyTotals } from "../bridge/walky/service.ts";
 import { walkySocketPath } from "../bridge/walky/socket.ts";
 import { formatRead, mintWalkyId, OUTCOME_ON_LEAD, WALKY_ID, type WalkyMessage, type WalkyReceipt } from "../bridge/walky/types.ts";
 
@@ -59,12 +61,23 @@ type Answer = { readonly ok: true; readonly body: JsonObject; readonly path: str
 
 /**
  * Ask the bridges in turn. A bridge that answers `not here` does not drive this pane: the next one is
- * asked. With `path` set only that bridge is asked (the one that took a send).
+ * asked. So is one that answers the bare `bad request` (added 2026-10-30): a bridge before that day
+ * says it to any request it cannot read, before it looks at the markers, so an older release lane
+ * asked first (this install's own socket) stopped a `here` send the pane's newer bridge would take.
+ * It is reported, in words, only when no other bridge took the request. So is one that holds no message
+ * with the id (added 2026-10-30): a machine can run two Collies on one multiplexer, both know the
+ * pane, and only one holds the message. A bridge before that day answers `no message <id> ...` as an
+ * error, a newer one answers `not here` with the sentence in `missing`; the sentence is printed only
+ * when no bridge held the message, the last one asked wins. With `path` set only that bridge is asked
+ * (the one that took a send). With `first` set that bridge is asked first and the rest follow.
  */
-async function request(deps: WalkyDeps, body: JsonObject, path?: string): Promise<Answer> {
+async function request(deps: WalkyDeps, body: JsonObject, path?: string, first?: string): Promise<Answer> {
   const line = `${JSON.stringify({ v: 1, markers: readEnvMarkers(deps.ctx.env), ...body })}\n`;
-  const paths = path === undefined ? socketPaths(deps) : [path];
+  const listed = socketPaths(deps);
+  const paths = path !== undefined ? [path] : first === undefined ? listed : [first, ...listed.filter((candidate) => candidate !== first)];
   let notHere = false;
+  let unread = false;
+  let missing: string | null = null;
   for (const candidate of paths) {
     const raw = await deps.ask(candidate, line).catch(() => null);
     if (raw === null) continue;
@@ -74,10 +87,21 @@ async function request(deps: WalkyDeps, body: JsonObject, path?: string): Promis
     const error = asJsonString(answer.error) ?? "failed";
     if (error === "not here") {
       notHere = true;
+      missing = asJsonString(answer.missing) ?? missing;
+      continue;
+    }
+    if (error.startsWith("no message ")) {
+      missing = error;
+      continue;
+    }
+    if (error === BARE_BAD_REQUEST) {
+      unread = true;
       continue;
     }
     return { ok: false, error };
   }
+  if (missing !== null) return { ok: false, error: missing };
+  if (unread) return { ok: false, error: UNREAD_BY_OLDER_BRIDGE };
   if (notHere) return { ok: false, error: "no Collie bridge on this machine knows this pane" };
   return { ok: false, error: "no running Collie bridge answers on this machine" };
 }
@@ -102,7 +126,7 @@ export function shown(value: string): string {
 function failure(deps: WalkyDeps, answer: { readonly error: string }): number {
   deps.io.err(`walky talky: ${shown(answer.error)}`);
   if (answer.error.startsWith("no running")) return EXIT.UNREACHABLE;
-  if (answer.error === "empty body" || answer.error === "bad request") return EXIT.USAGE;
+  if (answer.error === "empty body" || answer.error.startsWith(BARE_BAD_REQUEST)) return EXIT.USAGE;
   return EXIT.STATE;
 }
 
@@ -193,31 +217,82 @@ function windows(deps: WalkyDeps): boolean {
   return true;
 }
 
-/** `walky who [--json]`: every reachable target. */
+/** What `who` was asked to list: everything, a named workspace, or the asking pane's own. */
+type WhoFilter = { readonly kind: "all" } | { readonly kind: "workspace"; readonly scope: WalkyScope } | { readonly kind: "here" };
+
+/** The scope in words, as the person typed it: `<repo>` or `<repo>#<branch>`. */
+function scopeWords(scope: WalkyScope): string {
+  return scope.branch === null ? scope.repo : `${scope.repo}#${scope.branch}`;
+}
+
+/** `who`'s flags: `--json`, and at most one of `--workspace <repo>[#<branch>]` and `--here`. An error is the one-line reason. */
+function parseWhoArgs(args: readonly string[]): { readonly json: boolean; readonly filter: WhoFilter } | { readonly error: string } {
+  let json = false;
+  let here = false;
+  let named: WalkyScope | null = null;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--json") {
+      json = true;
+      continue;
+    }
+    if (arg === "--here") {
+      here = true;
+      continue;
+    }
+    if (arg !== "--workspace") return { error: `unknown argument \`${arg}\`` };
+    const value = args[i + 1];
+    if (value === undefined || value.startsWith("--")) return { error: "`--workspace` needs a folder name: <repo> or <repo>#<branch>" };
+    const address = parseAddress(value);
+    if (address === null || address.kind !== "workspace") return { error: `\`${value}\` is not a workspace: give a folder name, <repo> or <repo>#<branch>` };
+    named = { repo: address.repo, branch: address.branch };
+    i += 1;
+  }
+  if (here && named !== null) return { error: "`--workspace` and `--here` both pick the panes: use one of them" };
+  if (named !== null) return { json, filter: { kind: "workspace", scope: named } };
+  return { json, filter: here ? { kind: "here" } : { kind: "all" } };
+}
+
+/** The panes a filter keeps. The same rule as the bridge's scope (`inScope`), read over the label column. */
+function inFilter(rows: readonly JsonObject[], scope: WalkyScope): JsonObject[] {
+  return rows.filter((row) => {
+    const address = parseAddress(asJsonString(row.address) ?? "");
+    if (address === null || address.kind !== "pane") return false;
+    return inScope(asJsonString(row.label) ?? "", address.paneId, scope);
+  });
+}
+
+/** `walky who [--workspace <repo>[#<branch>] | --here] [--json]`: every reachable target, or the ones a scope would reach. */
 export async function cmdWalkyWho(deps: WalkyDeps, args: readonly string[]): Promise<number> {
   if (windows(deps)) return EXIT.STATE;
-  const json = args.includes("--json");
-  const unknown = args.find((arg) => arg !== "--json");
-  if (unknown !== undefined) return usage(deps, "who", `unknown argument \`${unknown}\``);
+  const parsed = parseWhoArgs(args);
+  if ("error" in parsed) return usage(deps, "who", parsed.error);
+  const { json, filter } = parsed;
   const answer = await request(deps, { op: "who" });
   if (!answer.ok) return failure(deps, answer);
-  const targets = Array.isArray(answer.body.targets) ? answer.body.targets.flatMap((entry) => {
+  const everyone = Array.isArray(answer.body.targets) ? answer.body.targets.flatMap((entry) => {
     const row = asJsonObject(entry);
     return row === undefined ? [] : [row];
   }) : [];
   const note = asJsonString(answer.body.note);
+  const scope = filter.kind === "workspace" ? filter.scope : filter.kind === "here" ? ownScope(everyone, asJsonString(answer.body.self)) : null;
+  if (filter.kind === "here" && scope === null) {
+    deps.io.err(`walky talky: ${asJsonString(answer.body.self) === undefined ? "`--here` needs a pane: run it inside an agent's pane, or name the folder with `--workspace <repo>`" : "this pane has no workspace folder to match: name one with `--workspace <repo>`"}`);
+    return EXIT.STATE;
+  }
+  const targets = scope === null ? everyone : inFilter(everyone, scope);
   if (json) {
     deps.io.out(JSON.stringify(note === undefined ? { self: answer.body.self ?? null, targets } : { self: answer.body.self ?? null, targets, note }));
     return EXIT.OK;
   }
   const self = asJsonString(answer.body.self);
   if (targets.length === 0) {
-    deps.io.out("no agent panes to message");
+    deps.io.out(scope === null ? "no agent panes to message" : `no agent panes in ${shown(scopeWords(scope))}`);
     if (note !== undefined) deps.io.out(note);
     return EXIT.OK;
   }
   // A solo install with this one agent pane: nobody to message yet, and the reason in one line.
-  if (note === undefined && self !== undefined && self.startsWith(`${LOCAL_MEMBER}/`) && targets.length === 1 && asJsonString(targets[0]!.address) === self) {
+  if (scope === null && note === undefined && self !== undefined && self.startsWith(`${LOCAL_MEMBER}/`) && targets.length === 1 && asJsonString(targets[0]!.address) === self) {
     deps.io.out(`You are ${shown(self)}. No other agent pane yet. A message needs two.`);
     return EXIT.OK;
   }
@@ -229,6 +304,15 @@ export async function cmdWalkyWho(deps: WalkyDeps, args: readonly string[]): Pro
   for (const row of rows) deps.io.out(`${line(row)}${row[0] === self ? "  (you)" : ""}`);
   if (note !== undefined) deps.io.out(note);
   return EXIT.OK;
+}
+
+/** The folder of the asking pane's own label, any branch (`here`), or null off a pane or for a pane whose label names no folder. */
+function ownScope(rows: readonly JsonObject[], self: string | undefined): WalkyScope | null {
+  const address = parseAddress(self ?? "");
+  if (address === null || address.kind !== "pane") return null;
+  const own = rows.find((row) => asJsonString(row.address) === self);
+  const folder = labelScope(asJsonString(own?.label) ?? "", address.paneId);
+  return folder === null ? null : { repo: folder.repo, branch: null };
 }
 
 interface SendArgs {
@@ -280,7 +364,7 @@ function usage(deps: WalkyDeps, verb: (typeof WALKY_SUBCOMMANDS)[number], why: s
 }
 
 const USAGE = {
-  who: "usage: collie walky who [--json]",
+  who: "usage: collie walky who [--workspace <repo>[#<branch>] | --here] [--json]",
   send: "usage: collie walky send <address> [text...]   (no text: the body is read from stdin)",
   reply: "usage: collie walky reply <id> [text...]   (no text: the body is read from stdin)",
   inbox: "usage: collie walky inbox [<id>] [--all] [--keep] [--json]",
@@ -310,9 +394,9 @@ function targetLine(target: JsonValue | undefined, fallback: string): string {
  * Send, then wait up to 15 s for each receipt to leave `accepted`, and print three lines: the id, the
  * pane it went to, and the state in words. A message not typed yet adds where to look later.
  */
-async function sendAndWait(deps: WalkyDeps, to: string | null, replyTo: string | null, body: string, json: boolean): Promise<number> {
+async function sendAndWait(deps: WalkyDeps, to: string | null, replyTo: string | null, body: string, json: boolean, first?: string): Promise<number> {
   const id = (deps.mintId ?? mintWalkyId)();
-  const answer = await request(deps, { op: "send", id, to, body, replyTo });
+  const answer = await request(deps, { op: "send", id, to, body, replyTo }, undefined, first);
   if (!answer.ok) return failure(deps, answer);
   let receipts = receiptsOf(answer.body.receipts);
   let elsewhere = new Set<string>();
@@ -349,10 +433,27 @@ export async function cmdWalkySend(deps: WalkyDeps, args: readonly string[]): Pr
   const parsed = parseSendArgs(args);
   if ("error" in parsed) return usage(deps, "send", parsed.error);
   if (parsed.to === null) return usage(deps, "send", "name an address (see `collie walky who`)");
-  if (parseAddress(parsed.to) === null) return usage(deps, "send", `\`${parsed.to}\` is not an address: <member>/<pane>, <member>/<pane>#<token> as \`who\` prints it, <member>/all or all`);
+  if (parseAddress(parsed.to) === null) return usage(deps, "send", `\`${parsed.to}\` is not an address: <member>/<pane>, <member>/<pane>#<token> as \`who\` prints it, <member>/all, all, <repo>, <repo>#<branch> or here`);
   const body = await bodyOf(deps, parsed.text);
   if (body === null) return usage(deps, "send", "no text: give it after the address, or on stdin");
   return sendAndWait(deps, parsed.to, parsed.replyTo, body, parsed.json);
+}
+
+/** The first bridge that holds a message, and the message; else the words for why none does. */
+async function holderOf(deps: WalkyDeps, id: string): Promise<{ readonly ok: true; readonly message: WalkyMessage; readonly path: string } | { readonly ok: false; readonly error: string }> {
+  let reached = false;
+  let failed = "no running Collie bridge answers on this machine";
+  for (const path of socketPaths(deps)) {
+    const asked = await request(deps, { op: "status", id }, path);
+    if (!asked.ok) {
+      failed = asked.error;
+      continue;
+    }
+    reached = true;
+    const message = readMessage(asked.body.message);
+    if (message !== null) return { ok: true, message, path };
+  }
+  return { ok: false, error: reached ? `no message ${id} on this machine` : failed };
 }
 
 /** `walky reply <id> [text...]`: send to the pane the message came from, as a reply to it. */
@@ -362,15 +463,16 @@ export async function cmdWalkyReply(deps: WalkyDeps, args: readonly string[]): P
   if ("error" in parsed) return usage(deps, "reply", parsed.error);
   const id = parsed.replyTo ?? parsed.to;
   if (id === null || !WALKY_ID.test(id)) return usage(deps, "reply", "name the message id to reply to (wt_ and 12 characters)");
-  const status = await request(deps, { op: "status", id });
-  if (!status.ok) return failure(deps, status);
-  const message: WalkyMessage | null = readMessage(status.body.message);
-  if (message === null) return failure(deps, { error: `no message ${id} on this machine` });
+  // The bridge that holds the message answers the reply: an older one asked first may know this pane
+  // and hold no such message (2026-10-30), so every bridge is asked until one holds it.
+  const found = await holderOf(deps, id);
+  if (!found.ok) return failure(deps, found);
+  const { message, path: holder } = found;
   if (message.from.address === null) return failure(deps, { error: `${id} came from an operator, who has no address to reply to` });
   const body = await bodyOf(deps, parsed.text);
   if (body === null) return usage(deps, "reply", "no text: give it after the id, or on stdin");
   // No address: the bridge sends a reply to the stored sender of what it answers, never elsewhere.
-  return sendAndWait(deps, null, id, body, parsed.json);
+  return sendAndWait(deps, null, id, body, parsed.json, holder);
 }
 
 /**
@@ -426,6 +528,8 @@ export async function cmdWalkyStatus(deps: WalkyDeps, args: readonly string[]): 
   let elsewhere = new Set<string>();
   let signer: string | null = null;
   let reached = false;
+  // A scope send (M75): one line per delivery and the parent's totals, as the bridge counted them.
+  let scope: ScopeAnswer | null = null;
   for (const path of socketPaths(deps)) {
     const answer = await request(deps, { op: "status", id }, path);
     if (!answer.ok) continue;
@@ -434,11 +538,12 @@ export async function cmdWalkyStatus(deps: WalkyDeps, args: readonly string[]): 
     elsewhere = elsewhereOf(answer.body.elsewhere);
     const message = readMessage(answer.body.message);
     signer = message?.signer ?? message?.from.memberId ?? null;
+    scope = message === null || !Array.isArray(answer.body.deliveries) ? null : { to: message.to, deliveries: answer.body.deliveries, totals: totalsOf(answer.body.totals) };
     if (receipts.length > 0) break;
   }
   if (!reached) return failure(deps, { error: "no running Collie bridge answers on this machine" });
   if (json) {
-    deps.io.out(JSON.stringify({ id, receipts }));
+    deps.io.out(JSON.stringify(scope === null ? { id, receipts } : { id, receipts, deliveries: scope.deliveries, totals: scope.totals }));
     return receipts.length === 0 ? EXIT.STATE : exitOf(receipts);
   }
   if (receipts.length === 0) {
@@ -446,9 +551,36 @@ export async function cmdWalkyStatus(deps: WalkyDeps, args: readonly string[]): 
     return EXIT.STATE;
   }
   deps.io.out(id);
+  if (scope !== null) deps.io.out(`to ${shown(scope.to)}`);
   for (const receipt of receipts) deps.io.out(`${receiptLine(receipt, true, elsewhere)} (${verifiedWords(receipt, signer)})`);
+  if (scope !== null) deps.io.out(totalsLine(scope.totals));
   if (receipts.some(isHeld)) deps.io.out(HELD_HINT);
   return exitOf(receipts);
+}
+
+/** What a status answer adds for a scope send (M75): the scope as typed, its deliveries as sent, and the totals. */
+interface ScopeAnswer {
+  readonly to: string;
+  readonly deliveries: JsonValue;
+  readonly totals: WalkyTotals;
+}
+
+/** A scope's totals per outcome as the bridge sent them: whole counts only, anything else dropped. */
+function totalsOf(value: JsonValue | undefined): WalkyTotals {
+  const out: WalkyTotals = {};
+  for (const [outcome, raw] of Object.entries(asJsonObject(value) ?? {})) {
+    const count = asJsonNumber(raw);
+    if (count !== undefined && Number.isSafeInteger(count) && count > 0) out[outcome] = count;
+  }
+  return out;
+}
+
+/** The parent's totals of a scope send (M75), one line: `3 deliveries: delivered 2, unreachable 1`. */
+export function totalsLine(totals: Readonly<Record<string, number>>): string {
+  const entries = Object.entries(totals).toSorted((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const count = entries.reduce((sum, [, n]) => sum + n, 0);
+  const parts = entries.map(([outcome, n]) => `${shown(outcome)} ${String(n)}`).join(", ");
+  return `${String(count)} ${count === 1 ? "delivery" : "deliveries"}${parts === "" ? "" : `: ${parts}`}`;
 }
 
 /** One target's answer to a take-back, as `cancel` prints it (M62 spec 03). */

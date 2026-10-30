@@ -1,5 +1,5 @@
-// The browser leg's cassettes (M67, ADR 0125): what a recorded model turn of pi or omp looks like on
-// disk, how a request is matched to it, and how its stream is replayed. Pure: no network, no clock,
+// The browser leg's cassettes (M67, ADR 0125): what a recorded model turn of pi, omp or Claude Code
+// looks like on disk, how a request is matched to it, and how its stream is replayed. Pure: no network, no clock,
 // no file system except the two small read/write helpers at the end, so the unit tests drive all of it.
 //
 // WHAT IS RECORDED. Per case, an ordered list of entries. An entry is one model request of one harness
@@ -16,6 +16,7 @@
 // two requests still matches, and anything else is a cassette mismatch. A request with no tools is a
 // SIDE request (a title, a summary, a description compressor): it is matched by digest alone, from a
 // pool of every side entry the leg recorded for that harness, in any order and as often as asked.
+// The comparison leaves out omp's session reminder (matchKeyOf): omp sends it only on some turns.
 //
 // WHAT THE DIGEST IGNORES. The values that differ on every run: walky talky ids, pane addresses with
 // their instance tokens, uuids, dates and times, the rig's ports, and the rig's own folders (VOLATILE
@@ -27,6 +28,13 @@
 // position in the request body (0 is the most recent). At replay the same rank over the live request
 // gives the live value. The rewrite works on the concatenation of each delta stream, so a value split
 // over two events is still found, and the event boundaries move only to keep a value whole.
+//
+// TWO VENDORS (M67 spec 07). pi and omp reach OpenRouter, Claude Code reaches Anthropic. The summary is
+// the same shape for both; the `anthropic` vendor reads Claude Code's body: it cuts each
+// `<system-reminder>` of the prompt to its first line (the reminders carry the operator's own CLAUDE.md
+// and the account's email address), leaves Claude's `role: system` items out (the machine's OS version
+// and the session's scratchpad path), and adds a `context` digest of the system blocks and the tool
+// definitions. pi's and omp's summaries are unchanged, so their cassettes keep their digests.
 import { createHash } from "node:crypto";
 
 import { asJsonObject, asJsonString, parseJson, type JsonObject, type JsonValue } from "../../../src/lib/json";
@@ -50,7 +58,16 @@ export interface RequestSummary {
   readonly prompt: string;
   /** One word per item after the last prompt: `assistant`, `call:<tool>`, `result`, `reasoning`. */
   readonly tail: readonly string[];
+  /**
+   * The `anthropic` vendor only: sha256 (16 hex) of the normalised `system` blocks and tool
+   * definitions, cache-control fields dropped. A new tool, a changed system prompt or another rig
+   * folder layout changes it.
+   */
+  readonly context?: string;
 }
+
+/** Whose wire a request is read as: pi and omp go through OpenRouter, Claude Code to Anthropic. */
+export type Vendor = "openrouter" | "anthropic";
 
 /** One server-sent event as recorded: its delay after the event before it, its name and its data. */
 export interface SseEvent {
@@ -139,13 +156,42 @@ export const VOLATILE: readonly { readonly name: string; readonly re: RegExp }[]
   { name: "port", re: /\b127\.0\.0\.1:\d{2,5}\b/gu },
 ];
 
+/**
+ * Claude Code's first system block names its build and a short hash of the conversation
+ * (`cc_version=2.1.312.237`): the hash follows the operator's own memory files, so it is masked. The
+ * version keys the cassette folder already.
+ */
+const CLAUDE_BILLING = /cc_version=[^;\s"\\]*/gu;
+
+/** The address and pane classes after a JSON line or tab escape (volatileValues). */
+const ESCAPED = new Map([
+  ["address", /(?<=\\[nt])(?:local|rig-lead|rig-member)\/[A-Za-z0-9_.:%@+=-]+#[a-z0-9]{4}\b/gu],
+  ["pane", /(?<=\\[nt])(?:local|rig-lead|rig-member)\/(?!all\b)[A-Za-z0-9_.:%@+=-]+/gu],
+]);
+
 /** A literal the stub knows, and its placeholder: the rig's state root (`{{lab}}`), the home (`{{home}}`). */
 export type Literal = readonly [value: string, placeholder: string];
+
+/**
+ * The walky cases' own marks: a case writes `id.slice(3, 9)` of its message id into the body
+ * (`Walky dialog check k5bosk: ...`, walky.spec.ts) to find the message on the screen. A mark is as
+ * volatile as its id, so each walky id in a text makes its mark a volatile value of the class `mark`.
+ */
+function marksOf(text: string): string[] {
+  const walky = VOLATILE.find((v) => v.name === "walky")?.re;
+  if (walky === undefined) return [];
+  return [...new Set([...text.matchAll(walky)].map((m) => m[0].slice(3, 9)))];
+}
+
+/** Each mark as a standalone word: never inside a longer word or an id. */
+const markRe = (mark: string): RegExp => new RegExp(`(?<![A-Za-z0-9_])${mark}(?![A-Za-z0-9])`, "gu");
 
 /** Replace every literal (longest first), then every volatile value by its class marker. */
 export function normalizeText(text: string, literals: readonly Literal[] = []): string {
   let out = replaceLiterals(text, literals);
+  const marks = marksOf(out);
   for (const { name, re } of VOLATILE) out = out.replace(re, `<${name}>`);
+  for (const mark of marks) out = out.replace(markRe(mark), "<mark>");
   return out;
 }
 
@@ -168,14 +214,26 @@ export type VolatileValues = Map<string, string[]>;
 export function volatileValues(text: string): VolatileValues {
   const out: VolatileValues = new Map();
   let masked = text;
-  for (const { name, re } of VOLATILE) {
+  const marks = marksOf(text);
+  const take = (name: string, res: readonly RegExp[]) => {
     const last = new Map<string, number>();
-    for (const match of masked.matchAll(re)) last.set(match[0], match.index);
+    for (const re of res) for (const match of masked.matchAll(re)) last.set(match[0], Math.max(last.get(match[0]) ?? -1, match.index));
     out.set(
       name,
       [...last.entries()].toSorted((a, b) => b[1] - a[1]).map(([value]) => value),
     );
-    masked = masked.replace(re, (value) => "\u0000".repeat(value.length));
+    for (const re of res) masked = masked.replace(re, (value) => "\u0000".repeat(value.length));
+  };
+  for (const { name, re } of VOLATILE) {
+    take(name, [re]);
+    // A mark is read right after the ids it comes from are masked (marksOf).
+    if (name === "walky") take("mark", marks.map(markRe));
+    // An address or pane that starts a line of a tool's output (`collie walky who`) follows a JSON
+    // `\n` or `\t` escape in the raw body, which the class's own look-behind reads as a word. It
+    // gets a class of its own, `lineaddress` or `linepane`, so the ranks of `address` and `pane` stay
+    // what every recording before it was written with.
+    const escaped = ESCAPED.get(name);
+    if (escaped !== undefined) take(`line${name}`, [escaped]);
   }
   return out;
 }
@@ -260,18 +318,59 @@ function isPrompt(item: JsonObject): boolean {
   return asJsonString(item.role) === "user" && texts(item.content).length > 0;
 }
 
-/** Read a request body's summary. A body that is not a JSON object gives an `other` summary with its text normalised. */
-export function summarize(path: string, raw: string, literals: readonly Literal[] = []): RequestSummary {
+/**
+ * One text block of a Claude Code prompt, as the summary keeps it. A `<system-reminder>` block keeps
+ * its first line (what kind of reminder it is) and every `Contents of {{lab}}...` or
+ * `Contents of {{worktree}}...` section (a memory file the rig wrote); the rest is the operator's own
+ * (their CLAUDE.md found on the walk up from the project, the account's email address). Any other
+ * block is kept whole. The literals are already placeholders here.
+ */
+export function cutReminder(block: string): string {
+  const open = "<system-reminder>";
+  const trimmed = block.trim();
+  if (!trimmed.startsWith(open)) return block;
+  const body = trimmed.slice(open.length).replace(/<\/system-reminder>\s*$/u, "");
+  const first = body.split("\n").find((line) => line.trim() !== "") ?? "";
+  const rigFiles = body.split(/\n(?=Contents of )/u).filter((section) => /^Contents of \{\{(?:lab|worktree)\}\}/u.test(section));
+  return [open, first.trim(), ...rigFiles.map((section) => section.trim()), "</system-reminder>"].join("\n");
+}
+
+/** A JSON value with every `cache_control` field dropped: Claude Code moves its cache breakpoints between turns. */
+function withoutCacheControl(value: JsonValue): JsonValue {
+  const arr = asJsonArray(value);
+  if (arr !== undefined) return arr.map(withoutCacheControl);
+  const obj = asJsonObject(value);
+  if (obj === undefined) return value;
+  const out: JsonObject = {};
+  for (const [key, item] of Object.entries(obj)) if (key !== "cache_control" && item !== undefined) out[key] = withoutCacheControl(item);
+  return out;
+}
+
+/** The `anthropic` vendor's context digest: the system blocks and the tool definitions, normalised. */
+function contextOf(body: JsonObject, literals: readonly Literal[]): string {
+  const text = JSON.stringify([withoutCacheControl(body.system ?? null), withoutCacheControl(body.tools ?? [])]).replace(CLAUDE_BILLING, "cc_version=<build>");
+  return shortHash(normalizeText(text, literals));
+}
+
+/**
+ * Read a request body's summary. A body that is not a JSON object gives an `other` summary with its
+ * text normalised. `vendor` says whose body it is (see TWO VENDORS above); `openrouter` is pi's and omp's.
+ */
+export function summarize(path: string, raw: string, literals: readonly Literal[] = [], vendor: Vendor = "openrouter"): RequestSummary {
   const api = apiOf(path);
   const body = asJsonObject(parseJson(raw));
   if (body === undefined) return { api: "other", model: null, stream: false, tools: [], prompt: normalizeText(raw.slice(0, 2000), literals), tail: [] };
+  const claude = vendor === "anthropic";
   const items = list(api === "responses" ? body.input : body.messages).flatMap((item) => {
     const o = asJsonObject(item);
-    return o === undefined ? [] : [o];
+    // Claude Code's `role: system` items: its environment (OS version, scratchpad path) and a token count.
+    if (o === undefined || (claude && asJsonString(o.role) === "system")) return [];
+    return [o];
   });
   const at = items.findLastIndex(isPrompt);
-  const prompt = at === -1 ? "" : texts(items[at]?.content).join("\n");
-  return {
+  const blocks = at === -1 ? [] : texts(items[at]?.content);
+  const prompt = claude ? blocks.map((block) => cutReminder(replaceLiterals(block, literals))).join("\n") : blocks.join("\n");
+  const summary: RequestSummary = {
     api,
     model: asJsonString(body.model) ?? null,
     stream: body.stream === true,
@@ -279,6 +378,7 @@ export function summarize(path: string, raw: string, literals: readonly Literal[
     prompt: normalizeText(prompt, literals),
     tail: items.slice(at + 1).map(tailWord),
   };
+  return claude ? { ...summary, context: contextOf(body, literals) } : summary;
 }
 
 export function kindOf(summary: RequestSummary): EntryKind {
@@ -287,10 +387,39 @@ export function kindOf(summary: RequestSummary): EntryKind {
 
 /** The check a replayed request must pass: sha256 of the summary, 16 hex. */
 export function digestOf(summary: RequestSummary): string {
+  const parts: unknown[] = [summary.api, summary.model, summary.stream, summary.tools, summary.prompt, summary.tail];
+  // Only Claude's summary has a context; pi's and omp's digests stay what their cassettes hold.
+  if (summary.context !== undefined) parts.push(summary.context);
   return createHash("sha256")
-    .update(JSON.stringify([summary.api, summary.model, summary.stream, summary.tools, summary.prompt, summary.tail]))
+    .update(JSON.stringify(parts))
     .digest("hex")
     .slice(0, 16);
+}
+
+/**
+ * omp's session reminder: a `<system-reminder>` with the date and the working folder that omp puts in
+ * front of a prompt only on some turns (the first prompt of a session, at least). Whether it is there
+ * depends on where the case falls in the run, not on the case: case 29 recorded alone had it on its
+ * first long list, and the same request in a full run did not. The match key leaves it out.
+ */
+const SESSION_REMINDER = /^<system-reminder>\nToday: [^\n]*\n<\/system-reminder>\n/u;
+
+/**
+ * Claude Code's reminder blocks (cutReminder: the rig's CLAUDE.md, the context and commit-attribution
+ * notes) lead only the FIRST user message of a session. Where a case falls in the run decides whether its
+ * prompt has them: case 13 recorded alone is the session's first message, and in the full leg it follows
+ * case 12 in the same session. The match key leaves the leading blocks out, the same way as omp's.
+ */
+const LEADING_REMINDERS = /^(?:<system-reminder>\n(?:(?!<\/system-reminder>)[\s\S])*<\/system-reminder>\n)+/u;
+
+/**
+ * What a request is matched on: its digest with the session reminders left out of the prompt (omp's and
+ * Claude's). Computed from a stored entry's summary and from a live request alike, so the cassettes keep
+ * their digests.
+ */
+export function matchKeyOf(summary: RequestSummary): string {
+  const prompt = summary.prompt.replace(SESSION_REMINDER, "").replace(LEADING_REMINDERS, "");
+  return prompt === summary.prompt ? digestOf(summary) : digestOf({ ...summary, prompt });
 }
 
 // ── server-sent events ───────────────────────────────────────────────────────────────────────────
@@ -473,7 +602,7 @@ export function rewriteResponse(response: RecordedResponse, pairs: readonly Lite
 // ── matching ─────────────────────────────────────────────────────────────────────────────────────
 
 /** Why a request found no entry, in words for the case's row. Always ends with how to fix it. */
-export const RERECORD = "re-record: COLLIE_RIG_MODEL=live COLLIE_RIG_RECORD=1 with a key file (web/e2e/rig/README.md)";
+export const RERECORD = "re-record: COLLIE_RIG_LIVE=<harness> COLLIE_RIG_RECORD=1 (a key file for pi and omp; web/e2e/rig/README.md)";
 
 export type Match = { readonly entry: Entry; readonly index: number } | { readonly mismatch: string };
 
@@ -483,13 +612,14 @@ export type Match = { readonly entry: Entry; readonly index: number } | { readon
  */
 export function matchTurn(entries: readonly Entry[] | undefined, machine: string, summary: RequestSummary, used: ReadonlySet<number>, caseId: string): Match {
   if (entries === undefined) return { mismatch: `cassette mismatch: no cassette for case ${caseId}; ${RERECORD}` };
-  const digest = digestOf(summary);
+  const key = matchKeyOf(summary);
   const mine = entries.map((entry, index) => ({ entry, index })).filter(({ entry, index }) => entry.kind === "turn" && entry.machine === machine && !used.has(index));
-  const hit = mine.find(({ entry }) => entry.request.digest === digest);
+  const hit = mine.find(({ entry }) => matchKeyOf(entry.request) === key);
   if (hit !== undefined) return hit;
   const next = mine[0]?.entry;
   if (next === undefined) return { mismatch: `cassette mismatch: case ${caseId} has no turn left for this request (prompt "${clip(summary.prompt)}"); ${RERECORD}` };
-  return { mismatch: `cassette mismatch: case ${caseId} turn ${String(next.ordinal)} expected prompt "${clip(next.request.prompt)}" tail [${next.request.tail.join(" ")}], got "${clip(summary.prompt)}" tail [${summary.tail.join(" ")}]; ${RERECORD}` };
+  const context = next.request.context !== summary.context && next.request.prompt === summary.prompt ? ` (same prompt, another system prompt or tool list: context ${next.request.context ?? "-"}, got ${summary.context ?? "-"})` : "";
+  return { mismatch: `cassette mismatch: case ${caseId} turn ${String(next.ordinal)} expected prompt "${clip(next.request.prompt)}" tail [${next.request.tail.join(" ")}], got "${clip(summary.prompt)}" tail [${summary.tail.join(" ")}]${context}; ${RERECORD}` };
 }
 
 /** A turn found in a case: which case, which entry, and its index there. */
@@ -505,11 +635,11 @@ export type CaseMatch = { readonly caseId: string; readonly entry: Entry; readon
 export function matchTurnAcross(byCase: ReadonlyMap<string, readonly Entry[]> | undefined, caseId: string, machine: string, summary: RequestSummary, usedIn: (caseId: string) => ReadonlySet<number>): CaseMatch {
   const own = matchTurn(byCase?.get(caseId), machine, summary, usedIn(caseId), caseId);
   if (!("mismatch" in own)) return { caseId, ...own };
-  const digest = digestOf(summary);
+  const key = matchKeyOf(summary);
   for (const [other, entries] of byCase ?? []) {
     if (other === caseId) continue;
     const used = usedIn(other);
-    const index = entries.findIndex((entry, i) => entry.kind === "turn" && entry.machine === machine && !used.has(i) && entry.request.digest === digest);
+    const index = entries.findIndex((entry, i) => entry.kind === "turn" && entry.machine === machine && !used.has(i) && matchKeyOf(entry.request) === key);
     const entry = entries[index];
     if (entry !== undefined) return { caseId: other, entry, index };
   }
@@ -518,8 +648,8 @@ export function matchTurnAcross(byCase: ReadonlyMap<string, readonly Entry[]> | 
 
 /** A side request against the pool of every side entry the leg recorded for this harness. */
 export function matchSide(pool: readonly Entry[], summary: RequestSummary): Entry | null {
-  const digest = digestOf(summary);
-  return pool.find((entry) => entry.request.digest === digest) ?? null;
+  const key = matchKeyOf(summary);
+  return pool.find((entry) => matchKeyOf(entry.request) === key) ?? null;
 }
 
 const clip = (text: string): string => (text.length > 120 ? `${text.slice(0, 117)}...` : text).replaceAll("\n", " ");

@@ -472,6 +472,15 @@ export const CONFIG_SETTINGS: readonly ConfigSetting[] = [
     doc: "The tuios daemon socket to drive. Empty takes the socket tuios itself uses.",
     configField: "muxEndpoint",
   },
+  {
+    key: "mux_endpoint_herdr_core",
+    env: "COLLIE_MUX_ENDPOINT_HERDR_CORE",
+    section: "mux",
+    kind: "string",
+    default: "",
+    doc: "The herdr-core socket to drive. Empty takes the socket hc itself dials: HC_SOCKET, else the HC_SESSION socket under XDG_RUNTIME_DIR or an existing /run/user/<uid>, else in the session's state directory (XDG_STATE_HOME or ~/.local/state, as on macOS).",
+    configField: "muxEndpoint",
+  },
 
   // ── access ─────────────────────────────────────────────────────────────────
   {
@@ -622,6 +631,15 @@ export const CONFIG_SETTINGS: readonly ConfigSetting[] = [
 
   // ── journal ────────────────────────────────────────────────────────────────
   {
+    key: "agy_root",
+    env: "COLLIE_AGY_ROOT",
+    section: "journal",
+    kind: "roots",
+    default: [],
+    doc: "Where Antigravity CLI keeps conversations and presence locks. Empty takes ~/.gemini/antigravity-cli.",
+    configField: "journalRoots",
+  },
+  {
     key: "transcript_root",
     env: "COLLIE_TRANSCRIPT_ROOT",
     section: "journal",
@@ -682,6 +700,15 @@ export const CONFIG_SETTINGS: readonly ConfigSetting[] = [
     kind: "roots",
     default: [],
     doc: "Where Kiro V3 keeps its sessions. Empty follows KIRO_HOME, else ~/.kiro/sessions.",
+    configField: "journalRoots",
+  },
+  {
+    key: "dsh_root",
+    env: "COLLIE_DSH_ROOT",
+    section: "journal",
+    kind: "roots",
+    default: [],
+    doc: "Where DeepSeek Harness keeps the sessions dsh-tui writes. Empty follows DSH_HOME, else ~/.dsh/sessions.",
     configField: "journalRoots",
   },
   {

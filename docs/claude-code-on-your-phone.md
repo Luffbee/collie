@@ -120,7 +120,7 @@ changes.
 ## What you need
 
 - A Linux or macOS host with Claude Code installed.
-- A terminal multiplexer: Herdr, tmux, zellij, tuios or tern. Herdr and tuios detect agents directly. On tmux, zellij
+- A terminal multiplexer: Herdr, the Herdr core, tmux, zellij, tuios or tern. Herdr and tuios detect agents directly. On tmux, zellij
   and tern, Collie uses beacon hooks, which require Linux.
 - Tailscale installed on the host and phone, with HTTPS enabled on your tailnet. For other setups,
   see [Deployment](deployment.md).
@@ -222,7 +222,7 @@ The page has these parts, from the top:
 - **New worktree.** A switch, described [above](#run-several-claude-code-sessions-at-once).
 - **A line** that says what will start where, and **Start**, pinned at the foot above the keyboard.
 
-**Agent** lists Claude Code, Codex, opencode, pi, omp, Grok, Hermes, Kiro, Muse and Antigravity.
+**Agent** lists Claude Code, Codex, opencode, pi, omp, Grok, Hermes, Kiro, Muse, Antigravity and dsh-TUI.
 Each machine checks which of them are installed, on the `PATH` your login shell uses. An agent
 installed through nvm, or in your home folder, counts. An agent that is not found stays in the list.
 It is disabled, and the reason follows its name in brackets, for example "not installed". Nothing
@@ -233,6 +233,11 @@ also add a launcher from the phone, with a few option chips such as "Skip permis
 ([Launchers added from a phone](configure.md#launchers-added-from-a-phone)). A launcher that skips
 permission prompts carries a **No prompts** badge, and the phone asks you once before it first starts
 it.
+
+**Send waits for the agent's first screen.** After a start, Send reads Starting… and your draft stays
+editable. Collie sends nothing on its own, so a dialog such as workspace trust shows before any text
+reaches the agent. Send is ready once Collie reads the agent's first screen, the agent leaves the
+pane, or two minutes pass.
 
 A refused Start shows its reason in a notice above Start, in your language. A folder that does not
 exist on the machine that runs the start, for example, starts nothing and says so.

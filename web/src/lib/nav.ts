@@ -9,6 +9,7 @@
 import { asJsonBoolean, asJsonNumber, asJsonObject, asJsonString, type JsonValue } from "./json";
 import { scopeFromSearchParams, scopeSearch, SESSION_PARAM, type Scope } from "./scope";
 import type { AgentView } from "./types";
+import type { AgentLaunch } from "./agent-startup";
 
 // The two Machines paths live in `machine-paths.ts` so the service worker can build them: this file
 // reads `window`, which a worker has no type for. Re-exported, so every caller still asks nav.ts.
@@ -25,6 +26,15 @@ export function panePath(paneId: string, scope?: Scope): string {
  */
 export function historyPath(paneId: string, scope?: Scope): string {
   return `/pane/${encodeURIComponent(paneId)}/history${scopeSearch(scope)}`;
+}
+
+/**
+ * A pane's output, zoomed: the mirror's text alone, full screen, for pinch and pan. A child path of
+ * the pane, like History, so it is a level and the phone's back closes it (ADR 0067). It reads the
+ * pane's own loader and never moves the pane (ADR 0008).
+ */
+export function zoomPath(paneId: string, scope?: Scope): string {
+  return `/pane/${encodeURIComponent(paneId)}/zoom${scopeSearch(scope)}`;
 }
 
 /**
@@ -361,12 +371,14 @@ export function pairLandingPath(search: string): string | null {
 // components and `lib/nav-entry.ts` seeds a cold deep link.
 
 /**
- * What Collie keeps in `location.state`: where a DOWN move came from, beside the one other field a
- * navigation carries (`freshPane`, a just-created pane the snapshot does not list yet).
+ * What Collie keeps in `location.state`: where a DOWN move came from, beside route-local extras
+ * such as a just-created pane and its independently scoped launch intent.
  */
 export interface NavState {
   from?: string;
   freshPane?: AgentView;
+  /** A named terminal-agent launch, scoped separately from the optimistic shell bootstrap. */
+  agentLaunch?: AgentLaunch;
   /**
    * The Changes tree opened this file from a `link` row. A symlink is listed and never followed, so
    * the row cannot say whether it points at a file or a folder, and the file read answers
@@ -420,7 +432,7 @@ const ANY_PANE = "/pane/*";
  *   L0 `/`
  *   L1 `/space/:id`, `/settings`, `/crew`, `/new` (from the dashboard, a space or a pane)
  *   L2 `/pane/:id`, `/new/add` (below the New page), `/space/:id/changes`, `/settings/:section`, `/settings/updates`, `/machines`
- *   L3 `/settings/voice/host`, `/settings/voice/model`, `/pane/:id/history`, `/pane/:id/changes` (a file view is the same path with `?repo=&path=`),
+ *   L3 `/settings/voice/host`, `/settings/voice/model`, `/pane/:id/history`, `/pane/:id/zoom`, `/pane/:id/changes` (a file view is the same path with `?repo=&path=`),
  *      `/space/:id/changes/commit`, `/space/:id/changes/files` (a folder or a file of the tree, with
  *      `?dir=` or `?path=`)
  *   L4 `/pane/:id/changes/commit` (the commit's file view adds `&path=`), `/pane/:id/changes/files`
@@ -450,7 +462,7 @@ export function ancestorsOf(pathname: string): string[] {
     return [`/pane/${id}/changes`, `/pane/${id}`, ANY_SPACE, "/"];
   }
   if (head === "pane" && seg.length === 2) return [ANY_SPACE, "/"];
-  if (head === "pane" && seg.length === 3 && (leaf === "history" || leaf === "changes")) {
+  if (head === "pane" && seg.length === 3 && (leaf === "history" || leaf === "zoom" || leaf === "changes")) {
     return [`/pane/${id}`, ANY_SPACE, "/"];
   }
   if (head === "settings" && seg.length === 1) return ["/"];
@@ -678,7 +690,7 @@ export function parentChain(pathname: string, search: string): string[] {
     return [...chain, filesUnder(list), ...filesFolders(at).slice(0, at.path !== undefined ? undefined : -1).map((dir) => filesUnder(list, { dir }))];
   }
   if (head === "pane" && seg.length === 2) return [home];
-  if (head === "pane" && seg.length === 3 && (leaf === "history" || leaf === "changes")) {
+  if (head === "pane" && seg.length === 3 && (leaf === "history" || leaf === "zoom" || leaf === "changes")) {
     const pane = `/pane/${id}${q}`;
     return file ? [home, pane, `/pane/${id}/changes${q}`] : [home, pane];
   }

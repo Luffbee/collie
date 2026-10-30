@@ -6,11 +6,13 @@ import { join } from "node:path";
 
 import type { BeaconMatcher } from "../beacon/decorate.ts";
 import { HOST, hostFor } from "../host.ts";
+import type { JsonValue } from "../json.ts";
 import type { SendResult, WalkyHost, WalkyPane } from "./deliver.ts";
 import { WalkyLog } from "./log.ts";
-import { parseWalkyRequest } from "./parse.ts";
+import { parseWalkyRequest, RAW_BODY_MAX, readWalkyRequest } from "./parse.ts";
+import { BAD_ACK_IDS, BAD_MESSAGE_ID, BAD_REQUEST_LINE, BARE_BAD_REQUEST, bodyOverRaw, NO_ADDRESS, unknownOp, unreadAddress } from "./refusals.ts";
 import { WalkyService } from "./service.ts";
-import { answerRequest, CANCEL_NEEDS_A_PANE, placeMarkers, walkySocketPath, WalkyServer, type PlaceTarget } from "./socket.ts";
+import { answerRequest, answerUnread, CANCEL_NEEDS_A_PANE, placeMarkers, walkySocketPath, WalkyServer, type PlaceTarget } from "./socket.ts";
 
 // A Unix socket file with an owner-only mode is POSIX; Windows has no walky socket ("Windows has no
 // socket" below), so every part of this test is about that socket.
@@ -140,10 +142,22 @@ describe("the requests", () => {
     // The pane closed, and a new session took %2: same id, another instance.
     list[1] = { ...list[1]!, instance: "cccc" };
     expect(await read()).toEqual({ ok: true, pane: "local/%2#cccc", messages: [] });
-    expect(await read("wt_aaaaaaaaaaa1")).toEqual({ ok: false, error: "no message wt_aaaaaaaaaaa1 for this pane" });
+    expect(await read("wt_aaaaaaaaaaa1")).toEqual({ ok: false, error: "not here", missing: "no message wt_aaaaaaaaaaa1 for this pane" });
     // A send to the old instance is refused, and one to the bare id reaches the new session.
     const stale = parseWalkyRequest(JSON.stringify({ v: 1, op: "send", markers: marker("%1"), id: "wt_aaaaaaaaaaa2", to: "local/%2#bbbb", body: "late" }));
     expect(await answerRequest(walky, stale!, [target])).toMatchObject({ ok: true, receipts: [{ state: "refused", reason: "pane replaced", target: "local/%2" }] });
+  });
+
+  test("a pane this bridge knows asks for a message it does not hold: `not here`, so the CLI asks the next bridge, with the sentence in `missing` (2026-10-30)", async () => {
+    const walky = service();
+    const ask = (op: string, markers: ReturnType<typeof marker>, id: string) => answerRequest(walky, parseWalkyRequest(JSON.stringify({ v: 1, op, markers, id, ack: false, all: false }))!, [target]);
+    const sentence = "no message wt_zzzzzzzzzzzz for this pane";
+    expect(await ask("inbox", marker("%2"), "wt_zzzzzzzzzzzz")).toEqual({ ok: false, error: "not here", missing: sentence });
+    // Cancel is the same shape: the sender's bridge may be the other one.
+    expect(await ask("cancel", marker("%2"), "wt_zzzzzzzzzzzz")).toEqual({ ok: false, error: "not here", missing: "no message wt_zzzzzzzzzzzz on this machine" });
+    // A pane this bridge does not know is `not here` without a sentence; no pane at all keeps the machine wording.
+    expect(await ask("inbox", marker("%9"), "wt_zzzzzzzzzzzz")).toEqual({ ok: false, error: "not here" });
+    expect(await ask("inbox", [], "wt_zzzzzzzzzzzz")).toEqual({ ok: false, error: "no message wt_zzzzzzzzzzzz on this machine" });
   });
 
   test("a bad line is no request: wrong version, unknown op, bad id, bad address", () => {
@@ -152,6 +166,68 @@ describe("the requests", () => {
     expect(parseWalkyRequest(JSON.stringify({ v: 1, op: "drop" }))).toBeNull();
     expect(parseWalkyRequest(JSON.stringify({ v: 1, op: "status", id: "../x" }))).toBeNull();
     expect(parseWalkyRequest(JSON.stringify({ v: 1, op: "send", id: "wt_aaaaaaaaaaa1", to: "local/../x", body: "x" }))).toBeNull();
+  });
+});
+
+describe("a request this bridge cannot read (added 2026-10-30)", () => {
+  const unreadOf = (row: Record<string, JsonValue>) => {
+    const read = readWalkyRequest(JSON.stringify(row));
+    if (read.ok) throw new Error("the line was read");
+    return read;
+  };
+
+  test("every unread line names its reason, and none is the bare word", () => {
+    const cases: [string, string][] = [
+      ["{", BAD_REQUEST_LINE],
+      [JSON.stringify({ v: 2, op: "who" }), BAD_REQUEST_LINE],
+      [JSON.stringify({ v: 1, op: "drop" }), unknownOp("drop")],
+      [JSON.stringify({ v: 1, op: "status", id: "../x" }), BAD_MESSAGE_ID],
+      [JSON.stringify({ v: 1, op: "send", id: "wt_aaaaaaaaaaa1", body: "x" }), NO_ADDRESS],
+      [JSON.stringify({ v: 1, op: "send", id: "wt_aaaaaaaaaaa1", to: "local/../x", body: "x" }), unreadAddress("local/../x")],
+      [JSON.stringify({ v: 1, op: "send", id: "wt_aaaaaaaaaaa1", to: "local/%2", body: "x".repeat(RAW_BODY_MAX + 1) }), bodyOverRaw(RAW_BODY_MAX)],
+      [JSON.stringify({ v: 1, op: "ack", ids: "wt_aaaaaaaaaaa1" }), BAD_ACK_IDS],
+    ];
+    for (const [line, reason] of cases) {
+      const read = readWalkyRequest(line);
+      expect(read).toMatchObject({ ok: false, reason });
+      expect(read.ok ? "" : read.reason).toStartWith(`${BARE_BAD_REQUEST}: `);
+    }
+    // `here` and the other scope words read on this build.
+    for (const to of ["here", "collie-workspace", "collie-workspace#main"]) {
+      expect(readWalkyRequest(JSON.stringify({ v: 1, op: "send", markers: marker("%1"), id: "wt_aaaaaaaaaaa1", to, body: "x" }))).toMatchObject({ ok: true, request: { to } });
+    }
+  });
+
+  test("markers that name no pane here answer `not here`, so the CLI asks the next bridge; this bridge's own pane hears the reason", async () => {
+    // An address form newer than this bridge, as `here` was to a bridge before M75.
+    const newer = { v: 1, op: "send", id: "wt_aaaaaaaaaaa1", to: "desk/w1:p1/next", body: "x" };
+    expect(await answerUnread(service(), unreadOf({ ...newer, markers: marker("%9") }), [target])).toEqual({ ok: false, error: "not here" });
+    expect(await answerUnread(service(), unreadOf({ ...newer, markers: [{ namespace: "hc", scope: "/run/hc.sock", pane: "t1" }] }), [target])).toEqual({ ok: false, error: "not here" });
+    expect(await answerUnread(service(), unreadOf({ ...newer, markers: marker("%1") }), [target])).toEqual({ ok: false, error: unreadAddress("desk/w1:p1/next") });
+    expect(await answerUnread(service(), unreadOf({ ...newer, markers: [] }), [target])).toEqual({ ok: false, error: unreadAddress("desk/w1:p1/next") });
+  });
+
+  test.skipIf(POSIX_ONLY)("the server answers an unread line with its reason or `not here`, never the bare word", async () => {
+    const root = mkdtempSync(join(tmpdir(), "walky-sock-"));
+    roots.push(root);
+    const path = walkySocketPath(root);
+    const server = new WalkyServer({ socketPath: path, service: service(), targets: () => [target], log: () => undefined });
+    expect(await server.start()).toBe(true);
+    const ask = (row: Record<string, JsonValue>) =>
+      new Promise<string>((resolve) => {
+        const conn = createConnection({ path });
+        let text = "";
+        conn.setEncoding("utf8");
+        conn.on("data", (chunk: string) => {
+          text += chunk;
+        });
+        conn.on("close", () => resolve(text));
+        conn.write(`${JSON.stringify(row)}\n`);
+      });
+    const newer = { v: 1, op: "send", id: "wt_aaaaaaaaaaa1", to: "a/b/c", body: "x" };
+    expect(JSON.parse(await ask({ ...newer, markers: marker("%9") }))).toEqual({ ok: false, error: "not here" });
+    expect(JSON.parse(await ask({ ...newer, markers: marker("%1") }))).toEqual({ ok: false, error: unreadAddress("a/b/c") });
+    server.stop();
   });
 });
 

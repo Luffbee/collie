@@ -1,14 +1,17 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import type { BeaconMatcher } from "../bridge/beacon/decorate.ts";
 import { HOST } from "../bridge/host.ts";
 import type { SendResult, WalkyHost, WalkyPane } from "../bridge/walky/deliver.ts";
 import { WalkyLog } from "../bridge/walky/log.ts";
+import { UNREAD_BY_OLDER_BRIDGE } from "../bridge/walky/refusals.ts";
 import { WalkyService } from "../bridge/walky/service.ts";
 import { walkySocketPath, WalkyServer, type PlaceTarget } from "../bridge/walky/socket.ts";
+import { parseJsonObject } from "../web/src/lib/json.ts";
 import { capture, context } from "./fakes.ts";
 import { EXIT } from "./io.ts";
 import { realFiles } from "./sys.ts";
@@ -91,6 +94,58 @@ async function bridge(over: Partial<ConstructorParameters<typeof WalkyService>[0
   expect(await server.start()).toBe(true);
   cleanups.push(() => server.stop());
   return state;
+}
+
+/**
+ * A bridge before 2026-10-30, as far as a request it cannot read goes: it answers the bare
+ * `bad request` to every line, before it looks at the markers. A real socket in a private dir, so the
+ * CLI's socket checks pass. POSIX only.
+ */
+async function olderBridge(): Promise<{ readonly path: string; readonly lines: string[] }> {
+  const stateDir = mkdtempSync(join(tmpdir(), "walky-older-"));
+  const path = walkySocketPath(stateDir);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const lines: string[] = [];
+  const server = createServer((socket) => {
+    socket.setEncoding("utf8");
+    socket.once("data", (chunk: string) => {
+      lines.push(chunk);
+      socket.end(`${JSON.stringify({ ok: false, error: "bad request" })}\n`);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(path, resolve));
+  cleanups.push(() => {
+    server.close();
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+  return { path, lines };
+}
+
+/**
+ * A bridge that knows the pane and holds no message with the id, as far as the CLI sees it (2026-10-30):
+ * a build before that day answers inbox with the error `no message <id> for this pane`, and status with
+ * an ok answer that holds no message and no receipt. A real socket in a private dir. POSIX only.
+ */
+async function emptyBridge(): Promise<{ readonly path: string; readonly lines: string[] }> {
+  const stateDir = mkdtempSync(join(tmpdir(), "walky-empty-"));
+  const path = walkySocketPath(stateDir);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const lines: string[] = [];
+  const server = createServer((socket) => {
+    socket.setEncoding("utf8");
+    socket.once("data", (chunk: string) => {
+      lines.push(chunk);
+      const request = parseJsonObject(chunk) ?? {};
+      const answer = request.op === "inbox" ? { ok: false, error: `no message ${String(request.id)} for this pane` } : { ok: true, receipts: [], message: null, elsewhere: [] };
+      socket.end(`${JSON.stringify(answer)}\n`);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(path, resolve));
+  cleanups.push(() => {
+    server.close();
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+  return { path, lines };
 }
 
 type Captured = ReturnType<typeof capture>;
@@ -349,6 +404,104 @@ describe("reply, inbox, status, who", () => {
     expect(await cmdWalkyStatus(deps(b), ["../x"])).toBe(EXIT.USAGE);
   });
 
+  socketTest("an older bridge asked first that cannot read `here` does not stop the send: the next bridge, the pane's own, takes it (2026-10-30)", async () => {
+    // The live shape: the CLI asks its own install's socket first, the release lane's, whose bridge
+    // predates M75 and answers the bare `bad request` before it looks at the markers.
+    const older = await olderBridge();
+    const b = await bridge();
+    const d = deps(b, inPane("%1"), { sockets: () => [older.path, walkySocketPath(b.stateDir)] });
+    expect(await cmdWalkySend(d, ["here", "hi"])).toBe(EXIT.OK);
+    expect(older.lines).toHaveLength(1);
+    expect(d.io.stderr).toEqual([]);
+    expect(d.io.stdout).toEqual(["wt_aaaaaaaaaaa1", "to here", "typed into the pane"]);
+    expect(b.service?.status("wt_aaaaaaaaaaa1").message?.to).toBe("here");
+  });
+
+  socketTest("when only an older bridge answers the bare `bad request`, the CLI says why in words and exits USAGE", async () => {
+    const older = await olderBridge();
+    const b = scratch();
+    const d = deps(b, inPane("%1"), { sockets: () => [older.path] });
+    expect(await cmdWalkySend(d, ["here", "hi"])).toBe(EXIT.USAGE);
+    expect(d.io.stderr).toEqual([`walky talky: ${UNREAD_BY_OLDER_BRIDGE}`]);
+  });
+
+  socketTest("an older bridge asked first that knows the pane but holds no such message does not stop `inbox <id>`: the next bridge's message is read (2026-10-30)", async () => {
+    const older = await emptyBridge();
+    const b = await bridge();
+    await cmdWalkySend(deps(b, inPane("%1")), ["local/%2", "Tests are green."]);
+    const d = deps(b, inPane("%2"), { sockets: () => [older.path, walkySocketPath(b.stateDir)] });
+    expect(await cmdWalkyInbox(d, ["wt_aaaaaaaaaaa1"])).toBe(EXIT.OK);
+    expect(older.lines).toHaveLength(1);
+    expect(d.io.stderr).toEqual([]);
+    expect(d.io.stdout).toEqual(["[walky-talky wt_aaaaaaaaaaa1] from agent local/%1#aaaa (agent-x, repo#one)", "Tests are green."]);
+  });
+
+  socketTest("when every bridge knows the pane and none holds the message, `inbox <id>` prints the sentence and exits STATE, as before (2026-10-30)", async () => {
+    const older = await emptyBridge();
+    const b = await bridge();
+    const d = deps(b, inPane("%2"), { sockets: () => [older.path, walkySocketPath(b.stateDir)] });
+    expect(await cmdWalkyInbox(d, ["wt_zzzzzzzzzzzz"])).toBe(EXIT.STATE);
+    expect(d.io.stderr).toEqual(["walky talky: no message wt_zzzzzzzzzzzz for this pane"]);
+    // The newer bridge asked first, the older last: the same sentence.
+    const swapped = deps(b, inPane("%2"), { sockets: () => [walkySocketPath(b.stateDir), older.path] });
+    expect(await cmdWalkyInbox(swapped, ["wt_zzzzzzzzzzzz"])).toBe(EXIT.STATE);
+    expect(swapped.io.stderr).toEqual(["walky talky: no message wt_zzzzzzzzzzzz for this pane"]);
+    // A pane no bridge knows is still that, not a missing message.
+    const stranger = deps(b, inPane("%9"), { sockets: () => [walkySocketPath(b.stateDir)] });
+    expect(await cmdWalkyInbox(stranger, ["wt_zzzzzzzzzzzz"])).toBe(EXIT.STATE);
+    expect(stranger.io.stderr).toEqual(["walky talky: no Collie bridge on this machine knows this pane"]);
+  });
+
+  socketTest("a newer bridge asked first that does not hold the message answers not here, and the older one's message is read (2026-10-30)", async () => {
+    const holder = await bridge();
+    await cmdWalkySend(deps(holder, inPane("%1")), ["local/%2", "held by the second"]);
+    const first = await bridge();
+    const d = deps(first, inPane("%2"), { sockets: () => [walkySocketPath(first.stateDir), walkySocketPath(holder.stateDir)] });
+    expect(await cmdWalkyInbox(d, ["wt_aaaaaaaaaaa1"])).toBe(EXIT.OK);
+    expect(d.io.stdout).toEqual(["[walky-talky wt_aaaaaaaaaaa1] from agent local/%1#aaaa (agent-x, repo#one)", "held by the second"]);
+  });
+
+  socketTest("`status <id>` asks past a bridge that holds no receipt, and prints the sentence only when none does (2026-10-30)", async () => {
+    const older = await emptyBridge();
+    const b = await bridge();
+    await cmdWalkySend(deps(b, inPane("%1")), ["local/%2", "hi"]);
+    const d = deps(b, inPane("%1"), { sockets: () => [older.path, walkySocketPath(b.stateDir)] });
+    expect(await cmdWalkyStatus(d, ["wt_aaaaaaaaaaa1"])).toBe(EXIT.OK);
+    expect(older.lines).toHaveLength(1);
+    expect(d.io.stdout).toEqual(["wt_aaaaaaaaaaa1", "local/%2: typed into the pane (this machine)"]);
+    const none = deps(b, inPane("%1"), { sockets: () => [older.path, walkySocketPath(b.stateDir)] });
+    expect(await cmdWalkyStatus(none, ["wt_zzzzzzzzzzzz"])).toBe(EXIT.STATE);
+    expect(none.io.stdout).toEqual(["no record of wt_zzzzzzzzzzzz on this machine"]);
+  });
+
+  socketTest("`reply <id>` finds the message on the next bridge and sends the reply there, not through the older one asked first (2026-10-30)", async () => {
+    const older = await emptyBridge();
+    const b = await bridge();
+    await cmdWalkySend(deps(b, inPane("%1"), { mintId: () => "wt_aaaaaaaaaaa1" }), ["local/%2", "question?"]);
+    const d = deps(b, inPane("%2"), { mintId: () => "wt_bbbbbbbbbbb2", sockets: () => [older.path, walkySocketPath(b.stateDir)] });
+    expect(await cmdWalkyReply(d, ["wt_aaaaaaaaaaa1", "answer."])).toBe(EXIT.OK);
+    expect(older.lines).toHaveLength(1);
+    expect(b.sent[1]).toContain("reply to wt_aaaaaaaaaaa1");
+    // When every bridge lacks it, the words are as before.
+    const none = deps(b, inPane("%2"), { sockets: () => [older.path, walkySocketPath(b.stateDir)] });
+    expect(await cmdWalkyReply(none, ["wt_zzzzzzzzzzzz", "ok"])).toBe(EXIT.STATE);
+    expect(none.io.stderr).toEqual(["walky talky: no message wt_zzzzzzzzzzzz on this machine"]);
+  });
+
+  socketTest("a scope send (M75) passes the bare word through; status lists each delivery and the parent's totals, and --json carries them", async () => {
+    const b = await bridge();
+    const sent = deps(b, inPane("%1"));
+    expect(await cmdWalkySend(sent, ["here", "hi"])).toBe(EXIT.OK);
+    expect(sent.io.stdout).toEqual(["wt_aaaaaaaaaaa1", "to here", "typed into the pane"]);
+    expect(b.service?.status("wt_aaaaaaaaaaa1").message?.to).toBe("here");
+    const d = deps(b);
+    expect(await cmdWalkyStatus(d, ["wt_aaaaaaaaaaa1"])).toBe(EXIT.OK);
+    expect(d.io.stdout).toEqual(["wt_aaaaaaaaaaa1", "to here", "local/%2: typed into the pane (this machine)", "1 delivery: delivered 1"]);
+    const json = deps(b);
+    expect(await cmdWalkyStatus(json, ["wt_aaaaaaaaaaa1", "--json"])).toBe(EXIT.OK);
+    expect(JSON.parse(json.io.stdout[0]!)).toMatchObject({ id: "wt_aaaaaaaaaaa1", deliveries: [{ address: "local/%2", member: "local", outcome: "delivered" }], totals: { delivered: 1 } });
+  });
+
   socketTest("who on a solo install with only the asking agent pane says a message needs two", async () => {
     const lone: WalkyHost = {
       panes: () => [
@@ -374,6 +527,116 @@ describe("reply, inbox, status, who", () => {
       "local/%1#aaaa  desk     agent-x  repo#one  idle  (you)",
       "local/%2#bbbb  desk     agent-y  repo#two  working",
     ]);
+  });
+
+  /** Three agent panes in two folders, one a checkout on a branch: what a workspace filter has to tell apart. */
+  const folders = (): WalkyHost => ({
+    panes: () => [
+      { session: "main", paneId: "%1", agent: true, harness: "agent-x", label: "collie-workspace#main", state: "idle", instance: "aaaa", terminal: true },
+      { session: "main", paneId: "%2", agent: true, harness: "agent-x", label: "other", state: "idle", instance: "bbbb", terminal: true },
+      { session: "main", paneId: "%3", agent: true, harness: "agent-y", label: "collie-workspace#feat/x", state: "working", instance: "cccc", terminal: true },
+    ],
+    send: async () => ({ outcome: "sent" }),
+    sendState: () => ({ outcome: "sent" }),
+    cancelHeld: () => undefined,
+  });
+
+  socketTest("who --workspace <repo> lists only the panes whose label repo matches, any branch", async () => {
+    const b = await bridge({ host: folders() });
+    const d = deps(b, inPane("%2"));
+    expect(await cmdWalkyWho(d, ["--workspace", "collie-workspace"])).toBe(EXIT.OK);
+    expect(d.io.stdout).toEqual([
+      "ADDRESS        MACHINE  HARNESS  LABEL                    STATE",
+      "local/%1#aaaa  desk     agent-x  collie-workspace#main    idle",
+      "local/%3#cccc  desk     agent-y  collie-workspace#feat/x  working",
+    ]);
+  });
+
+  socketTest("who --workspace <repo>#<branch> narrows to the branch, and --json carries the filtered rows", async () => {
+    const b = await bridge({ host: folders() });
+    const d = deps(b, inPane("%1"));
+    expect(await cmdWalkyWho(d, ["--workspace", "collie-workspace#feat/x"])).toBe(EXIT.OK);
+    expect(d.io.stdout).toEqual(["ADDRESS        MACHINE  HARNESS  LABEL                    STATE", "local/%3#cccc  desk     agent-y  collie-workspace#feat/x  working"]);
+    const json = deps(b, inPane("%1"));
+    expect(await cmdWalkyWho(json, ["--workspace", "collie-workspace#main", "--json"])).toBe(EXIT.OK);
+    const body = JSON.parse(json.io.stdout[0]!);
+    expect(body.self).toBe("local/%1#aaaa");
+    expect(body.targets.map((row: { address: string }) => row.address)).toEqual(["local/%1#aaaa"]);
+  });
+
+  socketTest("who --workspace names a folder with no agent pane: one line, exit OK", async () => {
+    const b = await bridge({ host: folders() });
+    const d = deps(b, inPane("%1"));
+    expect(await cmdWalkyWho(d, ["--workspace", "nowhere"])).toBe(EXIT.OK);
+    expect(d.io.stdout).toEqual(["no agent panes in nowhere"]);
+  });
+
+  socketTest("who --here lists the asking pane's own folder, marks the asking pane, and works from any pane", async () => {
+    const b = await bridge({ host: folders() });
+    const d = deps(b, inPane("%1"));
+    expect(await cmdWalkyWho(d, ["--here"])).toBe(EXIT.OK);
+    expect(d.io.stdout).toEqual([
+      "ADDRESS        MACHINE  HARNESS  LABEL                    STATE",
+      "local/%1#aaaa  desk     agent-x  collie-workspace#main    idle  (you)",
+      "local/%3#cccc  desk     agent-y  collie-workspace#feat/x  working",
+    ]);
+    const lone = deps(b, inPane("%2"));
+    expect(await cmdWalkyWho(lone, ["--here"])).toBe(EXIT.OK);
+    expect(lone.io.stdout).toEqual(["ADDRESS        MACHINE  HARNESS  LABEL  STATE", "local/%2#bbbb  desk     agent-x  other  idle  (you)"]);
+  });
+
+  socketTest("who --here off a pane is refused in one line that names --workspace", async () => {
+    const b = await bridge({ host: folders() });
+    const d = deps(b);
+    expect(await cmdWalkyWho(d, ["--here"])).toBe(EXIT.STATE);
+    expect(d.io.stdout).toEqual([]);
+    expect(d.io.stderr).toEqual(["walky talky: `--here` needs a pane: run it inside an agent's pane, or name the folder with `--workspace <repo>`"]);
+  });
+
+  socketTest("--workspace and --here together are refused before any bridge is asked", async () => {
+    const b = await bridge({ host: folders() });
+    const d = deps(b, inPane("%1"));
+    expect(await cmdWalkyWho(d, ["--workspace", "collie-workspace", "--here"])).toBe(EXIT.USAGE);
+    expect(d.io.stderr[0]).toBe("error: `--workspace` and `--here` both pick the panes: use one of them");
+    expect(d.io.stderr[1]).toStartWith("usage: collie walky who");
+    expect(d.io.stdout).toEqual([]);
+  });
+
+  test("--workspace needs a folder name that is one", async () => {
+    const b = scratch();
+    const missing = deps(b);
+    expect(await cmdWalkyWho(missing, ["--workspace"])).toBe(EXIT.USAGE);
+    expect(missing.io.stderr[0]).toBe("error: `--workspace` needs a folder name: <repo> or <repo>#<branch>");
+    for (const bad of ["all", "here", "desk/%1"]) {
+      const d = deps(b);
+      expect(await cmdWalkyWho(d, ["--workspace", bad])).toBe(EXIT.USAGE);
+      expect(d.io.stderr[0]).toBe(`error: \`${bad}\` is not a workspace: give a folder name, <repo> or <repo>#<branch>`);
+    }
+  });
+
+  socketTest("status of a scope parent prints one line per delivery and the totals; --json carries both", async () => {
+    const b = await bridge({ host: folders() });
+    const sent = deps(b, inPane("%2"));
+    expect(await cmdWalkySend(sent, ["collie-workspace", "hi"])).toBe(EXIT.OK);
+    expect(sent.io.stdout.slice(0, 2)).toEqual(["wt_aaaaaaaaaaa1", "to collie-workspace"]);
+    expect(sent.io.stdout).toContain("local/%1: typed into the pane");
+    expect(sent.io.stdout).toContain("local/%3: typed into the pane");
+    const d = deps(b);
+    expect(await cmdWalkyStatus(d, ["wt_aaaaaaaaaaa1"])).toBe(EXIT.OK);
+    expect(d.io.stdout).toEqual([
+      "wt_aaaaaaaaaaa1",
+      "to collie-workspace",
+      "local/%1: typed into the pane (this machine)",
+      "local/%3: typed into the pane (this machine)",
+      "2 deliveries: delivered 2",
+    ]);
+    const json = deps(b);
+    expect(await cmdWalkyStatus(json, ["wt_aaaaaaaaaaa1", "--json"])).toBe(EXIT.OK);
+    expect(JSON.parse(json.io.stdout[0]!)).toMatchObject({
+      id: "wt_aaaaaaaaaaa1",
+      deliveries: [{ address: "local/%1", member: "local", outcome: "delivered" }, { address: "local/%3", member: "local", outcome: "delivered" }],
+      totals: { delivered: 2 },
+    });
   });
 
   test("a bare `walky` prints the sub-verbs and exits USAGE", () => {

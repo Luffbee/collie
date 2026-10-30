@@ -24,7 +24,7 @@
         "blank": true
       },
       "prompt": {
-        "pattern": "^›(?: (?!\\d{1,2}\\. )(?<draft>.*))?$",
+        "pattern": "^[›»](?: (?!\\d{1,2}\\. )(?<draft>.*))?$",
         "column": 0
       },
       "bottom": {
@@ -37,6 +37,9 @@
     },
     "placeholders": {
       "texts": [],
+      "patterns": [
+        "^Ask Codex to do anything$"
+      ],
       "sgr": 2
     },
     "volatile": {
@@ -50,7 +53,8 @@
         "hints": [
           "^\\s*← for agents · \\? for shortcuts(?:\\s{2,}\\S.*)?$",
           "^\\s*\\? for shortcuts(?:\\s{2,}\\S.*)?$",
-          "^\\s*[Tt]ab to queue message$"
+          "^\\s*[Tt]ab to queue message$",
+          "^\\s*⚠ \\d+(?: warnings?)? · f2(?: to view)?$"
         ]
       }
     },
@@ -106,7 +110,7 @@
         "hintAbove": true
       },
       {
-        "pattern": "^› (?<text>\\S.*?)\\s*$",
+        "pattern": "^[›»] (?<text>\\S.*?)\\s*$",
         "transcript": true
       }
     ]

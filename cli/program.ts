@@ -28,6 +28,7 @@ import {
 } from "./hooks.ts";
 import { lifecycleDeps, updateDeps } from "./deps.ts";
 import { cmdDoctor, doctorDeps } from "./doctor.ts";
+import { chooseDoctorInstanceHere } from "./doctor-instance.ts";
 import { cmdDocs, cmdSkill } from "./docs.ts";
 import {
   cmdSkillInstall,
@@ -89,11 +90,12 @@ import {
 } from "./push.ts";
 import { cmdPushKeys } from "./push-keys.ts";
 import { cmdQr } from "./qr.ts";
-import { loadUi, renderInputs, takePlainFlag, type Ui, wantsRich } from "./render.ts";
+import { loadUi, renderInputs, takePlainFlag, terminalColumns, type Ui, wantsRich } from "./render.ts";
 import { cmdCrewDeputy } from "./crew-deputy.ts";
 import { cmdCrewUpdate } from "./crew-update.ts";
 import { cmdCrewAdd, crewAddDeps, type CrewAddDeps } from "./remote.ts";
-import { cmdServe, cmdServeVerb, cmdUnserve } from "./serve.ts";
+import { gatherCensus } from "./census.ts";
+import { cmdServe, cmdServeStatus, cmdServeVerb, cmdUnserve, SERVE_SUBCOMMANDS } from "./serve.ts";
 import {
   cmdStt,
   cmdSttOff,
@@ -104,6 +106,8 @@ import {
   type SttDeps,
 } from "./stt.ts";
 import { cmdSttWhistle } from "./stt-whistle.ts";
+import { cmdMux, cmdMuxList, MUX_SUBCOMMANDS, type MuxListDeps } from "./mux-list.ts";
+import { cmdSessions, SESSIONS_VERB, type SessionsDeps } from "./sessions.ts";
 import { cmdDurable, cmdDurableAttach, cmdDurableDetach, cmdDurableList, DURABLE_SUBCOMMANDS, type DurableAttachDeps } from "./durable-attach.ts";
 import { realExec, realFiles } from "./sys.ts";
 import { HOST } from "../bridge/host.ts";
@@ -368,6 +372,12 @@ function durableVerbDeps(io: Io): DurableAttachDeps {
   };
 }
 
+/** `sessions`: the context, the filesystem, and the one network read of this instance's own bridge. */
+function sessionsDeps(io: Io): SessionsDeps {
+  const deps = lifecycleDeps(io);
+  return { ctx: deps.ctx, io, files: deps.files, fetch: (url, init) => fetch(url, init) };
+}
+
 function beaconDeps(): BeaconEmitDeps {
   return {
     ctx: loadContext(() => {}),
@@ -403,6 +413,12 @@ function holdDeps(): HoldDeps {
   };
 }
 
+/** `mux list`'s seams: the resolved context, the process and filesystem, and the user id the registry folder is checked against. */
+function muxListDeps(io: Io): MuxListDeps {
+  const ctx = loadContext(io.err);
+  return { ctx, io, exec: realExec(ctx.env, ctx.home), files: realFiles, uid: process.getuid?.() };
+}
+
 /** A verb whose body is a lifecycle function over {@link lifecycleDeps}. */
 function lifecycleCommand(
   name: string,
@@ -418,6 +434,30 @@ function lifecycleCommand(
     // even loaded — see `Session.ui`. `repairAcl` is the bridge process's alone (M43 spec 04).
     run: async (args, s) =>
       body(lifecycleDeps(s.io, opts.rich === true ? await s.ui() : null, { repairAcl: opts.repairAcl === true }), args),
+  };
+}
+
+/**
+ * `serve` publishes the front door and `serve status` reads what `tailscale serve` publishes. The
+ * bare verb is still the publisher, so it answers `--help` itself: a parent with children runs outside
+ * the guard in {@link buildProgram}, and publishing a door to answer a request for usage is the
+ * mistake that guard exists to stop (#392).
+ */
+function serveCommand(): Command {
+  const summary = "publish the single managed `tailscale serve` front door; `serve status` shows what tailscale serve publishes";
+  const publish: Command["run"] = async (args, s) =>
+    helpGuard(s, asksForHelp(args), "serve", summary, false, args, async () => cmdServeVerb(lifecycleDeps(s.io)));
+  return {
+    name: "serve",
+    summary,
+    subcommands: [
+      {
+        name: SERVE_SUBCOMMANDS[0],
+        summary: "what tailscale serve publishes on this machine (read only; `status --verbose` prints the same)",
+        run: (_args, s) => cmdServeStatus(lifecycleDeps(s.io)),
+      },
+    ],
+    run: publish,
   };
 }
 
@@ -456,7 +496,7 @@ function crewTree(): readonly Subcommand[] {
       cmdCrewUpdate,
       true,
     ),
-    crewSubcommand("status", "mode, members, reachability, secret pickup and why a link is refused", cmdCrewStatus, true),
+    crewSubcommand("status", "mode, members, reachability, each member's version, mux and panes, secret pickup and why a link is refused (--json)", cmdCrewStatus, true),
     crewSubcommand("rotate", "reissue the crew secret and hand it to every reachable peer", (deps) =>
       cmdCrewRotate(deps),
     ),
@@ -610,9 +650,21 @@ export const COMMANDS: readonly Command[] = [
   // Invoked directly, `serve` also prints where to point a phone (the pre-shim collie-ctl.sh) —
   // `start` does not, because its banner already carries the URL. That extra line is `cmdServeVerb`,
   // which lives beside the publish decision it depends on (a peer prints none — F24).
-  lifecycleCommand("serve", "publish the single managed `tailscale serve` front door", cmdServeVerb),
+  serveCommand(),
   lifecycleCommand("unserve", "tear down the front door we published", cmdUnserve),
-  lifecycleCommand("status", "is it running, and on what URLs", cmdStatus, { rich: true }),
+  {
+    name: "status",
+    summary:
+      "is it running, and on what URLs; then crew members, paired devices and agent sessions (`--json` for a program, `--verbose` adds the tailscale serve dump)",
+    run: async (args, s) => {
+      const deps = lifecycleDeps(s.io, await s.ui());
+      // The census reads: a `hello` per crew member and this bridge's own snapshot. Built here, where
+      // the real transport lives, so `cmdStatus` stays a function over values the tests can pass.
+      const census = (input: Parameters<typeof gatherCensus>[1]) =>
+        gatherCensus({ ctx: deps.ctx, files: deps.files, fetch: (url, init) => fetch(url, init), now: () => Date.now() }, input);
+      return cmdStatus(deps, args, census);
+    },
+  },
   lifecycleCommand("url", "print the bridge URL", cmdUrl),
   lifecycleCommand("qr", "print the bridge URL as a scannable QR code", (deps) => cmdQr(deps)),
   {
@@ -644,12 +696,27 @@ export const COMMANDS: readonly Command[] = [
   // one left out — no service manager, no front door, no store write.
   {
     name: "doctor",
-    summary: "check this install for the traps that fail silently",
+    summary: "check this install for the traps that fail silently (--json, --instance <name>)",
     run: async (args, s) => {
-      const deps = lifecycleDeps(s.io);
+      // The lane flag is read, and the name checked against this machine's instances, BEFORE the
+      // context is built: an unknown name exits 2 with the list, and no check runs (M71/04).
+      const chosen = chooseDoctorInstanceHere(args, process.env);
+      if (!chosen.ok) {
+        s.io.err(chosen.message);
+        return EXIT.USAGE;
+      }
+      const deps = lifecycleDeps(s.io, null, { instance: chosen.instance });
       return cmdDoctor(
-        doctorDeps({ ctx: deps.ctx, io: s.io, exec: deps.exec, files: deps.files, ui: await s.ui() }),
-        args,
+        doctorDeps({
+          ctx: deps.ctx,
+          io: s.io,
+          exec: deps.exec,
+          files: deps.files,
+          ui: await s.ui(),
+          // Read once, here at the edge: the plain lines wrap at the terminal's width, else at 80.
+          columns: terminalColumns(process.stdout.isTTY === true, process.stdout.columns),
+        }),
+        chosen.rest,
       );
     },
   },
@@ -879,6 +946,28 @@ export const COMMANDS: readonly Command[] = [
       },
     ],
     run: async (args, s) => await cmdDurable(durableVerbDeps(s.io), args),
+  },
+  // ── Multiplexers (M76 spec 02) ─────────────────────────────────────────────
+  // A read: the probes `start` and `doctor` make, and the live bridges' hook target records. Nothing
+  // is written, started or restarted. A bare `mux` prints the list.
+  {
+    name: "mux",
+    summary: `the multiplexers this machine has and who drives them: ${MUX_SUBCOMMANDS.join(", ")}`,
+    subcommands: [
+      {
+        name: "list",
+        summary: "every multiplexer this build knows, which are here, which instance drives each, how to start one (--json)",
+        run: (args, s) => cmdMuxList(muxListDeps(s.io), args),
+      },
+    ],
+    run: async (args, s) => await cmdMux(muxListDeps(s.io), args),
+  },
+  // ── Agent sessions (M76 spec 03) ───────────────────────────────────────────
+  // One read of this bridge's own snapshot, printed as a table. The name is `SESSIONS_VERB`, in one place.
+  {
+    name: SESSIONS_VERB,
+    summary: "list the agent sessions of the crew: member, mux, seat, harness, state (--state, --member, --all, --json)",
+    run: (args, s) => cmdSessions(sessionsDeps(s.io), args),
   },
   // ── Walky talky (M62) ──────────────────────────────────────────────────────
   // Messages between agent sessions, typed by an agent inside its pane or by the operator outside one.

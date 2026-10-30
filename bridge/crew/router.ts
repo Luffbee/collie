@@ -1,3 +1,4 @@
+import { hostname } from "node:os";
 import type { AuditLog } from "../audit.ts";
 import type { JsonObject, JsonValue } from "../json.ts";
 import {
@@ -22,6 +23,7 @@ import { CREW_MACHINE_FIELD } from "../machine-stats.ts";
 import type { MachineSample } from "../types.ts";
 import { LEAD_LINE_HEADER, LEAD_RELEASE_HEADER, UPDATE_TURN_HEADER } from "./follow.ts";
 import { apiPathFor } from "./forward.ts";
+import { leadLabel } from "./merge.ts";
 import { HOST_PARAM } from "./registry.ts";
 import {
   adoptLead,
@@ -32,12 +34,14 @@ import {
   enrollPeer,
   isDemotionRefused,
   isLeading,
+  isEnrollRefusal,
   parseEnrollRequest,
   parseRosterEntry,
   recordSignedRequest,
   removeMember,
   CREW_PROTOCOL_VERSION,
   type DemotionRefused,
+  type EnrollRefusal,
 } from "./enrollment.ts";
 import { randomToken, type RandomSource } from "./identity.ts";
 import {
@@ -63,6 +67,7 @@ import {
 import type { TrustedMember, TrustStore, TrustStoreData, Warrant } from "./trust-store.ts";
 import { checkWarrantPush, currentWarrant, parseWarrant, storeWarrant, warrantReportOf, type WarrantRefusal } from "./warrant.ts";
 import { deposedStateFrom, isDepositionProof, selfHeal, type DeposedState } from "./deposed.ts";
+import { cleanHost } from "./machine-host.ts";
 import { selectView, type SnapshotView } from "../sessions.ts";
 import type { MuxConfig, SessionCard, SnapshotResponse } from "../types.ts";
 import { WALKY_ACK_HEADER, WALKY_REPORT_FIELD, type CrewAnswer } from "../walky/crew.ts";
@@ -108,6 +113,17 @@ export const CREW_MUX_FIELD = "mux";
  * block for every session"**, which is what every lead read before the field existed.
  */
 export const CREW_SESSIONS_FIELD = "sessions";
+
+/**
+ * The three OPTIONAL fields a `snapshot` answer carries beside the body (M76 spec 04, M77 spec 01,
+ * 1.25.0): `mux`, the registry name of the multiplexer this member drives, `panes`, how many agent
+ * panes it serves, and `host`, the machine's own host name. **Absent means "this answer said
+ * nothing"**, never an empty multiplexer, never zero panes and never a machine with no name: a member
+ * whose bridge has not read its multiplexer yet sends no `panes` at all.
+ */
+export const CREW_STATUS_MUX_FIELD = "mux";
+export const CREW_PANES_FIELD = "panes";
+export const CREW_STATUS_HOST_FIELD = "host";
 
 /**
  * The OPTIONAL field a `hello` answer carries its Surface reader version on (M56 spec 09): one small
@@ -325,6 +341,10 @@ export interface CrewSurface {
   readonly sessions?: SessionCardSource;
   /** This collie's Surface reader version, for `hello` (M56 spec 09). Absent on a build that computes no Surface. */
   readonly surfaceVersion?: number | undefined;
+  /** The agent panes this machine serves, for its `snapshot` answer (M76 spec 04). See {@link CrewRouterDeps.panes}. */
+  readonly panes?: () => number | null;
+  /** This machine's own host name, for its `snapshot` answer (M77 spec 01). See {@link CrewRouterDeps.host}. */
+  readonly host?: () => string | null;
 }
 
 /**
@@ -362,6 +382,8 @@ export interface StandbySurface {
 export interface CrewRouterDeps {
   readonly store: TrustStore;
   readonly audit: AuditLog | null;
+  /** This machine's hostname, for the lead's own display name when a joiner asks for it. Absent: `os.hostname`. */
+  readonly hostname?: () => string;
   /** Absent ⇒ `/crew/v1/snapshot` 404s like any unimplemented route. */
   readonly snapshot?: SnapshotSource;
   /** Absent ⇒ the per-pane/tab/workspace half of §5's table 404s. */
@@ -509,6 +531,20 @@ export interface CrewRouterDeps {
    * is omitted, which the lead reads as **not reported**, never as an idle machine.
    */
   readonly machineStats?: () => MachineSample | null;
+  /**
+   * **How many agent panes this machine serves**, published beside the snapshot body (M76 spec 04).
+   *
+   * `null` ⇒ the machine cannot count right now (its bridge has not read the multiplexer yet), and
+   * the field is omitted. It is never sent as `0`: a lead reads absence as "not reported", and zero
+   * as "reported, and nothing is running".
+   */
+  readonly panes?: () => number | null;
+  /**
+   * **This machine's own host name**, published beside the snapshot body (M77 spec 01), so the lead
+   * can tell which members run on one machine. `null` or absent ⇒ the field is omitted, which the
+   * lead reads as "this member did not say" and groups nothing on.
+   */
+  readonly host?: () => string | null;
   /**
    * §20's two REQUEST headers reaching through: the lead's own settled release, and the turn.
    *
@@ -829,6 +865,20 @@ function resolveDial(
     return { memberId: deputy.memberId, isDeputy: true };
   }
   return null;
+}
+
+/** The lead refuses a joiner's name (CREW_PROTOCOL.md §8.2, 1.25.0): 422, never 409, which old joiners read as a protocol mismatch. */
+function enrollLabelRefusedResponse(refusal: EnrollRefusal): Response {
+  return new Response(
+    JSON.stringify({ error: refusal.message, code: refusal.refused, label: refusal.label, takenBy: refusal.takenBy }),
+    {
+      status: 422,
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        [PROTOCOL_HEADER]: String(CREW_PROTOCOL_VERSION),
+      },
+    },
+  );
 }
 
 export function createCrewRouter(deps: CrewRouterDeps): CrewHandler {
@@ -1158,12 +1208,23 @@ export function createCrewRouter(deps: CrewRouterDeps): CrewHandler {
       // one, which the lead reads as "not reported", never as an idle machine (§7.1).
       const load = deps.machineStats?.() ?? null;
       const withLoad = load === null ? withVersion : { ...withVersion, [CREW_MACHINE_FIELD]: load };
+      // M76 spec 04: the multiplexer's registry name and the agent pane count, in that same seat. The
+      // name is the one `hello`'s block already carries (`deps.mux`), so the two cannot disagree; the
+      // count is omitted while the machine cannot count, which the lead reads as "not reported".
+      const muxName = deps.mux?.()?.name ?? "";
+      const paneCount = deps.panes?.() ?? null;
+      const withMux = muxName === "" ? withLoad : { ...withLoad, [CREW_STATUS_MUX_FIELD]: muxName };
+      const withPanes = paneCount === null ? withMux : { ...withMux, [CREW_PANES_FIELD]: paneCount };
+      // M77 spec 01: the machine's own name, in that same seat. Cleaned by the one reading the lead
+      // applies on receipt, so what leaves here is what the lead would bank.
+      const hostName = cleanHost(deps.host?.() ?? null);
+      const withHost = hostName === null ? withPanes : { ...withPanes, [CREW_STATUS_HOST_FIELD]: hostName };
       // §21: the receipts this member wrote for messages from elsewhere that its lead has not acked,
       // in that same seat, with the cursor of the newest. The lead's ack (a REQUEST header, lower-case
       // lookup) is applied first, so what it already read is gone. Omitted when nothing is held, which
       // the lead reads as "nothing to report" (§7.1). A report on the exchange, never a stored state.
       const walkyReport = deps.walky?.report?.(headerValue(req, WALKY_ACK_HEADER.toLowerCase())) ?? null;
-      const withWalky = walkyReport === null ? withLoad : { ...withLoad, [WALKY_REPORT_FIELD]: walkyReport };
+      const withWalky = walkyReport === null ? withHost : { ...withHost, [WALKY_REPORT_FIELD]: walkyReport };
       // §20's two REQUEST headers, read LAST and answered with nothing. They are additive-optional
       // and absent-means-closed: a build with no `onFollow` ignores both, which is a correct peer,
       // and a peer that reads them still decides for itself. Handed over synchronously and never
@@ -1679,21 +1740,30 @@ export function createCrewRouter(deps: CrewRouterDeps): CrewHandler {
     // single-use token the operator carried out of band, and the pin is trust-on-first-use at this
     // instant — `parseEnrollRequest` has already refused a payload whose certificate and fingerprint
     // are not the same certificate, so what is pinned is what the joiner will actually present.
-    const response = await commitCrewChange(deps.store, deps.audit, (data) =>
-      data === null
-        ? null
-        : enrollPeer(
-            data,
-            {
-              fingerprint: parsed.fingerprint,
-              certPem: parsed.certPem,
-              address: parsed.address,
-              label: parsed.label ?? invite.label,
-            },
-            now(),
-            random,
-          ),
-    );
+    // A refused name writes nothing, so it travels out of the commit in a variable: the store's
+    // `update` takes a change or null, and null already means "not a crew member" below.
+    let refusal: EnrollRefusal | null = null;
+    const response = await commitCrewChange(deps.store, deps.audit, (data) => {
+      if (data === null) return null;
+      const outcome = enrollPeer(
+        data,
+        {
+          fingerprint: parsed.fingerprint,
+          certPem: parsed.certPem,
+          address: parsed.address,
+          label: parsed.label ?? invite.label,
+        },
+        now(),
+        random,
+        leadLabel((deps.hostname ?? hostname)(), data.self.memberId),
+      );
+      if (!isEnrollRefusal(outcome)) return outcome;
+      refusal = outcome;
+      return null;
+    });
+    // The token proved good above, so this answer is not an oracle for an unauthenticated caller.
+    // 422, not 409: a pre-1.25.0 `crew join` reads every 409 as a protocol mismatch.
+    if (refusal !== null) return enrollLabelRefusedResponse(refusal);
     if (response === null) return refuse(CREW_ENROLL_PATH, "not-a-crew-member");
 
     // The peer is in the roster on disk; this process still holds the one it booted with (§8.2's

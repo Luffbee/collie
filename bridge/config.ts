@@ -1,4 +1,4 @@
-import { chmodSync, statSync } from "node:fs";
+import { chmodSync, existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -19,6 +19,7 @@ import { secretFileVerdict } from "./owner-only.ts";
 import type { AuditContent } from "./audit.ts";
 import type { DialMode } from "./dial.ts";
 import type { JournalRoots, ModelCatalogs } from "./journal/registry.ts";
+import { resolveMux } from "./mux/herdr-core/pick.ts";
 import { DEFAULT_MUX, muxEndpointVar } from "./mux/registry.ts";
 import { DEFAULT_MAX_UPLOAD_MB } from "./uploads.ts";
 
@@ -183,6 +184,17 @@ export interface Config {
    */
   muxEndpoint: string;
   /**
+   * Why {@link mux} was picked with no `COLLIE_MUX`, when it is not the default: the evidence the
+   * bridge logs once at boot. Empty when `COLLIE_MUX` named it or the default stands
+   * (`bridge/mux/herdr-core/pick.ts`).
+   */
+  muxPickedBecause: string;
+  /**
+   * Why a herdr-core socket that is present was NOT picked with no `COLLIE_MUX`: the Herdr TUI's
+   * socket, or its install on this host. Logged once at boot beside the default. Empty otherwise.
+   */
+  muxNotPickedBecause: string;
+  /**
    * Absolute path to the `tmux` binary, when the operator has one somewhere unusual. Empty (the
    * default) probes a short list of fixed paths — never `PATH`, which a systemd unit and a Herdr
    * plugin action do not share with the operator's shell (`bridge/mux/tmux/exec.ts`). Set via
@@ -324,6 +336,13 @@ export interface Config {
    * likewise never read here.
    */
   launchersFile: string;
+  /**
+   * Where the operator's session labels live, `spaces.toml`, a sibling in the same dir, read the
+   * same way (bridge/operator-space-labels.ts) and likewise never read here. Display-only: a label
+   * never renames a session. `loadConfig` always sets it; optional only so a hand-built Config (a
+   * test fixture) may leave it out, which reads as "no labels".
+   */
+  spacesFile?: string;
   /**
    * Where the operator's prompt-cache overrides live — `cache-rules.toml`, the sixth file on the same
    * contract, read the same way (bridge/operator-cache-rules.ts) and likewise never read here.
@@ -594,6 +613,7 @@ export function resolveJournalRoots(
     // roots (comma-separated) because `CLAUDE_CONFIG_DIR` gives each Claude profile its own
     // projects tree, and a herd routinely mixes them (issue #92); one value is still one root.
     claude: envRoots("COLLIE_TRANSCRIPT_ROOT", join(home, ".claude", "projects"), env),
+    agy: envRoots("COLLIE_AGY_ROOT", join(home, ".gemini", "antigravity-cli"), env),
     // Each harness's own home var is honoured first, so relocating the agent relocates its journal
     // without a second Collie setting to keep in sync. The Collie override takes a list too — the
     // multi-home case isn't Claude's alone, and one setting shouldn't behave differently per agent.
@@ -642,6 +662,9 @@ export function resolveJournalRoots(
       join(env.XDG_DATA_HOME ?? join(home, ".local", "share"), "muse", "sessions"),
       env,
     ),
+    // DeepSeek Harness keeps one folder per session under $DSH_HOME/sessions, ~/.dsh when DSH_HOME is
+    // unset (the dsh-tui launcher reads it the same way). dsh-tui panes are read from here.
+    "dsh-tui": envRoots("COLLIE_DSH_ROOT", join(env.DSH_HOME?.trim() || join(home, ".dsh"), "sessions"), env),
     // OpenClaw keeps one SQLite per agent under its state folder, which `OPENCLAW_STATE_DIR` moves.
     openclaw: envRoots("COLLIE_OPENCLAW_ROOT", env.OPENCLAW_STATE_DIR ?? join(home, ".openclaw"), env),
   };
@@ -713,7 +736,20 @@ export function holdPrivateFile(path: string, repairAcl = false): PrivateFileVer
   return tightenPrivateFile(path, diskFilePerms, repairAcl);
 }
 
-export function loadConfig(env: Environment = process.env): Config {
+/** The entry names of a directory, or `[]` when it cannot be read: the herdr-core pick's one listing. */
+function listDir(dir: string): readonly string[] {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
+export function loadConfig(
+  env: Environment = process.env,
+  exists: (path: string) => boolean = existsSync,
+  list: (dir: string) => readonly string[] = listDir,
+): Config {
   const stateDir = resolveStateDir(env);
 
   const submitKeys = envList("COLLIE_SUBMIT_KEYS", env);
@@ -728,14 +764,19 @@ export function loadConfig(env: Environment = process.env): Config {
   // that is. ~/.config/collie is the same last-resort default the shim ends on.
   const configDir = resolveConfigDir(env);
 
-  const mux = (env.COLLIE_MUX ?? "").trim() || DEFAULT_MUX;
   const socketPath = env.HERDR_SOCKET_PATH ?? defaultSocketPath(HOST, env);
+  // No name, no Herdr TUI socket, no Herdr TUI install, and a herdr-core socket: the new core, said
+  // once at boot (M74). herdr-core runs on Linux and macOS only, so Windows keeps the default.
+  const resolved = resolveMux(socketPath, env, { home: homedir(), exists, list }, HOST.platform);
+  const mux = resolved.mux;
 
   return {
     mux,
     // Herdr's endpoint IS its socket path, so the default adapter keeps reading exactly the setting
     // it always read and nothing about an existing deployment moves.
-    muxEndpoint: mux === DEFAULT_MUX ? socketPath : (env[muxEndpointVar(mux)] ?? "").trim(),
+    muxEndpoint: mux === DEFAULT_MUX ? socketPath : resolved.pickedSocket || (env[muxEndpointVar(mux)] ?? "").trim(),
+    muxPickedBecause: resolved.pickedBecause,
+    muxNotPickedBecause: resolved.notPickedBecause,
     tmuxBin: (env.COLLIE_TMUX_BIN ?? "").trim(),
     zellijBin: (env.COLLIE_ZELLIJ_BIN ?? "").trim(),
     ternBin: (env.COLLIE_TERN_BIN ?? "").trim(),
@@ -770,6 +811,7 @@ export function loadConfig(env: Environment = process.env): Config {
     fontsDir: join(configDir, "fonts"),
     launchersFile: join(configDir, "launchers.toml"),
     cacheRulesFile: join(configDir, "cache-rules.toml"),
+    spacesFile: join(configDir, "spaces.toml"),
     trustedUser: env.COLLIE_TRUSTED_USER ?? "",
     trustedUserOptional: envBool("COLLIE_TRUSTED_USER_OPTIONAL", false, env),
     accessTeam: (env.COLLIE_ACCESS_TEAM ?? "").trim(),

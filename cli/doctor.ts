@@ -17,12 +17,12 @@ import { beaconReader } from "../bridge/beacon-io.ts";
 import { readBeacons, type BeaconSweepDeps } from "../bridge/beacon/reader.ts";
 import { DEFAULT_PORT, envBool, isLoopbackBindHost, nonLoopbackBindRefusal, resolveBridgeHost } from "../bridge/config.ts";
 import { configFilePaths } from "../bridge/config-source.ts";
-import { localAuthHeader, readLocalSecret } from "../bridge/local-secret.ts";
 import type { MuxCapabilityDeclaration } from "../bridge/mux/capabilities.ts";
 import { buildMuxRegistry, DEFAULT_MUX, factoryFor, type MuxTarget } from "../bridge/mux/registry.ts";
 import { TMUX_BINARY_OPTION } from "../bridge/mux/tmux/adapter.ts";
 import { ZELLIJ_BINARY_OPTION } from "../bridge/mux/zellij/adapter.ts";
 import { DURABLE_MUX } from "../bridge/mux/durable/adapter.ts";
+import { HERDR_CORE_MUX } from "../bridge/mux/herdr-core/adapter.ts";
 import { TERN_BINARY_OPTION } from "../bridge/mux/tern/adapter.ts";
 import { bindIsWildcard } from "../bridge/crew/config.ts";
 import { deriveMode } from "../bridge/crew/mode.ts";
@@ -43,6 +43,8 @@ import {
 import { sidName } from "../bridge/sddl.ts";
 import { DEVICES_FILENAME, isExpired, parseRegistryText } from "../bridge/pairing.ts";
 import { pairedRegistryOf } from "./pairing.ts";
+import { sameBuild } from "../bridge/version.ts";
+import { readOwnSnapshot } from "./snapshot-read.ts";
 import { collieVersionBare, type CliContext } from "./context.ts";
 import { aboutCrew, bad, ok, skipped, warn, type DoctorStatus, type Finding } from "./finding.ts";
 import { parseAccountWindowsSetting } from "../bridge/account-windows-setting.ts";
@@ -51,8 +53,10 @@ import { muxFinding, muxSettings, pathLinkFinding, tailscaleFindings, type MuxSe
 import { cacheFindings } from "./cache-findings.ts";
 import { surfaceFindings } from "./surface-findings.ts";
 import { harnessFindings, harnessReader, type ReadHarness } from "./harness-findings.ts";
+import { sendsSection } from "./send-findings.ts";
 import { durableFindings, sourcesFindings } from "./durable-findings.ts";
-import { historyFindings, type SnapshotRead } from "./history.ts";
+import { herdrCoreFindings, type HcDial } from "./herdr-core-findings.ts";
+import { historyFindings, type HistoryDeps, type SnapshotRead } from "./history.ts";
 import { EXIT, type Io } from "./io.ts";
 import {
   binaryLayout,
@@ -73,7 +77,8 @@ import { classifyExe, exePathOf, type ExeEvidence } from "../bridge/exe-replaced
 import { queryTask, taskOwner, windowsPathKey } from "./task-scheduler.ts";
 import { agentLabel, collieBinary, unitName } from "./unit.ts";
 import { pidFilePath } from "./lifecycle.ts";
-import type { Ui } from "./render.ts";
+import { DEFAULT_COLUMNS, type Ui } from "./render.ts";
+import { layoutFindings } from "./doctor-layout.ts";
 import {
   failureLine,
   type MemberReach,
@@ -82,15 +87,17 @@ import {
   soloCrewHint,
   VERSION_REPORTED_SINCE,
 } from "./crew.ts";
-import { fingerprintRoot, mountName, parseRecord, parseServeStatus, rootAvailability } from "./serve.ts";
+import { fingerprintRoot, handMadeDoors, mountName, parseRecord, parseServeStatus, rootAvailability } from "./serve.ts";
 import type { Exec, Files } from "./sys.ts";
 import { whistleModelFindings, type WhistleSeams } from "./stt-whistle.ts";
 import { BUILD_MARKER, currentVersionDir, listVersions, platformId, readBuildMarker } from "./update.ts";
 import { settingsHold } from "./hold-entry.ts";
 import { loadProfiles } from "../web/src/lib/surface/profile.ts";
 import {
+  certDomains,
   HTTPS_DISABLED_HINT,
-  tailnetCertDomains,
+  readTailscale,
+  TAILSCALE_PROBE_MS,
   tailnetInboundBlocked,
   tailnetName,
 } from "./tailnet.ts";
@@ -162,6 +169,11 @@ export interface DoctorDeps {
    * every test and every piped run sees — means the plain lines below, unchanged.
    */
   readonly ui?: Ui | null;
+  /**
+   * The width the plain lines wrap at. The edge reads it once (`terminalColumns`, `cli/render.ts`)
+   * and passes it in, so this verb reads no global. Absent means 80, which is what every pipe sees.
+   */
+  readonly columns?: number;
   /** The Whistle model check's stand-in pin, for the tests. Production leaves it. */
   readonly whistle?: WhistleSeams;
   /**
@@ -170,6 +182,11 @@ export interface DoctorDeps {
    * the tests that are not about it see.
    */
   readonly harnesses?: ReadHarness;
+  /**
+   * The herdr-core dial the `hc-socket` row makes (`hello` and `server.status`). Absent means the real
+   * socket; the tests that are not about it never reach it, because they have no core socket file.
+   */
+  readonly hcDial?: HcDial;
 }
 
 // ── §8.6's window, and the shoulder before it ────────────────────────────────
@@ -212,6 +229,9 @@ export async function cmdDoctor(deps: DoctorDeps, args: readonly string[]): Prom
   // about an adapter this install does not drive.
   const chosen = muxSettings(deps);
   const declaration = muxDeclaration(chosen);
+  // A multiplexer that names its agents but not their sessions gets the session id from the hooks
+  // (herdr-core, M74 spec 04): the join is the decorator's session-only mode.
+  const sessionsFromHooks = lacksSessionRef(chosen, declaration);
   // How this Collie got here, and where its updates come from — read once, and by the same functions
   // `collie update` decides on, so the two verbs can never disagree about what they are looking at.
   const install = classifyInstall(probeInstall(deps, deps.ctx.root));
@@ -232,7 +252,12 @@ export async function cmdDoctor(deps: DoctorDeps, args: readonly string[]): Prom
     updateSource(deps, install),
     ...quarantine(deps, install),
     herdrSocket(deps),
-    bindCheck(deps, mode, leadIsOnLoopback(data?.lead?.address ?? null)),
+    bindCheck({
+      deps,
+      mode,
+      leadOnLoopback: leadIsOnLoopback(data?.lead?.address ?? null),
+      leadLastDialledAt: runtimeMarker?.leadLastDialledAt ?? null,
+    }),
     bindWildcard(deps),
     // The setup check's Tailscale rows (`cli/setup-findings.ts`): installed and signed in, a tailnet
     // name with HTTPS certificates, and on Linux the operator setting. `collie start` prints the
@@ -247,6 +272,8 @@ export async function cmdDoctor(deps: DoctorDeps, args: readonly string[]): Prom
     // seventh whether the lead is new enough to show its panes: only when `durable` is the
     // multiplexer this install drives.
     ...(chosen.name === DURABLE_MUX ? await durableFindings({ ctx: deps.ctx, crew: { mode, marker: runtimeMarker } }) : []),
+    // herdr-core's socket and `hc --version`, in place of the two Herdr rows `appliesToMux` drops (M74).
+    ...(chosen.name === HERDR_CORE_MUX ? await herdrCoreFindings({ env: deps.ctx.env, exec: deps.exec, files: deps.files, endpoint: chosen.endpoint, dial: deps.hcDial }) : []),
     // The programs in `sources.json` (M55): one row for the file, then one block per program, each row
     // named `<row>:<program>`. Nothing when there is no file. The `durable-lead` row comes once: with
     // the env form's rows above on a durable-only install, after these blocks otherwise.
@@ -255,7 +282,7 @@ export async function cmdDoctor(deps: DoctorDeps, args: readonly string[]): Prom
     // whether the secret folders are owner-only by their access list (M43 spec 04). No line elsewhere:
     // on POSIX the mode bits are checked where the files are read, as before.
     ...(deps.host.platform === "win32" ? [windowsTask(deps), windowsLongPaths(deps), secretsPrivate(deps)] : []),
-    beaconHooks(deps, hookEntries, declaration?.supports.agentDetection ?? true),
+    beaconHooks(deps, hookEntries, declaration?.supports.agentDetection ?? true, sessionsFromHooks),
     await beacons(deps, hookEntries.length > 0),
     skillWalkyTalky(deps),
     ...walkyRefusals(deps),
@@ -272,6 +299,7 @@ export async function cmdDoctor(deps: DoctorDeps, args: readonly string[]): Prom
       files: deps.files,
       snapshot: ownRead,
       host: deps.host,
+      ...sessionRefDeps(declaration, chosen, sessionsFromHooks, hookEntries.length > 0),
     })),
     // Whether the prompt-cache chip is telling the truth: every TTL's date, and the one variable
     // `doctor` can read that the bridge deliberately cannot (ADR 0041). Its own module for the same
@@ -282,6 +310,10 @@ export async function cmdDoctor(deps: DoctorDeps, args: readonly string[]): Prom
     ...surfaceFindings({ ctx: deps.ctx, files: deps.files, now: deps.now }),
     // The binary and version of every harness with a profile, and what the profile says (1.24.1).
     ...(deps.harnesses === undefined ? [] : await harnessFindings(deps.harnesses)),
+    // Whether sends reach each harness (M71 spec 01): the outcomes of its recent sends, read from the
+    // receipts in `<stateDir>/sends/` without a store, and three rules over them. Local: no stamp.
+    // Then the held sends still open and how often a send met a screen it could not type into (spec 02).
+    ...sendsSection({ ctx: deps.ctx, files: deps.files, now: deps.now }),
     restartPending(deps, install, runtimeMarker, await ownRead()),
     // STAMPED `crew` when it is a comparison at all (ADR 0050), while still PRINTING here, where it
     // always has. `clock` measures this machine against a member's `Date` header and its own remedy
@@ -418,11 +450,12 @@ async function render(
     });
     return;
   }
+  const columns = deps.columns ?? DEFAULT_COLUMNS;
   deps.io.out(instance);
   deps.io.out(heading);
   deps.io.out("");
   deps.io.out("local:");
-  for (const f of local) deps.io.out(line(f));
+  for (const l of layoutFindings(local, columns)) deps.io.out(l);
   deps.io.out("");
   if (crew.length === 0) {
     // One line, exactly as `crew status` does — never a column of padded `skipped` crew checks,
@@ -431,18 +464,7 @@ async function render(
     return;
   }
   deps.io.out(`crew: ${data?.crew?.name ?? "?"}`);
-  for (const f of crew) deps.io.out(line(f));
-}
-
-/** One check, one line. The status leads, the identifier is the second word, the remedy closes it. */
-function line(f: Finding): string {
-  const head = f.status === "ok" ? "✓" : `${f.status}:`;
-  // 22 = longest check id ("integration-opencode", 20 chars) + 2, so every id gets
-  // at least one space before the detail. Grow this if a longer check id lands.
-  // A detail of more than one line (the Windows `secrets-private` line puts a path on its own)
-  // continues under its first line. No other detail holds a line break.
-  const body = `  ${head.padEnd(9)}${f.check.padEnd(22)}${f.detail.replaceAll("\n", `\n${" ".repeat(33)}`)}`;
-  return f.remedy === null ? body : `${body} → ${f.remedy}`;
+  for (const l of layoutFindings(crew, columns)) deps.io.out(l);
 }
 
 // ── Local checks ─────────────────────────────────────────────────────────────
@@ -836,19 +858,37 @@ function leadIsOnLoopback(address: string | null): boolean {
  * that same tunnel, and loopback is the right bind: ADR 0013's table names both rows. This peer
  * cannot see the lead's dial, so a tunnel that runs one way only is the lead's `member-reach` to
  * catch.
+ *
+ * Or when the lead has already dialled this listener. A peer never stores its own advertised
+ * address (only the lead holds `peers[].address`), so a member enrolled at `127.0.0.1:<port>` on the
+ * lead's own machine, joined by the lead's public name, looks like the trap from here. The runtime
+ * marker's `leadLastDialledAt` is the proof: an admitted call from the lead reached a loopback bind,
+ * so the lead shares this machine or the tunnel.
  */
-function bindCheck(deps: DoctorDeps, mode: string, leadOnLoopback: boolean): Finding {
+function bindCheck(input: {
+  readonly deps: DoctorDeps;
+  readonly mode: string;
+  readonly leadOnLoopback: boolean;
+  readonly leadLastDialledAt: number | null;
+}): Finding {
+  const { deps, mode, leadOnLoopback, leadLastDialledAt } = input;
   const host = resolvedBind(deps);
   const shown = bindIsWildcard(host) ? "0.0.0.0/:: (COLLIE_HOST empty)" : host;
   if (mode === "peer" && isLoopbackBind(host)) {
     if (leadOnLoopback) {
       return ok("bind", `${shown} (mode peer: this peer listens on loopback, and it reaches its lead on loopback too, so the lead sits on this host or at the end of a tunnel)`);
     }
+    if (leadLastDialledAt !== null) {
+      return ok(
+        "bind",
+        `COLLIE_HOST=${host} on a peer, and the lead dialled this listener at ${new Date(leadLastDialledAt).toISOString()}, so it shares this machine`,
+      );
+    }
     const suggestion = tailnetName(deps.exec) ?? "<address the lead can dial>";
     return bad(
       "bind",
       `COLLIE_HOST=${host} on a PEER — only this machine can reach the crew listener, so the lead's` +
-        " probe never lands and the member stays provisional",
+        " probe has not landed yet and the member stays provisional until it does",
       `set COLLIE_HOST=${suggestion} in ${join(deps.ctx.configDir, ".env")}, then \`collie restart\``,
     );
   }
@@ -993,10 +1033,34 @@ function frontDoor(deps: DoctorDeps, mode: string): Finding {
       "install tailscale and `collie serve`, or set COLLIE_SKIP_SERVE=1 if you own the ingress (docs/deployment.md Variant E)",
     );
   }
+  // Read the state before the certificates: a signed-out Tailscale answers `status --json` with
+  // exit 0 and no `CertDomains`, which reads as "no HTTPS" and blames the wrong thing.
+  const state = readTailscale(deps.exec);
+  if (state.kind === "down") {
+    return skipped(
+      "front-door",
+      "Tailscale is not running here, so the published mapping cannot be read yet",
+      "fix the tailscale line first, then run `collie doctor` again",
+    );
+  }
+  if (state.kind === "slow") {
+    return skipped(
+      "front-door",
+      `\`tailscale status --json\` did not answer within ${TAILSCALE_PROBE_MS / 1000} seconds, so the published mapping cannot be read yet`,
+      "run `tailscale status` by hand, then `collie doctor` again",
+    );
+  }
+  if (state.kind === "unreadable") {
+    return skipped(
+      "front-door",
+      "`tailscale status --json` did not answer readably",
+      "run it by hand, then `collie doctor` again",
+    );
+  }
   // No certificates, no https door — and `tailscale serve` says so by asking a question at a
   // terminal a service has not got (#172). `collie serve` refuses on this same fact; doctor names it
   // here so the operator reads it before they type the verb.
-  if (deps.ctx.serveMode === "https" && tailnetCertDomains(deps.exec)?.length === 0) {
+  if (deps.ctx.serveMode === "https" && state.kind === "running" && certDomains(state.json)?.length === 0) {
     return warn(
       "front-door",
       "this tailnet has no HTTPS certificates, so an https front door cannot be published",
@@ -1051,6 +1115,8 @@ function frontDoor(deps: DoctorDeps, mode: string): Finding {
     }
     const detail = `no Collie-managed mapping is recorded and nothing of ours is published on :${listener}`;
     const publishRemedy = "`collie serve` here (or COLLIE_SKIP_SERVE=1 if you own the ingress)";
+    const stray = handMadeDoorFinding(deps, status, listener);
+    if (stray !== null) return stray;
     return mode === "lead"
       ? bad(
           "front-door",
@@ -1089,10 +1155,10 @@ function frontDoor(deps: DoctorDeps, mode: string): Finding {
   const fingerprint = fingerprintRoot(status, record.hostPort, record.port, record.path);
   if (fingerprint === `${record.mode}|proxy:${record.proxy}`) {
     const at = record.path === "/" ? "" : ` at ${record.path}`;
-    return ok("front-door", `${record.hostPort}${at} → ${record.proxy} (recorded and live)`);
+    return handMadeDoorFinding(deps, status, record.port) ?? ok("front-door", `${record.hostPort}${at} → ${record.proxy} (recorded and live)`);
   }
   if (fingerprint === "absent") {
-    return warn(
+    return handMadeDoorFinding(deps, status, record.port) ?? warn(
       "front-door",
       `the record names ${record.hostPort}, but no root mount is published there`,
       "`collie serve` here to republish it",
@@ -1106,9 +1172,30 @@ function frontDoor(deps: DoctorDeps, mode: string): Finding {
   );
 }
 
+/**
+ * A root mount on a listener other than `ownPort` that still proxies to this Collie's loopback: a
+ * door made by hand (the old Headscale recipe used port 80). Collie never adopts it and
+ * `collie uninstall` never removes it, so it is named. Null when there is none. Callers use it only
+ * when the own door is fine or missing, so no other answer is hidden behind it.
+ */
+function handMadeDoorFinding(
+  deps: DoctorDeps,
+  status: NonNullable<ReturnType<typeof liveServeStatus>>,
+  ownPort: number,
+): Finding | null {
+  const proxy = `http://127.0.0.1:${deps.ctx.port}`;
+  const stray = handMadeDoors(status, ownPort, proxy, deps.ctx.basePath)[0];
+  if (stray === undefined) return null;
+  return warn(
+    "front-door",
+    `:${stray.listener} proxies to ${proxy}, made by hand on a port Collie does not manage; collie uninstall will not remove it`,
+    `remove it with \`tailscale serve --${stray.protocol}=${stray.listener} --set-path=${deps.ctx.basePath} off\`, then run \`collie start\`, which publishes on Collie's own port (docs/windows.md)`,
+  );
+}
+
 /** `tailscale serve status --json`, parsed — `null` for every "can't tell", as everywhere else. */
 function liveServeStatus(deps: DoctorDeps): ReturnType<typeof parseServeStatus> | null {
-  const r = deps.exec.capture("tailscale", ["serve", "status", "--json"]);
+  const r = deps.exec.capture("tailscale", ["serve", "status", "--json"], TAILSCALE_PROBE_MS);
   if (!r.found || r.code !== 0) return null;
   try {
     return parseServeStatus(r.stdout);
@@ -1130,19 +1217,9 @@ function liveServeStatus(deps: DoctorDeps): ReturnType<typeof parseServeStatus> 
  * "it did not answer".
  */
 async function ownSnapshot(deps: DoctorDeps): Promise<SnapshotRead> {
-  const host = resolvedBind(deps);
-  const dialled = bindIsWildcard(host) ? "127.0.0.1" : host;
-  const bracketed = dialled.includes(":") && !dialled.startsWith("[") ? `[${dialled}]` : dialled;
-  try {
-    const answer = await deps.fetch(`http://${bracketed}:${String(deps.ctx.port)}/api/snapshot`, {
-      signal: AbortSignal.timeout(SNAPSHOT_BUDGET_MS),
-      headers: ownReadHeaders(deps),
-    });
-    if (answer.ok) return { kind: "body", text: await answer.text() };
-    return { kind: "refused", status: answer.status };
-  } catch {
-    return { kind: "silent" };
-  }
+  // The configured login (issue #238, below) rides beside the bridge's local read credential, which
+  // `readOwnSnapshot` adds itself: reads need a pairing token now (ADR 0086) and this process holds none.
+  return readOwnSnapshot(deps, { extraHeaders: identityHeader(deps) });
 }
 
 /**
@@ -1167,24 +1244,6 @@ function identityHeader(deps: DoctorDeps): Record<string, string> | undefined {
   const login = deps.ctx.env.COLLIE_TRUSTED_USER ?? "";
   return login === "" ? undefined : { "Tailscale-User-Login": login };
 }
-
-/**
- * Everything this verb shows its own bridge on a read: the configured login (issue #238, above) and
- * the bridge's local read credential (`<stateDir>/local-secret`, bridge/local-secret.ts), because
- * reads need a pairing token now (ADR 0086) and this process holds none. The credential reads only,
- * and only from this host (loopback or the host's own bound address); with no file (the bridge is
- * down, or older) nothing is sent and the bridge refuses as it did before, which `ownAnswerSentence`
- * and the history section report as a refusal.
- */
-function ownReadHeaders(deps: DoctorDeps) {
-  return {
-    ...identityHeader(deps),
-    ...localAuthHeader(readLocalSecret(deps.ctx.stateDir, (p) => deps.files.read(p))),
-  };
-}
-
-/** Long enough for a busy loopback bridge, short enough that a wedged one does not hold the verb. */
-const SNAPSHOT_BUDGET_MS = 3000;
 
 /** A thunk that runs at most once: the first caller pays, every later one shares the same promise. */
 function once<T>(run: () => Promise<T>): () => Promise<T> {
@@ -1475,6 +1534,47 @@ function muxDeclaration(settings: MuxSettings): MuxCapabilityDeclaration | null 
   return factory === undefined ? null : factory.create(muxTarget(settings)).capabilities;
 }
 
+/**
+ * What the history section is told about session ids on this install (M74).
+ *
+ * A multiplexer that names agents itself but not their sessions reports one only through the hooks:
+ * with none installed `agent-sessions` is skipped and says to install them, and with them installed it
+ * is the observed result and its remedy is the hook. A multiplexer with no hook path at all (a
+ * declaration with no matcher) is skipped with the adapter's own note.
+ */
+function sessionRefDeps(
+  declaration: MuxCapabilityDeclaration | null,
+  chosen: MuxSettings,
+  sessionsFromHooks: boolean,
+  hooksInstalled: boolean,
+): Pick<HistoryDeps, "noSessionRefs" | "noSessionRefsRemedy" | "sessionsFromHooks"> {
+  if (sessionsFromHooks) {
+    return hooksInstalled
+      ? { noSessionRefs: undefined, noSessionRefsRemedy: undefined, sessionsFromHooks: true }
+      : {
+          noSessionRefs: "the hooks are not installed, and a hook is what adds a Claude pane's session",
+          noSessionRefsRemedy: "`collie hooks install claude`, then relaunch the Claude in the pane",
+          sessionsFromHooks: false,
+        };
+  }
+  const bare = declaration !== null && declaration.supports.agentDetection && !declaration.supports.agentSessionRef;
+  return {
+    noSessionRefs: bare ? (declaration.notes.agentSessionRef ?? `${chosen.name} reports no agent session`) : undefined,
+    noSessionRefsRemedy: undefined,
+    sessionsFromHooks: false,
+  };
+}
+
+/**
+ * Does this multiplexer name its agents on its own wire and still lack the session id, so that only
+ * a hook can supply it? True when it declares `agentDetection`, no `agentSessionRef`, and has a
+ * beacon matcher to join the hook to its panes.
+ */
+function lacksSessionRef(settings: MuxSettings, declaration: MuxCapabilityDeclaration | null): boolean {
+  if (declaration === null || !declaration.supports.agentDetection || declaration.supports.agentSessionRef) return false;
+  return factoryFor(buildMuxRegistry(), settings.name)?.beaconMatcher !== undefined;
+}
+
 /** Where Windows keeps the long-path switch, and the value `reg query` reads. */
 export const LONG_PATHS_KEY = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem";
 /** An install folder longer than this leaves little room under 260 characters for what sits inside it. */
@@ -1689,14 +1789,23 @@ function beaconHooks(
   deps: DoctorDeps,
   entries: readonly InstalledEntry[],
   muxReportsAgents: boolean,
+  hooksGiveSessions: boolean,
 ): Finding {
   const check = "beacon-hooks-claude";
   const would = resolveHookCommand(deps.ctx, deps.link);
   const name = muxSettings(deps).name;
   const install =
     `\`collie hooks install claude\` (writes ${String(BEACON_HOOKS.length)} marked entries into` +
-    " ~/.claude/settings.json; running Claudes must be relaunched)";
+    " ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json; running Claudes must be relaunched)";
   if (entries.length === 0) {
+    // The multiplexer names agents, and only a hook can add the session id that gives a pane History.
+    if (muxReportsAgents && hooksGiveSessions) {
+      return skipped(
+        check,
+        `${name} names each agent itself; the hooks add a Claude pane's session, which is what gives it History. Hooks installed: no`,
+        install,
+      );
+    }
     return muxReportsAgents
       ? ok(check, `not needed — ${name} reports agents itself; hooks installed: no`)
       : bad(
@@ -1751,7 +1860,11 @@ function beaconHooks(
   // Installed under a multiplexer that names its own agents is still `ok`. That multiplexer does not
   // need the hooks to name an agent, so the line says what they still give: the hook edges of the
   // input surface (M56 spec 11).
-  const spare = muxReportsAgents ? `; ${name} names agents itself and does not need them for that, so they give hook edges only` : "";
+  const spare = !muxReportsAgents
+    ? ""
+    : hooksGiveSessions
+      ? `; ${name} names agents itself, so they give hook edges and each Claude pane's session (its History)`
+      : `; ${name} names agents itself and does not need them for that, so they give hook edges only`;
   // The permission hold (M56 spec 12): which files hold permissions for the phone, if any.
   const holdEvent = loadProfiles().get("claude")?.hold?.event;
   const holding = holdEvent === undefined ? 0 : [...perFile.keys()].filter((path) => settingsHold(deps.files.read(path), holdEvent)).length;
@@ -2029,7 +2142,7 @@ function memberVersions(
     );
   }
   const behind = answered.filter(
-    (e) => e.outcome.value.version !== null && e.outcome.value.version !== ours,
+    (e) => e.outcome.value.version !== null && !sameBuild(e.outcome.value.version, ours),
   );
   const skewed = behind.map((e) => `${e.id} runs ${e.outcome.value.version}`);
   if (skewed.length === 0) return ok("member-versions", `every member that reported one runs ${ours}${note}`);
@@ -2076,6 +2189,7 @@ export function doctorDeps(base: {
   exec: Exec;
   files: Files;
   ui?: Ui | null;
+  columns?: number;
   host?: Host;
 }): DoctorDeps {
   return {

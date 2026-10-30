@@ -29,6 +29,7 @@ const KEYS = [
   "COLLIE_TRANSCRIPT_ROOT",
   "COLLIE_REDACT",
   "COLLIE_CODEX_ROOT",
+  "COLLIE_AGY_ROOT",
   "COLLIE_KIRO_ROOT",
   "KIRO_HOME",
   "COLLIE_PI_ROOT",
@@ -105,6 +106,7 @@ describe("loadConfig", () => {
     expect(cfg.journalRoots.hermes).toEqual([join(homedir(), ".hermes")]);
     expect(cfg.journalRoots.kiro).toEqual([join(homedir(), ".kiro", "sessions")]);
     expect(cfg.journalRoots.openclaw).toEqual([join(homedir(), ".openclaw")]);
+    expect(cfg.journalRoots.agy).toEqual([join(homedir(), ".gemini", "antigravity-cli")]);
     expect(cfg.submitKeys).toEqual(["Enter"]);
     expect(cfg.trustedUser).toBe("");
     expect(cfg.trustedUserOptional).toBe(false);
@@ -614,3 +616,49 @@ describe("normaliseBasePath — COLLIE_BASE_PATH as the bridge mounts it", () =>
     expect(loadConfig().basePath).toBe("/");
   });
 });
+
+describe("loadConfig picks herdr-core with no COLLIE_MUX only where the Herdr TUI is absent (M74)", () => {
+  const core = "/run/user/7/herdr-core/default.sock";
+  const env = { XDG_RUNTIME_DIR: "/run/user/7", HERDR_SOCKET_PATH: "/home/dev/.config/herdr/herdr.sock" };
+  // The pick lists Herdr's plugin config dir; the test host has none, whatever the real home holds.
+  const noDirs = (): readonly string[] => [];
+  const tuiConfig = join(homedir(), ".config", "herdr", "config.toml").replaceAll("\\", "/");
+
+  // herdr-core runs on Linux and macOS only (M74), so Windows keeps `herdr` on the same sockets.
+  test("only the core socket: herdr-core on that socket, with the reason; Windows keeps herdr", () => {
+    const cfg = loadConfig(env, (path) => path === core, noDirs);
+    if (process.platform === "win32") {
+      expect(cfg.mux).toBe("herdr");
+      expect(cfg.muxPickedBecause).toBe("");
+      return;
+    }
+    expect(cfg.mux).toBe("herdr-core");
+    expect(cfg.muxEndpoint).toBe(core);
+    expect(cfg.muxPickedBecause).toContain(core);
+    expect(cfg.muxNotPickedBecause).toBe("");
+  });
+
+  test("the TUI socket is there: herdr, as before, and the core socket is named as not picked", () => {
+    const cfg = loadConfig(env, () => true, noDirs);
+    expect(cfg.mux).toBe("herdr");
+    expect(cfg.muxEndpoint).toBe(env.HERDR_SOCKET_PATH);
+    expect(cfg.muxPickedBecause).toBe("");
+    if (process.platform !== "win32") expect(cfg.muxNotPickedBecause).toContain(`a Herdr socket at ${env.HERDR_SOCKET_PATH}`);
+  });
+
+  test("the TUI socket is absent but the Herdr TUI is installed here: herdr, with the reason", () => {
+    const cfg = loadConfig(env, (path) => path === core || path === tuiConfig, noDirs);
+    expect(cfg.mux).toBe("herdr");
+    expect(cfg.muxEndpoint).toBe(env.HERDR_SOCKET_PATH);
+    expect(cfg.muxPickedBecause).toBe("");
+    if (process.platform !== "win32") expect(cfg.muxNotPickedBecause).toContain("Herdr TUI install");
+  });
+
+  test("an explicit COLLIE_MUX is never second-guessed", () => {
+    const cfg = loadConfig({ ...env, COLLIE_MUX: "herdr" }, (path) => path === core, noDirs);
+    expect(cfg.mux).toBe("herdr");
+    expect(cfg.muxPickedBecause).toBe("");
+    expect(cfg.muxNotPickedBecause).toBe("");
+  });
+});
+
