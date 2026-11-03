@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { withAgentBeacons, type AgentBeaconDeps, type BeaconMatcher } from "./decorate.ts";
 import { withAgentHints } from "./hint.ts";
 import { fakeBeaconReader, FAKE_BEACON_NOW, type FakeBeacon } from "./fake.ts";
-import { BEACON_SCHEMA_VERSION, type BeaconMarker, type BeaconStatus } from "./types.ts";
+import { BEACON_SCHEMA_VERSION, BEACON_TTL_MS, type BeaconMarker, type BeaconStatus } from "./types.ts";
 import { declareCapabilities, type MuxCapability } from "../mux/capabilities.ts";
 import {
   muxAck,
@@ -22,10 +22,6 @@ import {
   type MuxSubscription,
   type MuxTabRequest,
   type MuxWatchOptions,
-  type MuxWorktree,
-  type MuxWorktreeCreateRequest,
-  type MuxWorktreeOpenRequest,
-  type MuxWorktreeScope,
 } from "../mux/types.ts";
 import type { ForegroundProcess } from "../journal/types.ts";
 
@@ -172,21 +168,6 @@ class StubAdapter implements MuxAdapter {
     return Promise.resolve(muxOk<readonly MuxSession[]>([{ name: "default", endpoint: "/tmp/stub.sock" }]));
   }
 
-  listWorktrees(scope: MuxWorktreeScope) {
-    this.note("listWorktrees", scope);
-    return Promise.resolve(muxOk<readonly MuxWorktree[]>([]));
-  }
-
-  createWorktree(request: MuxWorktreeCreateRequest) {
-    this.note("createWorktree", request);
-    return Promise.resolve(muxOk({ paneId: "%9", spaceId: "space", spaceLabel: "space", tabId: "tab", cwd: "/tmp" }));
-  }
-
-  openWorktree(request: MuxWorktreeOpenRequest) {
-    this.note("openWorktree", request);
-    return Promise.resolve(muxOk({ pane: { paneId: "%9", spaceId: "space", spaceLabel: "space", tabId: "tab", cwd: "/tmp" }, alreadyOpen: false }));
-  }
-
 
   watch(options: MuxWatchOptions): MuxSubscription {
     this.note("watch", options);
@@ -313,6 +294,20 @@ describe("session-only mode, for an adapter that names agents but not sessions",
     expect(shell.sessionAgent).toBe("claude");
   });
 
+  test("an agent quiet past the TTL keeps its session while its process runs, and loses it once the process is gone", async () => {
+    const quiet = (pid: number, alive: boolean): FakeBeacon => {
+      const fresh = beacon([marker("%1")], "idle", pid, alive);
+      return { ...fresh, record: { ...fresh.record, heartbeatMs: FAKE_BEACON_NOW - BEACON_TTL_MS - 60 * 60 * 1000 } };
+    };
+    const running = await paneOf(decorate(seeing(), [quiet(7, true)]), "%1");
+    expect(running.agentSession).toEqual({ kind: "id", value: "session-7" });
+    expect(running.agent).toBe("claude");
+    expect(running.status).toBe("idle");
+    expect(running.sessionAgent).toBeUndefined();
+    const gone = await paneOf(decorate(seeing(), [quiet(8, false)]), "%1");
+    expect(gone.agentSession).toBeUndefined();
+  });
+
   test("without the hooks the panes are the adapter's own", async () => {
     const adapter = decorate(seeing(), [beacon([marker("%1")], "working", 6)], false);
     expect((await paneOf(adapter, "%1")).agentSession).toBeUndefined();
@@ -371,9 +366,6 @@ describe("a decorator preserves the adapter's whole surface", () => {
     renameTab: true,
     closeTab: true,
     createSpace: true,
-    listWorktrees: true,
-    createWorktree: true,
-    openWorktree: true,
     listSessions: true,
     watch: true,
   } satisfies Record<keyof Required<MuxAdapter>, true>;

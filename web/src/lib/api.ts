@@ -8,7 +8,6 @@ import {
   endLongUpload,
   markLive,
   noteNetworkFailure,
-  noteReadStart,
   noteServerFailure,
   type ReadFailureKind,
 } from "./connection-health";
@@ -576,9 +575,6 @@ export async function fetchSnapshot(
 ): Promise<SnapshotResponse> {
   const path = withScope("/api/snapshot", scope);
   let snap: SnapshotResponse;
-  // When this read began, and whether the page was hidden: a read with no answer right after a wake
-  // is one strike, not the outage (lib/connection-health.ts `noteNetworkFailure`).
-  noteReadStart();
   try {
     snap = await req<SnapshotResponse>(all ? `${path}${path.includes("?") ? "&" : "?"}sessions=all` : path, {
       signal,
@@ -653,15 +649,24 @@ export function textBeforeLastSend(paneId: string, scope?: Scope): string | unde
 /**
  * Read one pane's mirror. `seen: false` leaves the pane's unseen mark alone: the read a finger
  * starts on `pointerdown` (lib/pane-prefetch.ts) may be the start of a scroll, not an open.
+ *
+ * `older: true` is a person's Load older (`?purpose=older`). Every other read is the mirror's poll,
+ * which herdr-core answers from the screen alone: its history read can hold the pane's keys, so it
+ * reads history only when asked (bridge/mux/herdr-core/adapter.ts, `readGrid`). Other multiplexers
+ * answer both alike.
  */
 export async function fetchPane(
   paneId: string,
   lines?: number,
   scope?: Scope,
   signal?: AbortSignal,
-  { seen = true }: { seen?: boolean } = {},
+  { seen = true, older = false }: { seen?: boolean; older?: boolean } = {},
 ): Promise<PaneReadResponse> {
-  const q = lines ? `?lines=${lines}` : "";
+  const params = new URLSearchParams();
+  if (lines) params.set("lines", String(lines));
+  if (older) params.set("purpose", "older");
+  const query = params.toString();
+  const q = query ? `?${query}` : "";
   const url = withScope(`/api/pane/${encodeURIComponent(paneId)}${q}`, scope);
   // Pane ids are unique only within one session on one machine (each session is its own Herdr
   // server; each crew member is its own machine again), so the ETag/body cache is keyed by the full
@@ -2129,8 +2134,8 @@ function hostOnly(scope?: Scope): Scope | undefined {
 }
 
 /**
- * GET /api/worktree/plan — what a branch from `cwd` would be (ADR 0093). A read, lead-local: the
- * sheet asks it only of the lead. `branch` and `parent` add the folder answers.
+ * GET /api/worktree/plan — what a branch from `cwd` would be (ADR 0093). A read, answered by the
+ * machine the scope names (a crew forwards it, ADR 0126). `branch` and `parent` add the folder answers.
  */
 export function planWorktree(query: { cwd: string; branch?: string; parent?: string }, scope?: Scope): Promise<WorktreePlanResponse> {
   const params = new URLSearchParams({ cwd: query.cwd });
@@ -2154,7 +2159,7 @@ interface WorktreeAtBody {
 
 /**
  * POST /api/worktree — a new branch in its own folder from the folder `cwd` names, opened as a
- * space, with an agent or a shell in it (ADR 0093). Lead-local, like every worktree call.
+ * space, with an agent or a shell in it (ADR 0093). Made on the machine the scope names (ADR 0126).
  */
 export function createWorktreeAt(
   ask: {
@@ -2201,10 +2206,12 @@ export function fetchLaunchers(scope?: Scope): Promise<LaunchersResponse> {
   return req<LaunchersResponse>(withScope("/api/launchers", scope));
 }
 
-// ── Rows a phone adds on one machine (ADR 0094) ─────────────────────────────────────────────────
+// ── Rows a phone adds for the crew (ADR 0094, amended by ADR 0127 point 4) ───────────────────────
 //
-// Each machine keeps its own list: a `scope` with `host` writes THAT member's store through the
-// lead's ordinary forward, and nothing is copied anywhere else. All three are writes on the write gate.
+// A row a phone adds is the LEAD's, so it serves every machine of the crew. None of the three takes a
+// scope: they carry no `host` and no `session`, and the lead answers them from its own store. A page
+// that names a member still shows the member as where the first run lands, but the write never goes
+// there. All three are writes on the write gate.
 
 /** What "Add your own" sends: a recipe the bridge builds, or a line typed by hand. */
 export type AddLauncherAsk =
@@ -2223,24 +2230,24 @@ export type AddLauncherAsk =
  * POST /api/launchers/added. `requestId` is a UUID minted per add (`mintRequestId`); a retry with the
  * same id answers the stored row with `replayed: true` and adds nothing.
  */
-export function addLauncher(ask: AddLauncherAsk, requestId: string, scope?: Scope): Promise<AddedLauncherResponse> {
-  return req<AddedLauncherResponse>(withScope("/api/launchers/added", scope), {
+export function addLauncher(ask: AddLauncherAsk, requestId: string): Promise<AddedLauncherResponse> {
+  return req<AddedLauncherResponse>("/api/launchers/added", {
     method: "POST",
     body: JSON.stringify({ ...ask, requestId }),
   });
 }
 
-/** POST /api/launchers/added/remove — remove one row a phone added on that machine. */
-export function removeAddedLauncher(id: string, scope?: Scope): Promise<{ ok: true; removed: number }> {
-  return req<{ ok: true; removed: number }>(withScope("/api/launchers/added/remove", scope), {
+/** POST /api/launchers/added/remove — remove one row a phone added, from the lead's list. */
+export function removeAddedLauncher(id: string): Promise<{ ok: true; removed: number }> {
+  return req<{ ok: true; removed: number }>("/api/launchers/added/remove", {
     method: "POST",
     body: JSON.stringify({ id }),
   });
 }
 
 /** POST /api/launchers/added/rename — a new label for one row a phone added. */
-export function renameAddedLauncher(id: string, label: string, scope?: Scope): Promise<AddedLauncherResponse> {
-  return req<AddedLauncherResponse>(withScope("/api/launchers/added/rename", scope), {
+export function renameAddedLauncher(id: string, label: string): Promise<AddedLauncherResponse> {
+  return req<AddedLauncherResponse>("/api/launchers/added/rename", {
     method: "POST",
     body: JSON.stringify({ id, label }),
   });

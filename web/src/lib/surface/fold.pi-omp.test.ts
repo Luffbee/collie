@@ -38,6 +38,7 @@ describe("the typed command's own list under pi's and omp's box (field case 2026
   const OWN: readonly [string, string][] = [
     ["pi--v130-slash-model-list--w120.txt", "/model"],
     ["pi--v130-slash-model-list--w80.txt", "/model"],
+    ["pi--v140-slash-model-list--w120.txt", "/model"],
     ["pi--v130-slash-settings-list--w120.txt", "/settings"],
     ["pi--v130-slash-settings-list--w80.txt", "/settings"],
     ["pi--v0871-slash-model-list--w120.txt", "/model"],
@@ -69,18 +70,15 @@ describe("the typed command's own list under pi's and omp's box (field case 2026
     });
   }
 
-  // On pi a list that points at another command (`/mod` typed, `model` pointed), the selector `/model`
-  // opens and the settings screen `/settings` opens all stay dialogs. omp names `leadOpens`: its fuzzy
-  // list under a box that starts with `/` is that text's own popup whatever it points at (below).
+  // The selector `/model` opens and the settings screen `/settings` opens stay dialogs. pi and omp name
+  // `leadOpens`: their fuzzy list under a box that starts with `/` is that text's own popup whatever it
+  // points at (below; pi since issue 638).
   for (const name of [
-    "pi--v130-slash-mod-partial--w120.txt",
     "pi--v130-model-selector-empty--w120.txt",
     "pi--v0871-model-selector-empty--w120.txt",
     "omp--v18-6-model-selector-empty--w120.txt",
     "pi--v130-settings-screen--w120.txt",
     "omp--v18-6-settings-screen--w120.txt",
-    "pi--v110-slash-palette.txt",
-    "pi--v120-slash-palette-padded.txt",
   ]) {
     it(`${name}: still reads as a dialog`, () => {
       const read = own(name);
@@ -90,14 +88,15 @@ describe("the typed command's own list under pi's and omp's box (field case 2026
     });
   }
 
-  it("on pi a list that points at another command finds no own list", () => {
+  it("on pi a list that points at another command is the typed text's own list (leadOpens, issue 638)", () => {
     const name = "pi--v130-slash-mod-partial--w120.txt";
     const rows = fixtureRows(name);
     const idle = idleFor("pi")!;
     const frame = findInputFrame(rows, idle);
     const texts = rows.map(rowText);
-    expect(frame === null ? null : ownCommandList(texts, frame, idle), name).toBeNull();
-    if (frame !== null) expect(commandListAt(texts, frame, idle.volatile.below.commandList)?.pointed, name).toBe("/model");
+    expect(frame?.interior.text, name).toBe("/mod");
+    expect(ownCommandList(texts, frame, idle)?.pointed, name).toBe("/model");
+    expect(pointsAt(commandListAt(texts, frame!, idle.volatile.below.commandList)!, "/mod", idle.volatile.below.commandList), name).toBe(false);
   });
 
   // omp's list is a fuzzy one: `/mod` lists ten commands that match it in part, the pointer on `model`
@@ -542,6 +541,46 @@ describe("the reporter's idle captures under pi-powerline-footer (issue 544)", (
 // `/mo` and `/nothere` ended `typed_not_submitted (modal_cue)` with the generic detail. The profile's
 // `leadOpens` makes the list the typed text's own popup: the Surface reads a draft and no modal, and
 // the Send Protocol alone decides, from the pointer, whether Enter runs what is typed.
+// Issue 638 (pi 1.4.0 on Herdr, mode=command): pi draws a fuzzy list under the box for a text that starts
+// with `/`, on 1.3.0 and 1.4.0 alike: `/s` lists five rows and a `(1/8)` count, the pointer on `settings`;
+// `/model haiku` lists the models that match the argument, the pointer on the first. Until the pi profile
+// named `leadOpens`, these screens read `unreadable`, the send ended `typed_not_submitted (modal_cue)` with
+// the generic detail, and every later send on the pane was refused `unconfirmed` until a person pressed
+// Escape in the terminal. Now the Surface reads a draft and no modal; Enter still waits, because the
+// pointer is not on the typed text, and the next send finds the person's draft.
+describe("pi's fuzzy command list under the box (issue 638, pi 1.3.0 and 1.4.0)", () => {
+  const FUZZY: readonly [string, string, string][] = [
+    ["pi--v130-slash-mod-partial--w120.txt", "/mod", "/model"],
+    ["pi--v140-slash-s-fuzzy--w120.txt", "/s", "/settings"],
+    ["pi--v140-slash-model-arg-list--w120.txt", "/model haiku", "/anthropic/claude-haiku-4.5"],
+  ];
+
+  for (const [name, typed, pointed] of FUZZY) {
+    it(`${name}: a draft with no modal and the list read, pointed at ${pointed}`, () => {
+      const read = own(name);
+      expect(read.frame?.interior.text).toBe(typed);
+      expect(read.surface).toEqual({ revision: 1, turn: "idle", modal: "none", composer: "draft" });
+      expect(read.cues?.strength).toBe("none");
+      expect(labelOf(name).state).toBe("popup");
+      const idle = idleFor("pi")!;
+      const texts = fixtureRows(name).map(rowText);
+      const list = commandListAt(texts, read.frame!, idle.volatile.below.commandList);
+      expect(list?.pointed, name).toBe(pointed);
+      expect(pointsAt(list!, typed, idle.volatile.below.commandList), name).toBe(false);
+    });
+  }
+
+  // A `/` alone with pi's whole palette under it is the person's draft too, not a dialog.
+  for (const name of ["pi--v110-slash-palette.txt", "pi--v120-slash-palette-padded.txt"]) {
+    it(`${name}: \`/\` with the palette open reads a draft with no modal`, () => {
+      const read = own(name);
+      expect(read.frame?.interior.text).toBe("/");
+      expect(read.surface).toMatchObject({ turn: "idle", modal: "none", composer: "draft" });
+      expect(labelOf(name).state).toBe("popup");
+    });
+  }
+});
+
 describe("omp's fuzzy command list under the box (18.6.1 and 18.12.6)", () => {
   const FUZZY: readonly [string, string, string][] = [
     ["omp--v18-6-1-slash-open-tall--w120.txt", "/", "/skill:"],
@@ -579,12 +618,7 @@ describe("omp's fuzzy command list under the box (18.6.1 and 18.12.6)", () => {
     expect(commandListAt(texts, read.frame!, idleFor("omp")!.volatile.below.commandList)?.pointed).toBe("/loop");
   });
 
-  // A list the profile does not call fuzzy stays what it was: a dialog until the pointer rests on the text.
-  it("pi's list that points at another command is still a dialog", () => {
-    const read = own("pi--v130-slash-mod-partial--w120.txt");
-    expect(read.surface.modal).toBe("unreadable");
-    expect(isFree(read.surface)).toBe(false);
-  });
+  // A box past a list the profile does not call fuzzy (`leadOpens`) is found only when the pointer rests on its text.
 });
 
 // omp 18.6.1 and 18.12.6 (omp-gang testers 05 and 12, 2026-10-25). A file path at the start of the box makes

@@ -21,10 +21,15 @@
 // `labels` parameter needs triage rights, so the label comes from the template itself.
 //
 // ── THE LINK HAS A LENGTH ────────────────────────────────────────────────────
-// GitHub answers a URL past its server limit with a 414. The link stays under {@link ISSUE_URL_MAX}
-// characters: the screen loses rows from its top first, then the doctor rows go (`screen-*`, then
-// `holds-*`, then `sends-*`), then the oldest sends go, then the person's own line is cut. The sheet
-// says what was cut, and Copy report holds the whole text.
+// GitHub drops a body, or answers a 414, when the URL passes its server limit, and only the title
+// survives. The link stays under {@link ISSUE_URL_MAX} characters: the screen loses rows from its top
+// first (a `... N rows cut` line says so), then the doctor rows go (`screen-*`, then `holds-*`, then
+// `sends-*`), then the oldest sends go, then the person's own line is cut. The signature line and the
+// setup block always stay. The sheet says what was cut, and Copy report holds the whole text.
+//
+// When the link still does not fit after all of that, the link is not the way out: `ReportLink.clipboard`
+// is true, the sheet copies the whole report and opens an issue whose body is one line that says the
+// report is on the clipboard ({@link CLIPBOARD_LINE}). The phone never files an empty body.
 //
 // ── FROM THE UNREAD-DIALOG CARD ──────────────────────────────────────────────
 // The fourth door (amendment 2026-10-28, #554). The trouble is a screen the phone's reader could not
@@ -48,8 +53,16 @@ export type { ReportContext } from "./context";
 export const ISSUE_REPO = "AltanS/collie";
 export const ISSUE_TEMPLATE = "from-app.yml";
 
-/** The longest link the sheet opens. GitHub's limit is about 8 KB; this leaves room for its own redirect. */
-export const ISSUE_URL_MAX = 6000;
+/**
+ * The longest link the sheet opens, in characters of the percent-encoded URL. GitHub's new-issue URL
+ * limit is about 8 KB (8192 bytes); past it the body is dropped and only the title survives. Signed out,
+ * GitHub carries the whole link once more inside its sign-in redirect (`return_to=`), where each `%XX`
+ * grows from 3 to 5 characters, so the worst case is 5/3 of this number: 4800 * 5/3 = 8000, under 8192.
+ */
+export const ISSUE_URL_MAX = 4800;
+
+/** The one-line body of the issue when the report did not fit the link and went to the clipboard instead. */
+export const CLIPBOARD_LINE = "The report did not fit this link. It is on the reporter's clipboard: paste it here.";
 
 /** The issue form's field ids (`.github/ISSUE_TEMPLATE/from-app.yml`). Renaming one breaks the prefill. */
 export const FIELD_IDS = { what: "what-happened", sends: "sends", setup: "setup", screen: "screen" } as const;
@@ -248,8 +261,21 @@ export function reportFields(input: ReportInput): ReportFields {
     what: note === "" ? summary(input) : note,
     sends: sendsBlock,
     setup: setup(input),
-    screen: input.screen ?? "",
+    screen: trimScreen(input.screen),
   };
+}
+
+/**
+ * The screen as the report holds it: each row without its trailing spaces and the empty rows under the
+ * last one gone. A pane pads rows to its width, and a padded row spends the link's budget on blanks.
+ */
+function trimScreen(screen: string | null): string {
+  if (screen === null) return "";
+  return screen
+    .split("\n")
+    .map((row) => row.trimEnd())
+    .join("\n")
+    .trimEnd();
 }
 
 /** The issue as the preview shows it: the title, then each field under the form's own label. */
@@ -270,8 +296,8 @@ export function issueLink(fields: ReportFields): string {
     ["template", ISSUE_TEMPLATE],
     ["title", fields.title],
     [FIELD_IDS.what, fields.what],
-    [FIELD_IDS.sends, fields.sends],
-    [FIELD_IDS.setup, fields.setup],
+    ...(fields.sends === "" ? [] : [[FIELD_IDS.sends, fields.sends]]),
+    ...(fields.setup === "" ? [] : [[FIELD_IDS.setup, fields.setup]]),
     ...(fields.screen === "" ? [] : [[FIELD_IDS.screen, fields.screen]]),
   ]
     .map(([key, value]) => `${key ?? ""}=${encodeURIComponent(value ?? "")}`)
@@ -296,11 +322,18 @@ export interface ReportCut {
   readonly note: boolean;
 }
 
+/** `... N rows cut`, the first line of a screen that lost its top rows. */
+export function rowsCutLine(rows: number): string {
+  return `... ${String(rows)} ${rows === 1 ? "row" : "rows"} cut`;
+}
+
 export interface ReportLink {
   readonly url: string;
-  /** The fields the link carries, which the preview shows. */
+  /** The fields the link carries, which the preview shows. With `clipboard`, the one-line body. */
   readonly fields: ReportFields;
   readonly cut: ReportCut;
+  /** True when no cut made the report fit: the sheet copies the whole report, and the link opens with {@link CLIPBOARD_LINE}. */
+  readonly clipboard: boolean;
 }
 
 /** The order doctor rows leave the setup block in: the screen's first, the sends' last. */
@@ -330,9 +363,10 @@ function setupDoctor(text: string): { readonly block: JsonObject; readonly lines
 }
 
 /**
- * The link under `max` characters. The screen loses its top rows first, then the screen goes, then the
- * doctor rows leave the setup block (`screen-*`, then `holds-*`, then `sends-*`), then the oldest send
- * lines go (the signature line stays), then the person's line is cut.
+ * The link under `max` characters. The screen loses its top rows first (and says `... N rows cut`), then
+ * the screen goes, then the doctor rows leave the setup block (`screen-*`, then `holds-*`, then
+ * `sends-*`), then the oldest send lines go (the signature line stays), then the person's line is cut.
+ * When even that does not fit, `clipboard` is true and the link carries only {@link CLIPBOARD_LINE}.
  */
 export function fitLink(full: ReportFields, max: number = ISSUE_URL_MAX): ReportLink {
   let screen = full.screen === "" ? [] : full.screen.split("\n");
@@ -354,12 +388,15 @@ export function fitLink(full: ReportFields, max: number = ISSUE_URL_MAX): Report
     const { doctor: _rows, ...rest } = doctor.block;
     return JSON.stringify(doctorLines.length === 0 ? rest : { ...rest, doctor: doctorLines }, null, 2);
   };
-  const current = (): ReportFields => ({ title: full.title, what, sends: [...entries.flat(), sig].join("\n"), setup: setupNow(), screen: screen.join("\n") });
+  let rowsCut = 0;
+  const screenNow = (): string => (screen.length === 0 || rowsCut === 0 ? screen.join("\n") : [rowsCutLine(rowsCut), ...screen].join("\n"));
+  const current = (): ReportFields => ({ title: full.title, what, sends: [...entries.flat(), sig].join("\n"), setup: setupNow(), screen: screenNow() });
   const fits = () => issueLink(current()).length <= max;
 
   let screenCut: ReportCut["screen"] = "none";
   while (!fits() && screen.length > 0) {
     screen = screen.slice(1);
+    rowsCut += 1;
     screenCut = screen.length === 0 ? "all" : "part";
   }
   while (!fits() && doctorLines.length > 0) {
@@ -379,6 +416,11 @@ export function fitLink(full: ReportFields, max: number = ISSUE_URL_MAX): Report
     const chars = [...what];
     what = `${chars.slice(0, Math.floor(chars.length / 2)).join("")}…`;
   }
+  const cut: ReportCut = { screen: screenCut, doctor: doctorCut, sends: sendsCut, note: noteCut };
+  if (!fits()) {
+    const fields: ReportFields = { title: full.title, what: CLIPBOARD_LINE, sends: "", setup: "", screen: "" };
+    return { url: issueLink(fields), fields, cut, clipboard: true };
+  }
   const fields = screenCut === "none" && doctorCut === 0 && sendsCut === 0 && !noteCut ? full : current();
-  return { url: issueLink(fields), fields, cut: { screen: screenCut, doctor: doctorCut, sends: sendsCut, note: noteCut } };
+  return { url: issueLink(fields), fields, cut, clipboard: false };
 }

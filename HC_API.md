@@ -135,7 +135,8 @@ There is no focus field and no content revision on a terminal.
   and the Send Protocol takes such a read as no read: it types nothing and presses nothing on a screen
   that may lack rows. Only a stitched read (`lines` above 0) was seen incomplete; the viewport read the
   protocol uses (`lines: 0`) was always complete.
-- No history depth is reported anywhere, so how far a read can reach is unknown in advance.
+- No history depth is reported anywhere, so how far a read can reach is unknown in advance. The phone
+  therefore offers Load older on the core while the text it shows is cut (`truncated`), not by a depth.
 
 ## Typing: `send`, `put`, `keys` and raw input
 
@@ -184,11 +185,15 @@ The line sat on the prompt with nothing submitted (`❯ echo "typed $HOME ä raw
 2026-10-30 in a private `collie-lab` session on bluefin (hc 0.1.14, a raw-mode sink): a raw write
 took 0.9 ms, a read 0.3 ms, a key press alone 33 ms, but a key press after a raw write was answered
 about 3,030 ms after that write, whatever the gap between the two (gap 0: 3,033 ms; gap 2,500 ms:
-531 ms; gap 3,500 ms: 32 ms). So the first key after typed text waits out the rest of about 3 s.
+531 ms; gap 3,500 ms: 32 ms). So the first named key after typed text waits out the rest of about 3 s.
 `terminal.send` quotes the same figure ("once nobody has typed for about 3 s", table above). Whether
 the key reaches the program when the call starts or when it is answered was not probed. The 50 ms
 round trip quoted above was a key pressed well after the write. This is the core's own behaviour and
-an upstream ask; Collie's Send Protocol keeps the two writes of its probe outside its read bound.
+an upstream ask. Raw input does not wait: since the change for herdr-core issue 52 (the maintainer's
+advice: type Enter as data on the attach channel), Collie types an unmodified Enter, Backspace and Tab as raw
+bytes (`\r`, `\x7f`, `\t`), so the Send Protocol's probe Backspace and its submitting Enter pay no hold.
+The hold stays for the keys that still go by name: a key with a modifier and every other named key.
+For those, the Send Protocol keeps the writes of its probe outside its read bound.
 
 The size rule is why the attach names the terminal's OWN size: "the last active viewer sets the
 size (active: it typed, resized, gained focus or sent FACTS)". Typing makes the attach active, so
@@ -352,8 +357,9 @@ it. This section has two parts: what Collie now handles itself, and what stays a
   Escape alone.
 - **`complete: false`.** The read reaches the mirror with its rows, marked `partial`, and the Send
   Protocol takes it as no read.
-- **The key hold.** The probe and the landing check of the Send Protocol wait out the core's 3 s after
-  a raw write, so a send takes about 6 s on the core instead of a fraction of one. Nothing is mis-sent.
+- **The key hold.** The core answers a named key about 3 s after a raw write. Collie types an unmodified
+  Enter, Backspace and Tab as raw input, so a Claude send pays no hold. A pi or omp send pays one, about
+  3 s, for its `ctrl+q` submit, instead of the 6 s both holds cost before. Nothing is mis-sent.
 - **Upper case keys.** The core reads key names without regard to case, so `G` arrived as `g`. Collie
   sends `shift+g`.
 - **No agent name without a report.** A program that sends no OSC 7501 report (omp 18.6.1) has
@@ -362,7 +368,7 @@ it. This section has two parts: what Collie now handles itself, and what stays a
 - **No session id.** The core keeps the program's status, not the agent's conversation id. Collie
   gets it from the agent's own hook through `HC_TERMINAL_ID` (see above), so a Claude pane has
   History once `collie hooks install claude` is done, and not before. pi and omp have no such hook,
-  so their panes have no History and no Chat card on the core.
+  so Collie finds their session log by the pane's folder (M79), and the phone draws their Chat from it.
 - **No focus, no rename, no tab or space verbs.** Focus lives in herdr-app per screen; structure
   changes go through herdr-app commands. Spec 05 of M74 plans a mod for both.
 
@@ -374,11 +380,31 @@ Each line is a thing the core could do that would close a gap Collie cannot clos
   fact that a harness paints and does not write: about 100 dialog readings on pi, opencode and omp
   (the pointer row, the stepper chip, the selected tab) are colour only, so a dialog of those three
   whose pointer is colour only cannot be answered from the phone. Claude, Codex and the placeholders
-  have a text twin and are done.
-- **A history read that answers.** `terminal.read` with `lines` above 0 did not answer in 30 s on a
-  pi that showed a permission or question dialog, while the viewport read (`lines: 0`) answered in
-  0.1 s. Collie gives up at 5 s and reads the pane as unreadable. The ask: a history read must not
-  wait on a full-screen program that shows a dialog.
+  have a text twin and are done. Filed as [herdrdev/herdr-core#68](https://github.com/herdrdev/herdr-core/issues/68).
+- **A history read that answers, and keys that do not wait for it.** `terminal.read` with `lines`
+  above 0 did not answer in 30 s on a pi that showed a permission or question dialog, while the
+  viewport read (`lines: 0`) answered in 0.1 s. Waited out, one such read took 25.03 s and answered
+  `{"complete": false, "how": "screen"}` (M78 report 10, case 2, hc 0.1.14). The core runs one
+  terminal's history reads and key presses one at a time: three history reads fired together ended at
+  +25, +50 and +75 s, and a `terminal.keys` sent 2 s into a history read answered after 23.1 s, 100 ms
+  after the read ended. A read the client gave up on still runs to its end. Another terminal in the
+  same core answered keys and history reads in 0.1 s, so the hold is per terminal. The effect: a key
+  call timed out at the client's 5 s and still reached pi later, and with a phone polling the pane
+  every 1.5 s the terminal's keys stayed held for over nine minutes. Collie now reads history on
+  demand only (M79 spec 01): the phone's poll, and every read of the bridge's own, reads the screen
+  (`lines: 0`) and marks the scrollback as cut. A history read starts only when a person taps Load
+  older, at most one per terminal, none while the program reports `blocked` or while Collie reads an
+  ask on the screen (the phone then says that Load older waits), and past a 2 s budget the screen
+  answers while the core finishes the read. A key call that timed out is reported as not confirmed
+  instead of failed. The 1.25.2 backoff (one read per terminal, then screen-only reads for 30 s to
+  5 min) is gone: it still let the one read hold the keys for up to 25 s after a dialog appeared. The
+  asks: a history read must not wait 25 s on a program that shows a dialog; `terminal.keys` must not
+  wait behind pending reads on the same terminal; and a read whose client gave up (closed the
+  connection) should be cancelled on the core. With those, the poll could read history again. The
+  related ask of keys that do not wait for the 3 s key hold after a raw write was answered in part:
+  the maintainer replied in herdr-core issue 52 to type Enter as data on the attach channel, and
+  Collie does so since the change for #637. The ask is answered for Enter, Backspace and Tab and stays
+  open for keys with modifiers and every other named key.
 - **`blocked` for pi's question.** The core's status stays `working` while pi waits on its question,
   because pi reports no blocked state for an extension's question. Collie marks the pane "needs you"
   from the screen. The ask: pi reports it, or the core says so.

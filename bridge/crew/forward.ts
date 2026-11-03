@@ -3,7 +3,17 @@ import type { JsonObject, JsonValue } from "../json.ts";
 import { MASK_VERSION } from "../redact.ts";
 import { MAX_UPLOAD_OVERHEAD, uploadTooLarge } from "../uploads.ts";
 import { DEVICE_HEADER, encodeDeviceHeader } from "./admission.ts";
-import { type CrewLink, type PeerFailure, type PeerOutcome, WRITE_BUDGET_MS } from "./peer-client.ts";
+import { LEAD_ROW_HEADER, LEAD_ROW_MARK } from "./launcher-rows.ts";
+import {
+  type CrewLink,
+  type CrewParams,
+  type PeerFailure,
+  type PeerOutcome,
+  PANE_READ_BUDGET_MS,
+  PANE_WRITE_BUDGET_MS,
+  WORKTREE_WRITE_BUDGET_MS,
+  WRITE_BUDGET_MS,
+} from "./peer-client.ts";
 import { HOST_PARAM, type PeerState } from "./registry.ts";
 
 // The LEAD side of a per-pane request: `?host=laptop` came in, the pane lives on the laptop, so the
@@ -92,6 +102,14 @@ const FORWARDABLE: readonly RegExp[] = [
   // bridge/server.ts. Additive-optional (§7.1): a member that predates it answers 404.
   /^space\/[^/]+\/rename$/,
   /^workspace$/,
+  // A worktree (ADR 0126 point 6): git runs where the checkout lives, so the plan and the create go to
+  // the addressed member like `workspace`, which runs its own `planWorktree` and `createWorktreeAt`. The
+  // plan is a read; the create is a write whose body, `requestId` included, rides through unchanged, so
+  // a retry lands on the member's own receipt and is still one create. Additive-optional (§7.1): a
+  // member that predates them answers 404, and a member whose multiplexer cannot open a space answers
+  // `unsupported` through its own route, as a launch does.
+  /^worktree$/,
+  /^worktree\/plan$/,
   // The Changes view asked by workspace (ADR 0065): read-only git over the folder of a space that
   // lives on ONE member, so a `?host=` call is proxied like `pane/:id/changes`. Mirrors
   // `WORKSPACE_CHANGES_ROUTE` in bridge/server.ts one-for-one.
@@ -104,11 +122,12 @@ const FORWARDABLE: readonly RegExp[] = [
   // lead's. Both ride the crew link exactly like `workspace` does.
   /^launch$/,
   /^launchers$/,
-  // The rows a phone adds, removes and renames (ADR 0094). Each machine keeps its own store, so a
-  // `?host=` write lands in THAT member's `launchers-added.json` and nowhere else; no row is ever
-  // copied between machines. `forget-device` is the lead's own call when it revokes a device; the
-  // lead's browser path refuses it, so only an admitted lead's request reaches a member with it.
-  /^launchers\/added(?:\/(?:remove|rename|forget-device))?$/,
+  // The rows a phone adds, removes and renames (ADR 0094, amended by ADR 0127 point 4) are answered on
+  // the lead whatever `?host=` says, so the three are NOT listed: the row lands in the lead's own
+  // `launchers-added.json` and joins the crew's rows. Only `forget-device` crosses the link. It is the
+  // lead's own call when it revokes a device, and members may still hold rows added through the link
+  // before 0127. The lead's browser path refuses it, so only an admitted lead's request reaches a member.
+  /^launchers\/added\/forget-device$/,
   // The one-off command history (ADR 0095): one per machine, so a `?host=` remove or clear changes
   // THAT member's `commands-recent.json`, and nothing is copied. A run itself rides `launch` above.
   /^launch\/recent\/(?:remove|clear)$/,
@@ -188,6 +207,20 @@ export function apiPathFor(route: string): string | null {
   return FORWARDABLE.some((re) => re.test(route)) ? `/api/${route}` : null;
 }
 
+/**
+ * How the lead merges its own data into one forwarded read before the phone gets it. One route passes one: `GET
+ * /api/launchers`, whose answer for a member carries the lead's rows as well (ADR 0127,
+ * `launcher-rows.ts`). Every other forward stays a proxy.
+ *
+ * `ask` builds the URL the member is asked from the phone's. `answer` takes the member's answer as
+ * plain bytes (the lead asks for them, `accept-encoding` is the lead's, not the phone's) and makes
+ * the answer the phone gets, compressed for the phone's hop by the route's own JSON writer.
+ */
+export interface LeadMerge {
+  ask(url: URL): Promise<URL>;
+  answer(member: Response): Promise<Response>;
+}
+
 /** A forwarded read (proxied byte-for-byte, §9.1) or a forwarded write (§10.3, §12). */
 export type ForwardKind = "read" | "write";
 
@@ -228,6 +261,8 @@ export function forwardKind(route: string, method?: string): ForwardKind {
   if (route === "folders/star") return "write";
   // The folder browser reads names off the member's disk and changes nothing: a read, like Files.
   if (route === "folders/browse") return "read";
+  // The worktree plan reads git on the member and creates nothing (ADR 0126): a read, like the browser.
+  if (route === "worktree/plan") return "read";
   // A blob read serves a file off the owning member's disk and changes nothing there — the same
   // shape as `pane/:id/history`, and attempted against a stale member for the same reason (§10.3).
   if (route.startsWith("blobs/")) return "read";
@@ -245,6 +280,21 @@ export function forwardKind(route: string, method?: string): ForwardKind {
   // reads one folder or file under that same root (ADR 0083): a read as well, and so is
   // `files/image`, whose third segment is `files` too (ADR 0090).
   return isPaneRead(action) ? "read" : "write";
+}
+
+/** `pane/<id>`: the read of one pane's screen, the one read whose member-side work can outlast a poll. */
+const PANE_SCREEN_ROUTE = /^pane\/[^/]+$/;
+
+/**
+ * The explicit budget a forwarded request dials on: {@link PANE_WRITE_BUDGET_MS} for a write to a pane (a send on a
+ * herdr-core member costs about 6.4 s), {@link WORKTREE_WRITE_BUDGET_MS} for a worktree create (git and a new
+ * space), {@link WRITE_BUDGET_MS} for every other write, {@link PANE_READ_BUDGET_MS}
+ * for a pane's screen read, none for every other read (the transport's own poll budget and bootstrap credit).
+ */
+export function budgetOf(kind: ForwardKind, route: string): number | undefined {
+  if (kind === "write" && route === "worktree") return WORKTREE_WRITE_BUDGET_MS;
+  if (kind === "write") return route.startsWith("pane/") ? PANE_WRITE_BUDGET_MS : WRITE_BUDGET_MS;
+  return PANE_SCREEN_ROUTE.test(route) ? PANE_READ_BUDGET_MS : undefined;
 }
 
 /** The pane id a route addresses, for the lead's own audit line. `undefined` for tab/workspace. */
@@ -270,6 +320,9 @@ export function forwardAuditAction(route: string, method?: string): string | nul
   if (isWalkyList(route, method)) return null;
   if (route === "tab") return "tab.create";
   if (route === "workspace") return "workspace.create";
+  // The member's own create writes `worktree.create`; its plan is a read.
+  if (route === "worktree") return "worktree.create";
+  if (route === "worktree/plan") return null;
   // `launch` writes either `workspace.launch` or `tab.launch`, decided by the body a route string
   // alone can't see — this generic name is the LEAD's own line about the forward (§12's "plus the
   // target host"), and the peer's own audit line is the accurate record of which one ran.
@@ -306,10 +359,12 @@ export function forwardAuditAction(route: string, method?: string): string | nul
  * the first step of a hop chain this protocol does not have.
  */
 export function forwardParams(url: URL) {
-  const params: Record<string, string> = {};
-  for (const [k, v] of url.searchParams) {
+  const params: Record<string, string | string[]> = {};
+  for (const k of new Set(url.searchParams.keys())) {
     if (k === HOST_PARAM) continue;
-    params[k] = v;
+    // A key asked once stays a string; a repeated one (ADR 0127's `?cwd=`) keeps every value, in order.
+    const values = url.searchParams.getAll(k);
+    params[k] = values.length === 1 ? values[0]! : values;
   }
   return params;
 }
@@ -353,6 +408,10 @@ export type ForwardAuditEntry = {
  * request — the operator's device as the lead's own `deviceAuth()` resolved it (§12) — and the sweep
  * that polls a peer's snapshot has no phone behind it. Absent when the lead's device gate is off,
  * matching how the audit field is omitted rather than nulled today.
+ *
+ * `X-Collie-Lead-Row` is NOT on the list, and must never be: a member trusts a body `row` only with
+ * it, so it is the lead's own word. {@link forwardToPeer} adds it after this list is built, and only
+ * for a row the lead carried itself (`leadRowCarry`, ADR 0127 point 3).
  */
 export function forwardHeaders(req: Request, device?: string | null): Headers {
   const headers = new Headers();
@@ -580,15 +639,16 @@ export class MemberPaneReads {
 /**
  * The transport, narrowed to what forwarding needs — {@link CrewLead.forward} in production.
  *
- * `budgetMs` is the deadline for THIS dial, and it is present for exactly one shape of request: a
- * forwarded write, on {@link WRITE_BUDGET_MS} (§10.1). Absent means "the transport's own default",
+ * `budgetMs` is the deadline for THIS dial, and it is present for two shapes of request: a
+ * forwarded write, on {@link WRITE_BUDGET_MS} or {@link PANE_WRITE_BUDGET_MS} (§10.1), and a pane's screen read, on
+ * {@link PANE_READ_BUDGET_MS}. Absent means "the transport's own default",
  * which for `PeerClient.proxy` is the poll budget plus a cold link's bootstrap credit — i.e. every
  * forwarded read keeps the budget it has always had.
  */
 export type ForwardTransport = (
   link: CrewLink,
   route: string,
-  params: Record<string, string>,
+  params: CrewParams,
   init: RequestInit,
   budgetMs?: number,
 ) => Promise<PeerOutcome<Response>>;
@@ -616,6 +676,12 @@ export interface ForwardDeps {
   readonly onExchange?: (receivedAt: number) => void;
   /** The operator's device, as the LEAD resolved it — forwarded as `X-Crew-Device` (§12). */
   readonly device?: string | null;
+  /**
+   * True when the LEAD set `row` on this body itself (`leadRowCarry`, ADR 0127 point 3): the forward
+   * then adds `X-Collie-Lead-Row`, the one sign a member trusts that a `row` is its lead's. Absent or
+   * false, the header is never sent, whatever the phone's request carried.
+   */
+  readonly leadRow?: boolean;
   /**
    * The LEAD's own upload cap in bytes (`cfg.maxUploadBytes`), for the §13 pre-check below. Passed
    * in rather than imported because it is no longer a constant — it is this host's setting, and a
@@ -839,6 +905,9 @@ export async function forwardToPeer(req: Request, url: URL, deps: ForwardDeps): 
   // `duplex` is required by the Fetch spec for a stream body; the DOM lib's `RequestInit` predates
   // it, so the streaming half of this init is typed here rather than asserted at the assignment.
   const headers = forwardHeaders(req, deps.device);
+  // The lead's own mark on a row it carried (ADR 0127 point 3). ADDED after the allowlist, like
+  // `X-Crew-Device`, and never copied: `forwardHeaders` does not pass a phone's `X-Collie-Lead-Row`.
+  if (deps.leadRow === true) headers.set(LEAD_ROW_HEADER, LEAD_ROW_MARK);
   // Text the phone will show is masked here, whatever the member's version (§9.1). Every other answer
   // is not read at all. A masked answer's tag carries the mask's version, both ways ({@link saltTag}).
   const answer = deps.mask === undefined ? null : textAnswerOf(route);
@@ -869,7 +938,7 @@ export async function forwardToPeer(req: Request, url: URL, deps: ForwardDeps): 
     route,
     forwardParams(url),
     init,
-    kind === "write" ? WRITE_BUDGET_MS : undefined,
+    budgetOf(kind, route),
   );
   const action = forwardAuditAction(route, req.method);
   const paneId = forwardPaneId(route);

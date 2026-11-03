@@ -16,7 +16,7 @@
 // them off. That door also adds the phone's own facts (`readClientFacts`) to the setup block.
 
 import { ExternalLink, Search } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type MouseEvent } from "react";
 
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Notice } from "@/components/ui/notice";
@@ -169,7 +169,9 @@ export function ReportSheetView({ context, contextError, rows, episodes, fromSet
   // Cheap enough per render: ten sends and forty rows at most.
   const full = reportFields(input);
   const link = fitLink(full);
-  const preview = reportText(link.fields);
+  // When the link could not hold the report, the issue opens with one line and the whole report goes to the clipboard.
+  const preview = reportText(link.clipboard ? full : link.fields);
+  const canOpen = !link.clipboard || canCopyText();
 
   async function turnScreen(on: boolean): Promise<void> {
     setIncludeScreen(on);
@@ -201,6 +203,19 @@ export function ReportSheetView({ context, contextError, rows, episodes, fromSet
     } catch {
       setStatus(t("copyable.failed"), "error");
     }
+  }
+
+  // The report goes to the clipboard first, then the issue opens. A copy that fails opens nothing.
+  async function openWithClipboard(event: MouseEvent<HTMLAnchorElement>): Promise<void> {
+    event.preventDefault();
+    try {
+      await copyText(reportText(full));
+    } catch {
+      setStatus(t("copyable.failed"), "error");
+      return;
+    }
+    setStatus(t("report.sheet.copied"), "success");
+    window.open(link.url, "_blank", "noopener,noreferrer");
   }
 
   return (
@@ -254,10 +269,15 @@ export function ReportSheetView({ context, contextError, rows, episodes, fromSet
         >
           {preview}
         </pre>
-        {link.cut.screen !== "none" && <p data-slot="report-cut" className="text-xs text-muted-foreground">{t("report.sheet.cutScreen")}</p>}
-        {link.cut.doctor > 0 && <p data-slot="report-cut" className="text-xs text-muted-foreground">{tn("report.sheet.cutDoctor", link.cut.doctor)}</p>}
-        {link.cut.sends > 0 && <p data-slot="report-cut" className="text-xs text-muted-foreground">{tn("report.sheet.cutSends", link.cut.sends)}</p>}
-        {link.cut.note && <p data-slot="report-cut" className="text-xs text-muted-foreground">{t("report.sheet.cutNote")}</p>}
+        {link.clipboard && (
+          <p data-slot="report-clipboard" className="text-xs text-muted-foreground">
+            {canOpen ? t("report.sheet.tooLong") : t("report.sheet.tooLongNoCopy")}
+          </p>
+        )}
+        {!link.clipboard && link.cut.screen !== "none" && <p data-slot="report-cut" className="text-xs text-muted-foreground">{t("report.sheet.cutScreen")}</p>}
+        {!link.clipboard && link.cut.doctor > 0 && <p data-slot="report-cut" className="text-xs text-muted-foreground">{tn("report.sheet.cutDoctor", link.cut.doctor)}</p>}
+        {!link.clipboard && link.cut.sends > 0 && <p data-slot="report-cut" className="text-xs text-muted-foreground">{tn("report.sheet.cutSends", link.cut.sends)}</p>}
+        {!link.clipboard && link.cut.note && <p data-slot="report-cut" className="text-xs text-muted-foreground">{t("report.sheet.cutNote")}</p>}
       </section>
 
       <Notice tone="caution" variant="box">
@@ -265,16 +285,24 @@ export function ReportSheetView({ context, contextError, rows, episodes, fromSet
       </Notice>
 
       <div className="flex flex-col gap-2">
-        <a
-          data-slot="report-open"
-          href={link.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className={cn(buttonVariants({ variant: "default" }), "h-11")}
-        >
-          <ExternalLink className="size-4" />
-          {t("report.sheet.open")}
-        </a>
+        {canOpen ? (
+          <a
+            data-slot="report-open"
+            href={link.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={link.clipboard ? (event) => void openWithClipboard(event) : undefined}
+            className={cn(buttonVariants({ variant: "default" }), "h-11")}
+          >
+            <ExternalLink className="size-4" />
+            {t("report.sheet.open")}
+          </a>
+        ) : (
+          <Button type="button" className="h-11" data-slot="report-open" disabled>
+            <ExternalLink className="size-4" />
+            {t("report.sheet.open")}
+          </Button>
+        )}
         {canCopyText() && (
           <Button type="button" variant="outline" className="h-11" data-slot="report-copy" onClick={() => void copyReport()}>
             {t("report.sheet.copy")}

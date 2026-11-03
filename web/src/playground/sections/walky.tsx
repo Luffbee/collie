@@ -255,7 +255,7 @@ export function WalkySection() {
             <WalkyLogProvider rows={LOG} reads={1}>
               <TapProbe>
                 {TOOLS.map(({ key, tool }) => (
-                  <ToolCard key={key} tool={tool} status="done" preview />
+                  <ToolCard key={key} callId={key} tool={tool} status="done" preview />
                 ))}
               </TapProbe>
             </WalkyLogProvider>
@@ -271,7 +271,7 @@ export function WalkySection() {
             <WalkyLogProvider rows={LOG} reads={1}>
               <TapProbe>
                 {INBOX_TOOLS.map(({ key, tool }) => (
-                  <ToolCard key={key} tool={tool} status="done" preview />
+                  <ToolCard key={key} callId={key} tool={tool} status="done" preview />
                 ))}
               </TapProbe>
             </WalkyLogProvider>

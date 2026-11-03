@@ -4,7 +4,7 @@ import type { SendReceiptRow } from "../surface/send";
 import { readReportContext } from "./context";
 import { asJsonObject, asJsonString, parseJson, type JsonObject } from "../json";
 import type { ReportDoctorRow } from "./context";
-import { doctorLine, FIELD_IDS, fitLink, hasTyped, ISSUE_URL_MAX, issueLink, reportFields, reportText, searchLink, sendLine, signature, type ClientFacts, type ReportContext, type ReportInput } from "./body";
+import { CLIPBOARD_LINE, doctorLine, rowsCutLine, FIELD_IDS, fitLink, hasTyped, ISSUE_URL_MAX, issueLink, reportFields, reportText, searchLink, sendLine, signature, type ClientFacts, type ReportContext, type ReportInput } from "./body";
 import type { DialogTrouble } from "./store";
 
 // The bridge's answer as JSON, for the reader.
@@ -167,14 +167,75 @@ describe("the link", () => {
     expect(link.cut.sends).toBe(3);
   });
 
-  it("ends even when nothing can make the link fit", () => {
+  it("ends even when nothing can make the link fit: the link falls back to the clipboard line", () => {
     const link = fitLink(reportFields({ ...BASE, note: "w".repeat(50) }), 10);
     expect(link.cut.note).toBe(true);
-    expect([...link.fields.what].length).toBeLessThanOrEqual(2);
+    expect(link.clipboard).toBe(true);
+    expect(link.fields.what).toBe(CLIPBOARD_LINE);
   });
 
   it("the duplicate search looks for the signature line", () => {
     expect(decodeURIComponent(searchLink(BASE))).toBe('https://github.com/AltanS/collie/issues?q=is:issue "collie-sig: send/probe_failed/claude@2.1.291/herdr"');
+  });
+});
+
+describe("the link budget (M80 spec 02): a long screen never costs the body", () => {
+  // A pi screen: rows padded to 280 columns, the input box and its rules at the bottom.
+  const pad = (text: string): string => text.padEnd(280, " ");
+  const long = (rows: number): string =>
+    [...Array.from({ length: rows }, (_, i) => pad(`transcript ${String(i).padStart(4, "0")} ${"é".repeat(30)}`)), pad("─".repeat(80)), pad("❯ the box that matters"), pad("─".repeat(80))].join("\n");
+  const DOCTOR: readonly ReportDoctorRow[] = [{ check: "sends-pi", status: "warn", detail: "3 refused (probe_failed 3)", harness: "pi" }];
+  const INPUT: ReportInput = { ...BASE, context: { ...CONTEXT, doctor: DOCTOR } };
+
+  it("a long 20 KB screen gives a URL under the budget whose body keeps the collie-sig line and the setup block", () => {
+    const screen = long(60);
+    expect(screen.length).toBeGreaterThan(16_000);
+    const link = fitLink(reportFields({ ...INPUT, screen }));
+    expect(link.clipboard).toBe(false);
+    expect(link.url.length).toBeLessThanOrEqual(ISSUE_URL_MAX);
+    const params = query(link.url);
+    expect(params.get(FIELD_IDS.sends)?.split("\n").at(-1)).toBe("collie-sig: send/probe_failed/claude@2.1.291/herdr");
+    expect(params.get(FIELD_IDS.setup)).toBe(reportFields(INPUT).setup);
+    expect(params.get(FIELD_IDS.what)).toBe("Sending kept failing on one pane.");
+    expect(reportText(link.fields)).toContain("### Setup");
+  });
+
+  it("the budget leaves room for GitHub's sign-in redirect, which carries the link encoded again", () => {
+    const link = fitLink(reportFields({ ...INPUT, screen: long(60) }));
+    expect(encodeURIComponent(link.url).length).toBeLessThan(8192);
+  });
+
+  it("cuts the screen from the top, says how many rows with a '... N rows cut' line, and keeps the box at the bottom", () => {
+    const link = fitLink(reportFields({ ...INPUT, screen: long(60) }));
+    const rows = link.fields.screen.split("\n");
+    const cut = Number(/^\.\.\. (\d+) rows cut$/u.exec(rows[0] ?? "")?.[1]);
+    expect(cut).toBeGreaterThan(0);
+    expect(cut + rows.length - 1).toBe(63);
+    expect(rows.at(-2)).toBe("❯ the box that matters");
+    expect(rowsCutLine(1)).toBe("... 1 row cut");
+  });
+
+  it("trims trailing spaces per row before the budget, so padded rows do not spend it", () => {
+    const fields = reportFields({ ...INPUT, screen: `${pad("a")}\n${pad("")}\n${pad("b")}\n${pad("")}\n` });
+    expect(fields.screen).toBe("a\n\nb");
+    // 30 padded rows are 30 short rows once trimmed: they fit whole.
+    const link = fitLink(reportFields({ ...INPUT, screen: Array.from({ length: 30 }, (_, i) => pad(`row ${String(i)}`)).join("\n") }));
+    expect(link.cut.screen).toBe("none");
+  });
+
+  it("a report that cannot fit even without its screen goes to the clipboard: the link carries one line, no empty body", () => {
+    // The setup block is never cut, so a setup that alone passes the budget cannot be sent by link.
+    const huge = Array.from({ length: 12 }, (_, i) => row(i + 1, { detail: "d".repeat(900) })).toReversed();
+    const input: ReportInput = { ...INPUT, sends: huge, screen: long(20), app: "a".repeat(6000) };
+    const link = fitLink(reportFields(input));
+    expect(link.clipboard).toBe(true);
+    expect(link.url.length).toBeLessThanOrEqual(ISSUE_URL_MAX);
+    const params = query(link.url);
+    expect(params.get(FIELD_IDS.what)).toBe(CLIPBOARD_LINE);
+    expect(params.get("title")).toBe(reportFields(input).title);
+    // The whole report, collie-sig line and setup included, is what Copy report holds.
+    expect(reportText(reportFields(input))).toContain("collie-sig: send/probe_failed/claude@2.1.291/herdr");
+    expect(reportText(reportFields(input))).toContain("### Setup");
   });
 });
 
@@ -309,6 +370,8 @@ describe("the doctor rows in the setup block (M71 spec 05)", () => {
     let sawSendCut = false;
     for (let max = issueLink(full).length; max > 400; max -= 40) {
       const link = fitLink(full, max);
+      // Below the setup block's own size nothing fits and the clipboard line takes over.
+      if (link.clipboard) break;
       expect(link.url.length <= max || link.cut.note).toBe(true);
       const left = kept(link.fields).map((line) => line.split(" ")[1]!.replace(/:$/u, ""));
       expect(link.cut.doctor).toBe(DOCTOR.length - left.length);

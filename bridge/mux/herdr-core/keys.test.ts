@@ -5,7 +5,7 @@ import { toHcKey, type HcKeyRejection } from "./keys.ts";
 
 describe("the contract's keys in herdr-core's spelling", () => {
   test.each([
-    ["Enter", "enter"],
+    ["shift+Enter", "shift+enter"],
     ["Escape", "esc"],
     ["PageUp", "pageup"],
     ["shift+Tab", "shift+tab"],
@@ -27,8 +27,17 @@ describe("the contract's keys in herdr-core's spelling", () => {
     expect(toHcKey(spelling)).toEqual({ ok: true, key: { kind: "key", name } });
   });
 
-  test("every named key of the contract translates to a name the core accepted", () => {
+  test.each([
+    ["Enter", "\r"],
+    ["Backspace", "\x7f"],
+    ["Tab", "\t"],
+  ])("a plain %s is typed as raw input, the bytes the core's own encoder gives it", (spelling, text) => {
+    expect(toHcKey(spelling)).toEqual({ ok: true, key: { kind: "text", text } });
+  });
+
+  test("every other named key of the contract translates to a name the core accepted", () => {
     for (const key of MUX_NAMED_KEYS) {
+      if (key === "Enter" || key === "Backspace" || key === "Tab") continue;
       const result = toHcKey(key);
       expect(result.ok && result.key.kind === "key" && coreKnowsKey(result.key.name)).toBe(true);
     }

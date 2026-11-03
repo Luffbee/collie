@@ -463,6 +463,18 @@ export interface WorkspaceView {
   /** The space's own folder, when the multiplexer keeps one (herdr worktree, tmux session_path). */
   folder?: string;
   /**
+   * What the checkout holding {@link folder} is on. Mirrors `WorkspaceView.gitHead` in bridge/types.ts.
+   *
+   * **Absent, never a placeholder**, by the same rule as {@link AgentView.gitHead}, and read through
+   * `spaceWorktreeContext` (lib/spaces.ts), which drops a malformed one from a peer.
+   */
+  gitHead?: GitHead;
+  /**
+   * The ref a worktree space was cut from, as the machine holding it wrote it down. Mirrors
+   * `WorkspaceView.base` in bridge/types.ts: only on a worktree, absent when unknown.
+   */
+  base?: string;
+  /**
    * Which member of the crew this space lives on — the same tag a pane and a session carry.
    *
    * Present exactly when `servers` is, absent otherwise, so a solo body is unchanged. Herdr numbers
@@ -1304,6 +1316,12 @@ export interface PaneReadResponse {
    * URL; absent for every other pane.
    */
   logicalText?: string;
+  /**
+   * Sent only on a Load older read (`?purpose=older`) that came back without the rows above the
+   * screen: one sentence that says why, in the multiplexer's words (herdr-core: the agent waits on
+   * you, or the core still reads them). The mirror shows it under Load older.
+   */
+  olderNote?: string;
   /** Set to true by the client when the server returns 304 Not Modified. Never sent over the wire. */
   notModified?: boolean;
 }
@@ -1913,9 +1931,7 @@ export const MUX_CAPABILITIES = [
   "renameTab",
   "closeTab",
   "createSpace",
-  "listWorktrees",
   "createWorktree",
-  "openWorktree",
   "pushTopologyEvents",
   "pushPaneEvents",
   // A durable program's own controls, declared from its `caps` (bridge/mux/capabilities.ts). Unlike
@@ -2097,7 +2113,7 @@ export interface LaunchersAdding {
 }
 
 /** Why an item does not start on that machine now. Mirrors `LauncherItem.reason` in bridge/types.ts. */
-export type LauncherItemReason = "not_found" | "adds_off" | "free_text_off";
+export type LauncherItemReason = "not_found" | "adds_off" | "free_text_off" | "no_folder";
 
 /**
  * One thing the New page may start on ONE machine, with its availability there (ADR 0094). Mirrors
@@ -2123,6 +2139,11 @@ export interface LauncherItem {
   branch: boolean;
   available: boolean;
   reason?: LauncherItemReason;
+  /**
+   * `lead`: one of the lead's rows, offered for this machine (ADR 0127). Mirrors `LauncherItem.from`
+   * in bridge/types.ts: set only in a lead's answer for another host, absent on a machine's own items.
+   */
+  from?: "lead";
   id?: string;
   addedBy?: string;
   addedAt?: number;
@@ -2561,7 +2582,7 @@ export type WorktreePlanResponse =
       currentBranch: string | null;
       remembered?: { base: "default" | "current"; folder: "default" | "parent"; parent?: string };
       branchValid?: boolean;
-      defaultTarget?: { path: string; exists: boolean };
+      defaultTarget?: { path: string; exists: boolean; reason?: string };
       parentTarget?:
         | { ok: true; path: string }
         | { ok: false; error: string; code?: ApiErrorCode; detail?: ApiErrorDetail };

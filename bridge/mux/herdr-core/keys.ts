@@ -48,6 +48,27 @@ const _EVERY_NAMED_KEY_IS_TRANSLATED: readonly (typeof MUX_NAMED_KEYS)[number][]
 void _EVERY_NAMED_KEY_IS_TRANSLATED;
 
 /**
+ * The unmodified keys typed as raw input instead of by name, in the bytes hc's own encoder gives them
+ * in every keyboard mode (its `keys.rs` test; the kitty keyboard's disambiguate mode leaves all three
+ * alone). `terminal.keys` is the core's "someone else wants to type" path: it waits until nobody has
+ * typed for about 3 s, and Collie's own raw write counts as somebody typing, so an Enter after typed
+ * text waited out the rest of the hold. Raw input goes in at once (herdr-core#52, the maintainer's
+ * advice: send the Enter the way the text went).
+ */
+const RAW_BY_CONTRACT_SPELLING = new Map<string, string>([
+  ["Enter", "\r"],
+  ["Backspace", "\x7f"],
+  ["Tab", "\t"],
+]);
+
+/** True for the raw bytes of an unmodified Enter, Backspace or Tab: the writes the adapter paces (`RAW_KEY_GAP_MS`). */
+export function isRawKeyText(text: string): boolean {
+  return RAW_KEY_TEXTS.has(text);
+}
+
+const RAW_KEY_TEXTS: ReadonlySet<string> = new Set(RAW_BY_CONTRACT_SPELLING.values());
+
+/**
  * The single characters hc names as keys (probed): letters, digits and the unshifted punctuation of
  * a US keyboard. Any other character has no hc name.
  */
@@ -76,6 +97,7 @@ function withCase(modifiers: readonly string[], key: string): readonly string[] 
 /**
  * One neutral chord in hc's spelling.
  *
+ * - Enter, Backspace and Tab with no modifier are typed as raw input (`RAW_BY_CONTRACT_SPELLING`).
  * - A named key or a nameable character, with or without modifiers, is a key name. A capital
  *   letter keeps its case as `shift+<letter>`, because the core takes names case-insensitively.
  * - A single printable character hc has no name for (`$`, `!`, `ä`), with NO modifier, is typed as
@@ -90,6 +112,10 @@ export function toHcKey(spelling: string): HcKeyResult {
   if (parsed === null) return { ok: false, reason: "unparsed" };
   if (parsed.modifiers.includes("meta")) return { ok: false, reason: "meta" };
   if (isExtendedOnlyChord(spelling)) return { ok: false, reason: "extended" };
+  if (parsed.modifiers.length === 0) {
+    const raw = RAW_BY_CONTRACT_SPELLING.get(parsed.key);
+    if (raw !== undefined) return { ok: true, key: { kind: "text", text: raw } };
+  }
   const named = NAMED_BY_CONTRACT_SPELLING.get(parsed.key);
   if (named !== undefined) return { ok: true, key: { kind: "key", name: [...parsed.modifiers, named].join("+") } };
   if (parsed.key === " ") return { ok: true, key: { kind: "key", name: [...parsed.modifiers, "space"].join("+") } };

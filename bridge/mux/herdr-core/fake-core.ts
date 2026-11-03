@@ -44,11 +44,19 @@
 //  • `hangHistoryReads` (HC_API.md § terminal.read, `lines: N` and `how: stitched`; M78 spec 03
 //    report, pi cases 2 and 3): a read with `lines` above 0 gives no answer while the switch is on
 //    (the real core gave none in 30 s while a pi dialog stood), and the plain screen read (`lines: 0`)
-//    still answers at once. `answerHungReads` lets the held reads answer, late.
+//    still answers at once. `answerHungReads` lets the held reads answer, late;
+//  • `slowHistoryReads` (M78 report 10, case 2, hc 0.1.14 under pi's permission dialog): a read with
+//    `lines` above 0 runs until `endSlowRead` and then answers the screen alone, `complete: false, how:
+//    screen`, as the real one did after 25 s. The terminal runs its history reads and key presses one
+//    at a time, so a `terminal.keys` call waits behind every history read queued before it. With
+//    `keysTimeoutMs` such a key call fails as the client's timeout does (`HcTimeout`) and the key
+//    still lands when its turn comes, as the real `Down` did. Screen reads (`lines: 0`) and other
+//    terminals answer at once.
 
 import type { MuxWrite } from "../conformance.ts";
 import {
   HcError,
+  HcTimeout,
   type EventStream,
   type HcRpc,
   type RunShellRequest,
@@ -115,6 +123,13 @@ export class ManualClock implements FakeClock {
 
 /** The measured gap between a raw write and the answer to the next key press (HC_API.md § Typing, "The key hold"). */
 export const KEY_HOLD_MS = 3030;
+
+/** The raw bytes a program cannot tell from a named key, and that key's name. */
+const RAW_KEY_BYTES = new Map<string, string>([
+  ["\r", "enter"],
+  ["\x7f", "backspace"],
+  ["\t", "tab"],
+]);
 
 /** What the program in a terminal receives, for a test that draws a screen from its input. */
 export type FakeInput = { readonly kind: "text"; readonly text: string } | { readonly kind: "keys"; readonly keys: readonly string[] };
@@ -189,6 +204,14 @@ export class FakeHcCore implements HcRpc {
   /** Terminals whose history reads hang, and the held reads waiting to answer. */
   private readonly hungHistory = new Set<string>();
   private heldReads: (() => void)[] = [];
+  /** Terminals whose history reads are slow, with the key call timeout to act out (null: none). */
+  private readonly slowHistory = new Map<string, { readonly keysTimeoutMs: number | null }>();
+  /** Per terminal, the end of its one-at-a-time queue of slow history reads and key presses. */
+  private readonly lanes = new Map<string, Promise<void>>();
+  /** Per terminal, the slow history reads waiting for `endSlowRead`, oldest first. */
+  private readonly slowReads = new Map<string, (() => void)[]>();
+  /** Per terminal, how many history reads (`lines` above 0) the core was asked for. */
+  private readonly historyCounts = new Map<string, number>();
   /** A generation the fake claims, for the compatibility test. */
   generation = 1;
 
@@ -270,6 +293,33 @@ export class FakeHcCore implements HcRpc {
   hangHistoryReads(address: string, on = true): void {
     if (on) this.hungHistory.add(address);
     else this.hungHistory.delete(address);
+  }
+
+  /**
+   * Make this terminal's history reads slow and queue its keys behind them, one at a time (see the
+   * header). `on: false` ends that for new calls; reads already queued still wait for `endSlowRead`.
+   */
+  slowHistoryReads(address: string, options: { on?: boolean; keysTimeoutMs?: number | null } = {}): void {
+    if (options.on === false) this.slowHistory.delete(address);
+    else this.slowHistory.set(address, { keysTimeoutMs: options.keysTimeoutMs ?? null });
+  }
+
+  /** The oldest slow history read of this terminal ends now. False when none waits. */
+  endSlowRead(address: string): boolean {
+    const release = this.slowReads.get(address)?.shift();
+    if (release === undefined) return false;
+    release();
+    return true;
+  }
+
+  /** How many slow history reads of this terminal wait for `endSlowRead`. */
+  pendingSlowReads(address: string): number {
+    return this.slowReads.get(address)?.length ?? 0;
+  }
+
+  /** How many history reads (`lines` above 0) of this terminal the core was asked for, in all. */
+  historyReads(address: string): number {
+    return this.historyCounts.get(address) ?? 0;
   }
 
   /** Every history read held so far answers now, as a late answer would. */
@@ -462,6 +512,8 @@ export class FakeHcCore implements HcRpc {
 
   async readTerminal(address: string, lines: number): Promise<WireRead> {
     this.assertConnected("terminal.read");
+    if (lines > 0) this.historyCounts.set(address, this.historyReads(address) + 1);
+    if (lines > 0 && this.slowHistory.has(address)) return this.slowRead(address);
     if (lines > 0 && this.hungHistory.has(address)) await new Promise<void>((resolve) => this.heldReads.push(resolve));
     this.deliverDueKeys();
     const terminal = this.known(address);
@@ -485,6 +537,8 @@ export class FakeHcCore implements HcRpc {
     if (unknown !== undefined) {
       throw new HcError("invalid_params", `herdr-core terminal.keys: invalid_params: unknown key "${unknown}" (try enter, esc, up, ctrl+c, alt+x, f5, a)`);
     }
+    const slow = this.slowHistory.get(address);
+    if (slow !== undefined) return this.keysInLane(terminal, keys, slow.keysTimeoutMs);
     const hold = this.hold;
     if (hold === null || hold.lastWriteAt === null) return this.deliverKeys(terminal, keys);
     const remaining = hold.lastWriteAt + hold.ms - hold.clock.now();
@@ -504,7 +558,20 @@ export class FakeHcCore implements HcRpc {
     this.assertTakesInput(terminal, "terminal.attach");
     if (this.hold !== null) this.hold.lastWriteAt = this.hold.clock.now();
     this.recorded.push({ paneId: address, kind: "text", payload: [text] });
-    terminal.onInput?.({ kind: "text", text });
+    // A program receives bytes: a raw \r, \x7f or \t is the same input as the key the core encodes
+    // to those bytes (herdr-core keys.rs), so the program is handed that key.
+    let plain = "";
+    for (const char of text) {
+      const key = RAW_KEY_BYTES.get(char);
+      if (key === undefined) {
+        plain += char;
+        continue;
+      }
+      if (plain !== "") terminal.onInput?.({ kind: "text", text: plain });
+      plain = "";
+      terminal.onInput?.({ kind: "keys", keys: [key] });
+    }
+    if (plain !== "") terminal.onInput?.({ kind: "text", text: plain });
   }
 
   async killTerminal(address: string): Promise<void> {
@@ -566,6 +633,44 @@ export class FakeHcCore implements HcRpc {
   private assertTakesInput(terminal: FakeTerminal, method: string): void {
     if (terminal.state !== "live") throw new HcError("finished", `herdr-core ${method}: finished: ${terminal.address} has finished`);
     if (terminal.waiting) throw new HcError("unavailable", `herdr-core ${method}: unavailable: ${terminal.address} is waiting for its new shell`);
+  }
+
+  /** Run `work` after everything queued on this terminal before it, one at a time. */
+  private inLane<T>(address: string, work: () => Promise<T> | T): Promise<T> {
+    const before = this.lanes.get(address) ?? Promise.resolve();
+    const run = before.then(work);
+    this.lanes.set(
+      address,
+      run.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return run;
+  }
+
+  /** A slow history read: it waits its turn and its `endSlowRead`, then answers the screen alone, incomplete. */
+  private async slowRead(address: string): Promise<WireRead> {
+    const { promise: ended, resolve: release } = Promise.withResolvers<void>();
+    const waiting = this.slowReads.get(address) ?? [];
+    waiting.push(release);
+    this.slowReads.set(address, waiting);
+    await this.inLane(address, () => ended);
+    const read = await this.readTerminal(address, 0);
+    return { text: read.text, complete: false, how: "screen" };
+  }
+
+  /** Keys queued behind the terminal's slow reads. A key call timeout fails the call, and the key still lands in turn. */
+  private keysInLane(terminal: FakeTerminal, keys: readonly string[], timeoutMs: number | null): Promise<void> {
+    const landed = this.inLane(terminal.address, () => {
+      if (terminal.state === "live") this.deliverKeys(terminal, keys);
+    });
+    if (timeoutMs === null) return landed;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new HcTimeout("terminal.keys", timeoutMs)), timeoutMs);
+    });
+    return Promise.race([landed, late]).finally(() => clearTimeout(timer));
   }
 
   private deliverKeys(terminal: FakeTerminal, keys: readonly string[]): void {
@@ -639,7 +744,13 @@ export class FakeHcCore implements HcRpc {
       screen: ["Claude Code", "", "Allow edit to src/x.ts?", "❯ 1. Yes", "  2. No", ""],
       history: Array.from({ length: 30 }, (_, i) => `earlier line ${String(i + 1)}`),
     });
-    this.add({ labels: inAgents, keep: true, cwd: "/home/dev/collie", foreground: { name: "bash", cwd: "/home/dev/collie" } });
+    this.add({
+      labels: inAgents,
+      keep: true,
+      cwd: "/home/dev/collie",
+      foreground: { name: "bash", cwd: "/home/dev/collie" },
+      history: ["$ bun test", "1293 pass", "0 fail"],
+    });
     this.add({ labels: { "herdr.space": "spscratch", "herdr.tab": "tbscratch", where: "scratch / 1" }, keep: true, cwd: "/home/dev/scratch", foreground: { name: "bash", cwd: "/home/dev/scratch" } });
     this.add({ name: "review", cwd: "/tmp", foreground: { name: "bash", cwd: "/tmp" } });
     this.add({ address: "box/t1", labels: inAgents, cwd: "/srv", status: { state: "working", app: "codex", kind: "" } });

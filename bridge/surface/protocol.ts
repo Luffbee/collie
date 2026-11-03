@@ -11,7 +11,9 @@
 //           and no other change, Backspace through the gate, require the S0 box again. A probe that
 //           fails with its character standing once in the box gets one Backspace and one more read.
 //           The bound counts only the reads: the two writes are outside it (`probeWrite` in gapsMs,
-//           and the request's bound grows by them), and the Backspace half always gets time for one read
+//           and the request's bound grows by them), and the Backspace half always gets time for one read.
+//           A probe that showed nowhere on a pane whose turn is idle reads on for LATE_PROBE (2, 3200)
+//           before it refuses (the late-probe window, below)
 //   write   the whole text in one write per line (a bracketed paste where the multiplexer and the
 //           profile allow it); a line break is the profile's newline key, through the gate. Where
 //           the multiplexer frames a paste itself (`pasteBlock`), a long or multi-line message is ONE
@@ -155,6 +157,31 @@
 // A probe that fails, goes out again with one Backspace and leaves text in the box proves a real
 // draft that is not Collie's (a stale row painted over the live box row): the send ends
 // `draft_present` with the draft's offers, never held (2026-10-26).
+// A box whose whole text is Collie's own probe characters is the one exception to the stale verdict
+// (#623, 2026-10-31): the agent took those keys and drew them, only later than the probe looked. A
+// harness that is busy for seconds (Claude Code 2.1.314 with a subagent running under its agents
+// footer) draws a probe long after its reads end, so the first send ends `probe_failed` with the box
+// empty, and the next one finds the late characters. When that box's own proof fails the same way, the
+// refusal carries the cause `late_keys` and says to wait and send again, not to redraw the pane; the
+// keys and the stale mark are the same as above. A late box is a reading of one moment, not a fix:
+// the send is still refused, and the next send takes the characters out once the agent draws again.
+// The late-probe window (M80 spec 09, 2026-11-01) is the fix for the first send: when the probe's own
+// reads saw the screen without the character and the pane's turn read idle at S0, the probe reads on
+// for LATE_PROBE before it refuses. A character that shows in that window is a live probe, and the send
+// goes on from there (Backspace, the text, Enter); one that still shows nowhere ends `probe_failed` as
+// before, and `gapsMs.probe` carries the whole wait. A free, responsive pane never waits for it: the
+// window opens only after the probe's reads saw nothing. A running turn keeps its own rules (queue, hold).
+// One rule for every harness: omp 18.6.1 right after its start under load (the browser leg's model
+// picker, M80 spec 08) refused the same way, its box idle and empty, the probe read twice in 242 ms.
+// A probe that shows in the window but changed more than the box gets one second chance (2026-11-01,
+// the first Herdr leg with the window: omp's first redraw after its start painted the whole screen
+// with the probe, so S0's rows were stale, `probe 3337`, "changed more than the box"). The cleanup
+// takes the character out as before; then a fresh S0 must read the turn idle, no modal, the box as S0
+// had it, no new cue and no new row under the box (a popup the probe opened and that stayed fails
+// here), and the probe goes once more from that read with the probe's own bound and the full compare,
+// no window. Its pass carries the request on from the fresh read; anything else ends as the first
+// probe did. Once per send, only after a probe the window showed; `keys` holds both probes, and
+// `gapsMs.probe` the whole wait.
 //
 // A placeholder on a read with no styling (M78 spec 06, 2026-10-30): a multiplexer that hands out plain
 // text (herdr-core) drops the faint attribute and the colour that mark an empty box's placeholder, so a
@@ -270,6 +297,17 @@ export const BOUNDS = {
   /** A notice's digit, written with no submit key: the notice gone and the box empty (it takes S1's and S2's place). */
   notice: { reads: 6, ms: 2000 },
 } as const;
+
+/**
+ * The late-probe window (the header, M80 spec 09): when the probe showed nowhere and the pane's turn is
+ * idle, it reads twice more inside this many ms before it refuses. A busy agent takes typed keys and draws
+ * them seconds late: Claude Code 2.1.314 with a subagent running drew Collie's probes several seconds
+ * after the probe's reads ended (#623), and omp 18.6.1 drew its first keys late right after its start on
+ * a loaded machine (M80 spec 08). The reads come 1000 and 3000 ms after the probe's own reads ended
+ * (`firstGapMs`, then twice that), and the last one has 200 ms to come back inside the window. The
+ * request's bound grows by it.
+ */
+export const LATE_PROBE = { reads: 2, ms: 3200, firstGapMs: 1000 } as const;
 
 /** The session lock's bound: the sum of the step bounds a send can take (the notice wait stands in for S1 and S2). A request past it ends `unknown`. */
 export const LOCK_BOUND_MS = BOUNDS.s0.ms + BOUNDS.probe.ms + BOUNDS.s1.ms + BOUNDS.s2.ms;
@@ -1113,15 +1151,17 @@ function rowsBelow(snap: Snap, frame: Frame): number {
  * The non-blank rows under a frame's bottom edge, the profile's hint rows left out
  * (`idle.volatile.below.hints`): a harness may hide or swap a hint there once the box holds text
  * (Codex 0.163.0 drops "← for agents · ? for shortcuts" at the first character), which is not a
- * moved screen. The rows of a stale list under an empty box (`stale`, `commandList.staleWhenEmpty`) are
- * left out the same way: the harness drops them at the next key.
+ * moved screen. The rows of a list under the box are left out the same way (`list`): a stale list under
+ * an empty box (`commandList.staleWhenEmpty`), which the harness drops at the next key, and the list the
+ * box's own text opened ({@link ownCommandList}), which comes and goes with that text. A probe typed
+ * after `/s` in pi's box closes pi's fuzzy list, and that is no moved screen (issue 638).
  */
-function countBelow(texts: readonly string[], frame: Frame | null, hints: readonly RegExp[], stale: CommandListRead | null = null, popup: PopupRead | null = null): number {
+function countBelow(texts: readonly string[], frame: Frame | null, hints: readonly RegExp[], list: CommandListRead | null = null, popup: PopupRead | null = null): number {
   if (frame === null) return 0;
   let n = 0;
   for (let i = frame.bottom + 1; i < texts.length; i++) {
-    // The rows of a list the harness left under an empty box (`commandList.staleWhenEmpty`) go with the next key.
-    if (stale !== null && i >= stale.first && i <= stale.last) continue;
+    // The rows of a stale list or of the box's own list under it go with the text that opened them.
+    if (list !== null && i >= list.first && i <= list.last) continue;
     // A typeahead popup (`volatile.below.popups`) comes and goes with the text: its rows are not a screen that moved.
     if (popup !== null && i >= popup.first && i <= popup.last) continue;
     const text = texts[i]!.trimEnd();
@@ -1516,6 +1556,34 @@ const STEER_MESSAGE_ONLY = "Only a message can steer a turn, not a command.";
 const STEER_NOT_TAKEN = "The steer key went out, but the text is still in the box.";
 /** The detail of a steer with no sign either way (M69). */
 const STEER_NO_EVIDENCE = "The steer key went out, but the screen did not show whether the agent took it.";
+/** The `unconfirmed` detail of a screen Collie cannot read: the same words as the phone's catalog line, which hides it. */
+const MANUAL_DETAIL = "Collie cannot read this screen. Check the pane, then tap Type here.";
+const SHORT_PANE: SendCause = "short_pane";
+
+/**
+ * The rows a profile's input box takes on the screen: its prompt row and each edge the harness draws
+ * (a blank or open edge takes none). Claude Code's rule, prompt and rule take three.
+ */
+function boxRows(profile: Profile): number {
+  const { top, bottom } = profile.idle.frame;
+  return (top.blank === true ? 0 : 1) + 1 + (bottom.blank === true || bottom.open === true ? 0 : 1);
+}
+
+/**
+ * The `unconfirmed` detail of a read that holds fewer rows than the box takes (cause `short_pane`), or
+ * null. A multiplexer never reads more rows than the viewport holds, so a read that short on a screen
+ * with no box says the pane cannot draw one: a tab that fills with splits squeezes its panes (seven
+ * review shells left a Claude Code pane two rows tall, 2026-10-30), and the person fixes the layout, not
+ * the screen. The manual Send stays offered: the harness takes keys it cannot draw.
+ */
+function shortPaneDetail(harness: string, snap: Snap, profile: Profile | null): string | null {
+  if (profile === null) return null;
+  const needs = boxRows(profile);
+  const rows = snap.rows.length;
+  if (rows >= needs) return null;
+  return `The read holds ${rows === 1 ? "one row" : `${String(rows)} rows`}, and the ${harness} input box takes at least ${String(needs)}. The pane may be too short to draw it: zoom or resize it on the desktop, or close the panes beside it in its tab, then send again.`;
+}
+
 /** The `unconfirmed` detail of a send whose whole text, or first line, is one of the keys a notice above the box printed. */
 const NOTICE_KEY_DETAIL = "That message would answer the notice above the box. Check the pane, then tap Type here.";
 /** The detail of a notice digit refused where no commit can go ahead (a running turn, a Replace). */
@@ -1528,6 +1596,14 @@ const NOTICE_NOT_TAKEN = "The notice did not take the number. Check the pane.";
 const NOTICE_KEY: SendCause = "notice_key";
 /** The cause of a refusal on a screen whose input box does not take keys (2026-10-25). */
 const STALE_CAUSE: SendCause = "stale_screen";
+/** The cause of that refusal when the box held only Collie's probe characters: they showed late (#623). */
+const LATE_CAUSE: SendCause = "late_keys";
+/**
+ * The detail of a `late_keys` refusal: the box held only Collie's earlier probe characters, which the
+ * agent drew after the probe's reads had ended, and its proof did not show in time either (#623).
+ */
+const LATE_KEYS =
+  "The box holds only Collie's earlier probe characters: the agent took those keys but showed them late, so it may be busy. Wait a moment, then send again. Collie takes them out first.";
 
 /**
  * The refusal of a send whose box would hold one of a notice's digits alone where no commit can go
@@ -3933,7 +4009,15 @@ export class SendProtocol {
       ([...text].length >= 1 && [...text].length <= SHORT_TEXT));
     let landing: Landing | null = null;
     try {
-      if (state.probed) landing = await this.probe(state, s0, prefix);
+      if (state.probed) {
+        const probed = await this.probe(state, s0, prefix);
+        landing = probed.landing;
+        // A late probe's second chance went from a fresh S0 (the header): the request goes on from it.
+        if (probed.base !== s0) {
+          s0 = probed.base;
+          state.marks.s0 = s0;
+        }
+      }
     } finally {
       // Lapped on a failed probe too, so its receipt says where the time went.
       this.lapProbe(state);
@@ -4092,6 +4176,8 @@ export class SendProtocol {
   private async proveDraft(state: RunState, s0: Snap): Promise<Snap> {
     const probe = probeCharOf(state.match);
     const before = countIn(s0.texts, probe);
+    // A box of Collie's own probe characters only: they showed late, so a failed proof is `late_keys` (#623).
+    const late = s0.frame !== null && probeResidue(boxText(s0.frame), probe) > 0;
     // The probe, then its Backspace, each with the probe's own bound.
     this.stretch(state, 2 * BOUNDS.probe.ms);
     const first = await this.draftProbe(state, s0, probe);
@@ -4110,19 +4196,19 @@ export class SendProtocol {
     let fresh = await this.stableRead(state, "s0");
     // A probe that showed nowhere may show now that the screen drew again: it is taken back first.
     if (first.landing === "nowhere") {
-      if (countIn(fresh.texts, probe) !== before + 1) throw this.staleScreen(state, fresh, probe);
+      if (countIn(fresh.texts, probe) !== before + 1) throw this.staleScreen(state, fresh, probe, late);
       fresh = await this.takeBack(state, before, probe);
     }
     const { frame } = fresh;
     if (frame === null || fresh.surface.composer !== "draft" || boxText(frame).length === 0) return fresh;
     // The same rows again: nothing mended the screen, and a second probe would only say so twice.
     if (s0.frame !== null && frameImageKey(fresh.texts, frame.top, frame.bottom) === frameImageKey(s0.texts, s0.frame.top, s0.frame.bottom)) {
-      throw this.staleScreen(state, fresh, null);
+      throw this.staleScreen(state, fresh, null, late);
     }
     const again = await this.draftProbe(state, fresh, probe);
     if (again.landing === "live") return again.snap;
     if (again.landing === "ghost") return this.ghostProven(state, fresh, again.snap);
-    throw this.staleScreen(state, state.lastRead ?? fresh, again.landing === "nowhere" ? probe : null);
+    throw this.staleScreen(state, state.lastRead ?? fresh, again.landing === "nowhere" ? probe : null, late);
   }
 
   /**
@@ -4226,8 +4312,10 @@ export class SendProtocol {
    * The refusal of a box that does not take keys (the header): `probe_failed`, the cause `stale_screen`,
    * the key pad as the offer, nothing deleted. `probe` names a probe character that showed nowhere and
    * may still stand in the live editor. The bridge's Surface is told which box rows were proven stale.
+   * `late`: the box held only Collie's probe characters, so the cause is `late_keys` and the detail says
+   * to wait (#623); everything else is the same.
    */
-  private staleScreen(state: RunState, snap: Snap, probe: string | null): Ended {
+  private staleScreen(state: RunState, snap: Snap, probe: string | null, late = false): Ended {
     const { frame } = snap;
     if (frame !== null) {
       try {
@@ -4237,8 +4325,9 @@ export class SendProtocol {
       }
     }
     if (probe !== null) this.notePending(state);
-    const detail = probe === null ? STALE_SCREEN : `${STALE_SCREEN} ${probeMayRemain(probe)}`;
-    return new Ended("refused", "probe_failed", sawNote(snap, { detail, framed: true, offers: ["keys"], cause: STALE_CAUSE }));
+    const head = late ? LATE_KEYS : STALE_SCREEN;
+    const detail = probe === null ? head : `${head} ${probeMayRemain(probe)}`;
+    return new Ended("refused", "probe_failed", sawNote(snap, { detail, framed: true, offers: ["keys"], cause: late ? LATE_CAUSE : STALE_CAUSE }));
   }
 
   /**
@@ -4280,7 +4369,9 @@ export class SendProtocol {
       throw draftRefusal(state, s0);
     }
     if (takesManualSend(surface)) {
-      this.gateManual(state, s0, "Collie cannot read this screen. Check the pane, then tap Type here.");
+      const short = shortPaneDetail(state.target.harness, s0, state.match?.profile ?? null);
+      if (short === null) this.gateManual(state, s0, MANUAL_DETAIL);
+      else this.gateManual(state, s0, short, SHORT_PANE);
       return;
     }
     throw new Ended("refused", "not_free", { surface, detail: "The input box is not free." });
@@ -4668,7 +4759,7 @@ export class SendProtocol {
         texts,
         frame,
         (idle?.volatile.below.hints ?? []).map((source) => new RegExp(source, "u")),
-        frame === null ? null : staleListUnder(texts, frame.bottom, frame.interior.text, idle?.volatile.below.commandList),
+        frame === null ? null : (staleListUnder(texts, frame.bottom, frame.interior.text, idle?.volatile.below.commandList) ?? (ownList?.side === "under" ? ownList : null)),
         popup,
       ),
       otherScreen: otherScreenOf(texts, frame, idle?.volatile.below.otherScreens ?? []),
@@ -4760,12 +4851,12 @@ export class SendProtocol {
   private async poll(
     state: RunState,
     step: string,
-    bound: { reads: number; ms: number },
+    bound: { readonly reads: number; readonly ms: number; readonly firstGapMs?: number },
     test: (snap: Snap) => Verdict | "again",
     againMs = FIRST_GAP_MS,
   ): Promise<{ snap: Snap | null; verdict: Verdict; reads: number }> {
     const until = Math.min(this.now() + bound.ms, state.deadline);
-    let gap = FIRST_GAP_MS;
+    let gap = bound.firstGapMs ?? FIRST_GAP_MS;
     let again = false;
     let last: Snap | null = null;
     let reads = 0;
@@ -4825,7 +4916,7 @@ export class SendProtocol {
    * The probe: the character, then Backspace; the box must take exactly it and give it back. A manual
    * send lets the rows under the box and the rest of the box change (see the header).
    */
-  private async probe(state: RunState, s0: Snap, prefix: string): Promise<Landing | null> {
+  private async probe(state: RunState, s0: Snap, prefix: string, again = false): Promise<{ readonly landing: Landing | null; readonly base: Snap }> {
     const probe = probeCharOf(state.match);
     const failed = (detail: string, snap: Snap | null): Ended => new Ended("refused", "probe_failed", sawNote(snap, { detail, framed: s0.frame !== null }));
     // Reads are shared across the two halves: the character may take two, Backspace gets the rest. The
@@ -4841,7 +4932,7 @@ export class SendProtocol {
     // it decide, as at S1 (2026-10-17). Commands and manual sends keep the full compare below.
     const boxOnly = s0.frame !== null && !state.command && !state.manual && queuesInTurn(state.match);
     const typedFrom = this.now();
-    const typed = await this.poll(state, "probe", { reads: budget.reads - 1, ms: budget.ms }, (snap) => {
+    const shows = (snap: Snap): Verdict => {
       if (s0.frame !== null) {
         // Queued: the Surface's claim of a modal over a found box fails, and so do two reads in a row
         // with no box. One read with no box may be torn, and its Surface claims nothing to trust.
@@ -4867,7 +4958,16 @@ export class SendProtocol {
       if (snap.plain.join("\n") === s0.plain.join("\n")) return "wait";
       landing = probeLanding(s0.plain, snap.plain, probe, { freeBelow: state.manual });
       return landing !== null && !cueAppeared(s0, snap) ? "pass" : "fail";
-    });
+    };
+    let typed = await this.poll(state, "probe", { reads: budget.reads - 1, ms: budget.ms }, shows);
+    let shownLate = false;
+    if (!again && this.lateWindowOpens(state, s0, typed, probe)) {
+      // The late-probe window (the header): a busy agent draws a typed key seconds late (#623).
+      this.stretch(state, LATE_PROBE.ms);
+      const late = await this.poll(state, "probe", LATE_PROBE, shows);
+      typed = { snap: late.snap ?? typed.snap, verdict: late.verdict, reads: typed.reads + late.reads };
+      shownLate = late.verdict !== "wait";
+    }
     const spent = this.now() - typedFrom;
     // A box on screen that showed no probe at all, on a pane where its harness is starting: the box is
     // drawn but reads no keys yet. The character waits in the terminal and shows later, where the next
@@ -4880,7 +4980,14 @@ export class SendProtocol {
       const screen = boxOnly ? (typed.snap?.otherScreen ?? null) : null;
       const why =
         typed.verdict === "wait" ? "The probe character did not show in the box." : screen !== null ? probeOtherScreen(screen) : "The probe character changed more than the box.";
-      throw await this.probeCleanup(state, s0, typed.snap, probe, why);
+      const ended = await this.probeCleanup(state, s0, typed.snap, probe, why);
+      // A late probe that came with a repaint of the whole screen (the header): S0's rows are stale, so
+      // the probe goes once more from a fresh S0. Once per send, and only after the window showed it.
+      if (shownLate && typed.verdict === "fail" && screen === null && ended.extra.probeClean === true) {
+        const fresh = await this.lateBaseline(state, s0);
+        if (fresh !== null) return this.probe(state, fresh, prefix, true);
+      }
+      throw ended;
     }
 
     try {
@@ -4904,7 +5011,40 @@ export class SendProtocol {
       const unproven = state.starting || back.snap === null || (s0.frame !== null && back.snap.frame === null);
       throw failed(unproven ? unconfirmedClean(probe) : "Backspace did not give the box back as it was.", back.snap);
     }
-    return landing;
+    return { landing, base: s0 };
+  }
+
+  /**
+   * The fresh S0 a late probe's second chance goes from (the header): the same S0 read, and it must
+   * show the turn idle, no modal, the box as S0 had it (empty, or the draft it held), no cue S0 did not
+   * have and no more rows under the box. Null when it does not, or when it does not read twice alike:
+   * the first probe's refusal stands then. The request's bound grows by an S0 and a probe.
+   */
+  private async lateBaseline(state: RunState, s0: Snap): Promise<Snap | null> {
+    if (s0.frame === null) return null;
+    this.stretch(state, BOUNDS.s0.ms + BOUNDS.probe.ms);
+    let fresh: Snap;
+    try {
+      fresh = await this.stableRead(state, "s0");
+    } catch (err) {
+      if (err instanceof Ended && err.outcome === "refused") return null;
+      throw err;
+    }
+    if (fresh.frame === null || fresh.surface.turn !== "idle" || fresh.surface.modal !== "none") return null;
+    if (boxText(fresh.frame) !== boxText(s0.frame)) return null;
+    if (cueAppeared(s0, fresh) || fresh.below > s0.below) return null;
+    return fresh;
+  }
+
+  /**
+   * Whether the late-probe window opens ({@link LATE_PROBE}, the header): the probe's reads saw the
+   * screen and no character on it, and the pane's turn read idle at S0. A running turn, a queued or
+   * streamed send, and a probe that showed somewhere (it failed, or went elsewhere) keep today's path.
+   */
+  private lateWindowOpens(state: RunState, s0: Snap, typed: { readonly snap: Snap | null; readonly verdict: Verdict }, probe: string): boolean {
+    if (typed.verdict !== "wait" || typed.snap === null) return false;
+    if (s0.surface.turn !== "idle" || state.queued || state.streamed) return false;
+    return countIn(typed.snap.texts, probe) === countIn(s0.texts, probe);
   }
 
   /**

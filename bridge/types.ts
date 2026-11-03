@@ -672,6 +672,26 @@ export interface WorkspaceView {
    */
   folder?: string;
   /**
+   * What the checkout holding this space's {@link folder} is on: a branch, or a detached head at a
+   * full object name. Read off disk by `bridge/git-head.ts`, the same reader and the same cache as
+   * {@link AgentView.gitHead}, and attached at serialise time the same way (bridge/space-view.ts).
+   *
+   * ABSENT, NEVER A PLACEHOLDER. A space with no folder, a folder in no checkout, one that is gone or
+   * unreadable, a reading not taken yet (the first snapshot after a space appears) and every older
+   * bridge carry no key at all, and the phone then draws exactly what it drew before the field existed.
+   */
+  gitHead?: GitHead;
+  /**
+   * The ref this worktree was cut from, as the bridge that made it wrote it down
+   * (`bridge/worktree-bases.ts`, keyed by the checkout folder), attached at serialise time on the
+   * machine that holds the space. Only on a space with `isWorktree: true`.
+   *
+   * ABSENT, NEVER A PLACEHOLDER. A worktree made outside Collie, one made with no starting point, one
+   * whose entry aged out of the store, a space that is not a worktree and every older bridge carry no
+   * key at all. A member's value reaches the phone through the lead unchanged (additive-optional).
+   */
+  base?: string;
+  /**
    * Which member of the crew this space lives on — the same tag panes and sessions carry.
    *
    * **Present exactly when {@link SnapshotResponse.servers} is**, and absent otherwise (§11), so a
@@ -1286,6 +1306,12 @@ export interface PaneReadResponse {
    * to repair — the payload stays byte-identical to what it was for every other pane.
    */
   logicalText?: string;
+  /**
+   * Set only on a Load older read (`?purpose=older`) the multiplexer answered without the rows above
+   * the screen: one sentence that says why, for the phone to show (mux/types.ts `MuxGrid.olderNote`).
+   * Absent on every other read.
+   */
+  olderNote?: string;
 }
 
 /**
@@ -1662,7 +1688,10 @@ export type WorktreeCreateResponse =
  * `null` when there is none to name. `remembered` is this repo's last choices on this machine.
  * `branchValid`, `defaultTarget` and `parentTarget` answer only when the query named a branch (and a
  * parent): `defaultTarget` is where Herdr will put the folder when no path is sent, a prediction from
- * Herdr's own rule; `parentTarget` is the folder rule's verdict on the parent the phone named.
+ * Herdr's own rule, with `exists` true only when a create would refuse the folder (a folder git lists
+ * as the same finished worktree on this branch reads false, the create then opens it) and `reason`
+ * the state git lists when it names one; `parentTarget` is the folder rule's verdict on the parent
+ * the phone named.
  */
 export type WorktreePlanResponse =
   | {
@@ -1672,7 +1701,7 @@ export type WorktreePlanResponse =
       currentBranch: string | null;
       remembered?: { base: "default" | "current"; folder: "default" | "parent"; parent?: string };
       branchValid?: boolean;
-      defaultTarget?: { path: string; exists: boolean };
+      defaultTarget?: { path: string; exists: boolean; reason?: string };
       parentTarget?:
         | { ok: true; path: string }
         | { ok: false; error: string; code?: ErrorCode; detail?: ApiErrorDetail };
@@ -1983,6 +2012,13 @@ export interface LaunchersResponse {
    * while `[phone] run` is off too, each then unavailable with `run_off`. Absent from an older bridge.
    */
   recentRuns?: RecentRunWire[];
+  /**
+   * Whether each pinned `cwd` the lead asked about is a folder on THIS machine, keyed by the path as
+   * asked, `~` expanded here (ADR 0127). Answered only to the lead over the crew link, for the
+   * `?cwd=` it adds to a forwarded read; the lead uses it for `no_folder` and drops it from the
+   * phone's answer. Absent from a member that predates 0127.
+   */
+  folders?: Record<string, boolean>;
 }
 
 /** One line in this machine's one-off command history (ADR 0095, `bridge/recent-runs.ts`). */
@@ -2100,8 +2136,14 @@ export interface LauncherItem {
   /**
    * Why not, when `available` is false. `not_found`: the binary is not on this machine's login PATH.
    * `adds_off`: the operator turned phone rows off. `free_text_off`: free lines are off.
+   * `no_folder`: a lead row's pinned `cwd` is not a folder on this machine (ADR 0127).
    */
-  reason?: "not_found" | "adds_off" | "free_text_off";
+  reason?: "not_found" | "adds_off" | "free_text_off" | "no_folder";
+  /**
+   * `lead`: the item is one of the lead's rows, offered for this machine (ADR 0127). Set only in a
+   * lead's answer for another host of its crew; absent on a machine's own items and in solo.
+   */
+  from?: "lead";
   /** Added rows: the id (for rename and remove), who added it, when, and how. */
   id?: string;
   addedBy?: string;

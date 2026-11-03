@@ -1,5 +1,6 @@
 import { render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import type { ReactElement } from "react";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
 
@@ -106,6 +107,52 @@ describe("ReportSheetView (ADR 0123)", () => {
     const cut = fitLink(reportFields(base({ context: { ...CONTEXT, doctor } }))).cut.doctor;
     expect(cut).toBeGreaterThan(1);
     expect(container.querySelector('[data-slot="report-cut"]')).toHaveTextContent(`${String(cut)} doctor rows were left out of the setup to fit the link. Copy report has all of it.`);
+  });
+
+  describe("a report too long for the link (M80 spec 02)", () => {
+    // The setup block is never cut, so a setup that alone passes the budget cannot go by link.
+    const hugeContext: ReportContext = { ...CONTEXT, os: "x".repeat(6000) };
+    const huge = (): ReactElement => (
+      <ReportSheetView context={hugeContext} contextError={null} rows={SENDS} episodes={[]} fromSettings={false} loadScreen={vi.fn()} />
+    );
+
+    it("budget: Open on GitHub copies the whole report first, then opens the one-line issue", async () => {
+      const user = userEvent.setup();
+      const writeText = vi.fn(async (_text: string) => {});
+      Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+      const open = vi.spyOn(window, "open").mockReturnValue(null);
+      try {
+        const { container } = render(huge());
+        expect(container.querySelector('[data-slot="report-clipboard"]')).toHaveTextContent("too long for the link");
+        const input = base({ context: hugeContext });
+        const link = fitLink(reportFields(input));
+        expect(link.clipboard).toBe(true);
+        await user.click(container.querySelector('[data-slot="report-open"]')!);
+        await waitFor(() => expect(open).toHaveBeenCalledTimes(1));
+        expect(writeText).toHaveBeenCalledWith(reportText(reportFields(input)));
+        expect(open.mock.calls[0]?.[0]).toBe(link.url);
+        expect(String(writeText.mock.calls[0]?.[0])).toContain("collie-sig: send/");
+      } finally {
+        open.mockRestore();
+        Reflect.deleteProperty(navigator, "clipboard");
+      }
+    });
+
+    it("budget: a copy that fails opens nothing and says so", async () => {
+      const user = userEvent.setup();
+      const writeText = vi.fn(async () => Promise.reject(new Error("denied")));
+      Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+      const open = vi.spyOn(window, "open").mockReturnValue(null);
+      try {
+        const { container } = render(huge());
+        await user.click(container.querySelector('[data-slot="report-open"]')!);
+        await waitFor(() => expect(writeText).toHaveBeenCalled());
+        expect(open).not.toHaveBeenCalled();
+      } finally {
+        open.mockRestore();
+        Reflect.deleteProperty(navigator, "clipboard");
+      }
+    });
   });
 
   it("a screen that cannot be read turns the switch back off and says why", async () => {

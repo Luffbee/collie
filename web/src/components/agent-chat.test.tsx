@@ -6,7 +6,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { createMemoryRouter, RouterProvider, useParams, useRevalidator } from "react-router";
 
-import { __resetConnectionHealth } from "@/lib/connection-health";
+import { __resetConnectionHealth, NETWORK_LATCH_MS, noteNetworkFailure } from "@/lib/connection-health";
 import type { JsonValue } from "@/lib/json";
 
 // Mock the race guard at AgentChat's seam so the frozen-revision tests can observe exactly what
@@ -1766,6 +1766,79 @@ describe("AgentChat — top-of-mirror history affordance", () => {
     renderChat({ agent, agents: [agent], requestedLines: 600 });
     expect(showHistory()).toBeInTheDocument();
     expect(loadOlder()).not.toBeInTheDocument();
+  });
+
+  // herdr-core (M79 spec 01): no scrollback depth, and its poll reads the screen alone, marked
+  // `truncated`. Load older stands while the text on display is cut, and each tap is one read of the
+  // rows above the screen.
+  describe("on a multiplexer that reports no scrollback depth (herdr-core)", () => {
+    const shell = { ...fixtureAgents[0]!, kind: "shell" as const }; // no readableLines
+    const SCREEN = paneTextWithDraft("the screen alone");
+    const OLDER_ROWS = `an older row above the screen\n${SCREEN}`;
+    const NOTE = "On the Herdr core, Load older waits until the agent is no longer waiting on you.";
+    afterEach(async () => {
+      const { resetRequestedLines } = await import("@/lib/loaders");
+      resetRequestedLines();
+    });
+
+    /** The pane view, whose loader data the test swaps in as a Load older read would land. */
+    function renderSwappable(first: Partial<ComponentProps<typeof AgentChat>>) {
+      let land: (next: Partial<ComponentProps<typeof AgentChat>>) => void = () => undefined;
+      function Host() {
+        const [props, setProps] = useState(first);
+        land = (next) => setProps({ ...first, ...next });
+        return <AgentChat paneId={shell.paneId} agent={shell} agents={[shell]} shellPanes={[]} tabs={[]} text={SCREEN} onBack={vi.fn()} onSelect={vi.fn()} {...props} />;
+      }
+      const router = createMemoryRouter([{ path: "/", element: withHeaderHost(<Host />) }]);
+      render(<RouterProvider router={router} />);
+      return { land: (next: Partial<ComponentProps<typeof AgentChat>>) => act(() => land(next)) };
+    }
+
+    it("offers Load older while the text is cut, and nothing on a whole read", () => {
+      renderChat({ agent: shell, agents: [shell], requestedLines: 600, truncated: true });
+      expect(loadOlder()).toBeInTheDocument();
+      cleanup();
+      renderChat({ agent: shell, agents: [shell], requestedLines: 600, truncated: false });
+      expect(loadOlder()).not.toBeInTheDocument();
+    });
+
+    it("a tap marks the next read as Load older, and the rows it brings replace the cut text and the button goes", async () => {
+      const user = userEvent.setup();
+      const { land } = renderSwappable({ requestedLines: 600, truncated: true });
+      await user.click(loadOlder()!);
+      const { paneLoader } = await import("@/lib/loaders");
+      const asked: string[] = [];
+      server.use(
+        http.get(/\/api\/pane\/[^/]+$/, ({ request }) => {
+          asked.push(new URL(request.url).search);
+          return HttpResponse.json({ paneId: shell.paneId, text: OLDER_ROWS, truncated: false, revision: 3 });
+        }),
+      );
+      const data = await paneLoader({ params: { paneId: shell.paneId } });
+      expect(asked).toEqual(["?lines=1000&purpose=older"]);
+      expect(data.olderRead).toBe(true);
+      // A poll before it lands is not adopted: only the Load older read is.
+      land({ requestedLines: 1000, truncated: true, text: SCREEN });
+      expect(screen.queryByText(/an older row above the screen/)).not.toBeInTheDocument();
+      land({ requestedLines: 1000, truncated: false, olderRead: true, text: OLDER_ROWS });
+      expect(await screen.findByText(/an older row above the screen/)).toBeInTheDocument();
+      expect(loadOlder()).not.toBeInTheDocument();
+      // The read after it is the poll again.
+      await paneLoader({ params: { paneId: shell.paneId } });
+      expect(asked[1]).toBe("?lines=1000");
+    });
+
+    it("a Load older that brought no older rows says why, and the button stays for another tap", async () => {
+      const user = userEvent.setup();
+      const { land } = renderSwappable({ requestedLines: 600, truncated: true });
+      await user.click(loadOlder()!);
+      land({ requestedLines: 1000, truncated: true, olderRead: true, olderNote: NOTE, text: SCREEN });
+      expect(await screen.findByText(NOTE)).toBeInTheDocument();
+      expect(loadOlder()).toBeInTheDocument();
+      // At the window's cap the next tap asks again at the same window, and clears the note.
+      await user.click(loadOlder()!);
+      expect(screen.queryByText(NOTE)).not.toBeInTheDocument();
+    });
   });
 });
 
@@ -4360,8 +4433,8 @@ describe("AgentChat: a new agent pane draws Chat from the first frame", () => {
 // Altan, airplane mode with Tailscale up, a pane open in Chat: the body went blank under a strip that
 // said "showing what was saved". The rule now: what the Chat body holds stays on screen through any
 // failed poll, and it is marked as the saved copy (the dated line above the body) on the read that
-// proves the outage: at once for a read that got no answer, on the second 5xx in a row. The line stays
-// until a live answer.
+// proves the outage: once the herd read latches a read that got no answer (its strike, then its retry,
+// 2026-10-29), on the second 5xx in a row. The line stays until a live answer.
 describe("AgentChat — a failed poll keeps the Chat on screen", () => {
   const journalAgent = () => ({ ...fixtureAgents[0]!, hasSession: true });
   type ChatMode = "live" | "drop" | "502";
@@ -4413,6 +4486,15 @@ describe("AgentChat — a failed poll keeps the Chat on screen", () => {
   }
 
   const savedLine = () => screen.queryByText(/^Saved copy from .+\. Older text is on the bridge\.$/);
+  // The herd read of the same poll gets no answer either, and so does a later one past
+  // NETWORK_LATCH_MS with no live answer: that latches.
+  const herdGetsNoAnswer = () =>
+    act(() => {
+      noteNetworkFailure();
+      vi.setSystemTime(Date.now() + NETWORK_LATCH_MS);
+      noteNetworkFailure();
+    });
+  afterEach(() => vi.useRealTimers());
 
   it("online, content shown, then a poll that gets no answer: the blocks stay and the saved line appears", async () => {
     const view = renderPolled();
@@ -4422,6 +4504,7 @@ describe("AgentChat — a failed poll keeps the Chat on screen", () => {
     expect(savedLine()).toBeNull();
 
     mode = "drop";
+    herdGetsNoAnswer();
     await view.poll();
     await waitFor(() => expect(savedLine()).toBeInTheDocument());
     expect(view.blocks()).toBe(shown);
@@ -4462,6 +4545,7 @@ describe("AgentChat — a failed poll keeps the Chat on screen", () => {
     expect(document.querySelector('[data-slot="saved-copy"]')).toBeNull();
 
     mode = "drop";
+    herdGetsNoAnswer();
     await view.poll();
     await waitFor(() => expect(savedLine()).toBeInTheDocument());
     const stream = document.querySelector('[data-slot="session-stream"]')!;

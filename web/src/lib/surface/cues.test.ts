@@ -460,17 +460,21 @@ describe("a list that leaves the lead off, under the box only, over the harness'
 
   it("the pointer on `model` under a box that holds /model is its own typeahead: the lead goes in front", () => {
     expect(read(screen("/model", MODEL))).toMatchObject({ list: { pointed: "/model", side: "under", first: 4, last: 5 }, own: true });
-    // The same list under /mod or /models is no typeahead of the box's text. Its unpainted rows are
-    // no footer either, so the plain rows here find no box at all; the painted capture does (fold.test.ts).
-    expect(read(screen("/mod", MODEL))).toMatchObject({ frame: null, own: false });
-    expect(read(screen("/models", MODEL))).toMatchObject({ frame: null, own: false });
+    // The same list under /mod or /models points at another command. pi names `leadOpens` since issue 638
+    // (pi 1.3.0 and 1.4.0 draw a fuzzy list under any text that starts with `/`), so it is the text's own
+    // popup all the same: the box is found and the pointer stays on `model`. Whether Enter would run what
+    // is typed is `pointsAt`'s question, which the protocol asks.
+    expect(read(screen("/mod", MODEL))).toMatchObject({ frame: { interior: { text: "/mod" } }, list: { pointed: "/model" }, own: true });
+    expect(read(screen("/models", MODEL))).toMatchObject({ frame: { interior: { text: "/models" } }, list: { pointed: "/model" }, own: true });
   });
 
   it("a list taller than the footer bound still finds the box, and only when the list is its own", () => {
     const tall = [...MODEL, "  modelpreset    Presets", "  switch         Switch", "  (1/9)"];
     expect(read(screen("/model", tall))).toMatchObject({ frame: { interior: { text: "/model" } }, own: true });
-    // The same list pointed at another command: the row under the box is no footer, so no box.
-    expect(read(screen("/mod", tall)).frame).toBeNull();
+    // The same list pointed at another command is the text's own popup too (`leadOpens`, issue 638).
+    expect(read(screen("/mod", tall))).toMatchObject({ frame: { interior: { text: "/mod" } }, own: true });
+    // A box whose text does not start with the lead opened no list: the rows under it are no footer, so no box.
+    expect(read(screen("mod", tall)).frame).toBeNull();
   });
 
   it("the footer ends the list: one run to the screen's end, at most six rows, no blank row in it", () => {

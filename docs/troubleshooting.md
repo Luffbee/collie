@@ -10,7 +10,7 @@ reboot** · **a pane is stuck narrow** · **Collie refuses to open a tmux window
 **an update started from the phone stays at staging** · **a phone update on macOS leaves Collie
 unloaded** · **on macOS, `collie status` says "loaded, not running"** · **a pane shows no prompt-cache chip** · **a Kiro pane's History opens empty** · **a pane has no Chat or History** · **`hc-socket` is red in `collie doctor`** · **the phone shows the Herdr TUI's panes, not herdr-app's** · **a new Codex pane says it has no history
 yet** · **the phone says Collie cannot read a screen the agent is not showing** · **sending failed 3 times
-and the phone offers a report** · **something looks wrong on a Herdr core (`herdr-core`) pane** ·
+and the phone offers a report** · **a send is refused and `⌁` shows in the box later** · **something looks wrong on a Herdr core (`herdr-core`) pane** ·
 **an agent is greyed
 out on the New page** · **Start says there is no folder, or says it could not confirm** ·
 **walky talky: send is refused, "run this inside a pane"** · **walky talky: the message sits in the
@@ -196,10 +196,11 @@ run `collie hooks install claude`, then restart the Claude in that pane.
    started from a shell that another agent opened. Oh My Pi's hook stays silent when `OMPCODE=1` is
    inherited from the parent agent. Start it from a fresh terminal.
 
-On tmux, zellij and tern only Claude Code reports a session, through Collie's beacon hooks. Run
+On tmux, zellij and tern Claude Code reports a session through Collie's beacon hooks. Run
 `collie hooks install claude` ([Collie writes hooks into Claude's own
-settings](multiplexers.md#collie-writes-hooks-into-claudes-own-settings)). The other agents have no
-Chat or History there.
+settings](multiplexers.md#collie-writes-hooks-into-claudes-own-settings)). On tmux, zellij and the
+Herdr core, pi and Oh My Pi need no hook: Collie finds their log from the pane's folder, and a fresh
+pane shows an empty Chat until the agent's first reply. The other agents have no Chat or History there.
 
 **A new Codex pane says it has no history yet.** Expected until its first turn. Codex reports its
 session to Herdr only when the first prompt is sent, not when it starts, so a fresh pane has no
@@ -237,6 +238,8 @@ under your own GitHub account, and **Copy report** copies the same text. Tap **A
 first to find an issue with the same signature line. The pane menu and **Settings → System** open
 the same sheet at any time. The cross closes the card on that pane until a send works again. A
 crew member's pane does not offer a report yet; use the steps above.
+
+**A send is refused, and `⌁` shows in the box a few seconds later.** The agent was busy and showed the keys Collie typed late. Before Collie types a message, it types one probe character (`⌁`) and looks for it in the box. When the agent is not in a turn and the character does not show at once, Collie looks twice more over about 3 seconds. Claude Code with a subagent running (the agents footer under the box, `● main` and `◯ general-purpose`) can take longer than that, so the send is refused with "the probe character did not show in the box", and the character shows later. A send after that finds only those characters in the box. If the agent is still slow, the refusal says that the agent showed the keys late and to wait. Wait until the agent shows what you type at the desk without delay, then send again: Collie takes its own characters out of the box first, and then types your message. Nothing you typed is lost, and no Enter was pressed.
 
 **An update started from the phone stays at staging.** On Collie up to 1.6.0, an update tapped on
 the phone could stage the new version and then stop: the runner that performs the swap was never
@@ -299,8 +302,9 @@ login shell on that machine, run `bash -lc 'command -v claude'` (or the agent's 
 install the agent there, or fix the line in your shell's login file that adds it to the `PATH`, and
 reopen the page. On a crew, check the machine you picked: each member looks on its own disk.
 "this machine runs an older Collie" means update that member
-([Starting something on a machine](crew.md#starting-something-on-a-machine)). "needs Herdr" and
-"only on" a machine's name belong to the **New worktree** switch, not to an agent.
+([Starting something on a machine](crew.md#starting-something-on-a-machine)). A reason under the
+**New worktree** switch belongs to the switch, not to an agent: that machine has no git, or its
+multiplexer cannot open a space.
 
 **Start says "There is no folder … on this machine", or "could not confirm the start".** The first
 means the folder is not on the machine that runs the start, so nothing started. A name with no leading `/` or

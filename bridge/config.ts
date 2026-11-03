@@ -22,6 +22,7 @@ import type { JournalRoots, ModelCatalogs } from "./journal/registry.ts";
 import { resolveMux } from "./mux/herdr-core/pick.ts";
 import { DEFAULT_MUX, muxEndpointVar } from "./mux/registry.ts";
 import { DEFAULT_MAX_UPLOAD_MB } from "./uploads.ts";
+import { PAIR_LIMIT } from "./walky/rate.ts";
 
 // All bridge configuration, resolved once at startup. Env-driven so the systemd unit and the
 // plugin launcher can configure it without code changes. Defaults are safe for a single-user,
@@ -465,6 +466,12 @@ export interface Config {
    */
   walky: boolean;
   /**
+   * The walky talky pair cap (`COLLIE_WALKY_PAIR_LIMIT`): messages in ten minutes between the same two
+   * panes, either direction, counted by this bridge alone. 6 by default, 1 to 100; a value outside that
+   * range, or one that is not an integer, warns and takes the default.
+   */
+  walkyPairLimit: number;
+  /**
    * Whether `tailscale serve` is bypassed (COLLIE_SKIP_SERVE=1) because an operator-run reverse
    * proxy (Caddy/Nginx) fronts the loopback bridge instead. The bridge itself handles every request
    * identically either way — this flag only informs the startup warnings: without `tailscale serve`
@@ -622,14 +629,17 @@ export function resolveJournalRoots(
       join(env.CODEX_HOME ?? join(home, ".codex"), "sessions"),
       env,
     ),
-    // TWO defaults, one adapter: Oh My Pi ships as `omp` and writes pi's own format into
-    // `~/.omp/agent/sessions`, so a host that runs it has a second home for the same log format.
-    // `PI_CODING_AGENT_DIR`, when the operator set it, is the one answer and neither is added.
+    // Pi, Oh My Pi and bundled Gentle Shell keep the same journal format in separate homes.
+    // An explicit Pi home still replaces the defaults; COLLIE_PI_ROOT can name several homes.
     pi: envRoots(
       "COLLIE_PI_ROOT",
       env.PI_CODING_AGENT_DIR
         ? join(env.PI_CODING_AGENT_DIR, "sessions")
-        : [join(home, ".omp", "agent", "sessions"), join(home, ".pi", "agent", "sessions")],
+        : [
+            join(home, ".omp", "agent", "sessions"),
+            join(home, ".pi", "agent", "sessions"),
+            join(home, ".gentle-shell", "agent", "sessions"),
+          ],
       env,
     ),
     // OpenCode keeps one SQLite database at the top of its XDG data dir, not per-session files.
@@ -833,6 +843,7 @@ export function loadConfig(
     surfaceShadow: envBool("COLLIE_SURFACE_SHADOW", false, env),
     sendProtocol: envBool("COLLIE_SEND_PROTOCOL", true, env),
     walky: envBool("COLLIE_WALKY", true, env),
+    walkyPairLimit: envInt("COLLIE_WALKY_PAIR_LIMIT", PAIR_LIMIT, { min: 1, max: 100 }, env),
     skipServe: envBool("COLLIE_SKIP_SERVE", false, env),
     basePath: normaliseBasePath(env.COLLIE_BASE_PATH),
   };

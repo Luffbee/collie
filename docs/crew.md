@@ -265,6 +265,9 @@ A deputy is one peer the lead named ahead of time. It binds a standby door with 
 that door is never published. The lead's silence arms it, and your own pairing credential spends it,
 so the phone can reach the deputy while the lead is gone.
 
+The deputy keeps the crew's rows too: a read-only copy of the lead's launcher rows, which the New
+screen offers once the deputy takes over.
+
 ## Durable agents in a crew
 
 A member's durable agents show on the lead's phone, in the one Durable agents section, and the member's own
@@ -315,6 +318,11 @@ member that sent it. Run `collie walky status <id>` on the sender's machine or o
 On the phone, a pane on a member shows its messages as a lead's own pane does. The lead reads the
 list from that member's log, so the cards and the Messages sheet look the same on every machine
 ([On the phone](walky-talky.md#on-the-phone)).
+
+On the phone, a message names the sessions and senders in it by name. In the terminal and in `collie walky who`,
+the same message carries addresses and ids. The walky talky skill asks an agent to write the full address of
+any session it names, as `who` prints it, never a bare pane id, a window id or a label alone, so both
+read well.
 
 > **Note.** A member needs Collie 1.23.0 to take a message and to show its messages on the phone. A
 > message to an older member is refused `not sent: older member`, and a member under an older lead
@@ -510,12 +518,16 @@ command and the folder you pick all belong to the machine you picked, and that m
   agent installed through nvm or in a home folder counts. An agent a machine lacks stays in the
   select, disabled, marked "not installed". The same agent can be ready on one machine and greyed out
   on the next.
-- **Each machine reads its own launchers.** The rows in `launchers.toml`, and the rows a phone added
-  there, are not shared across the crew
-  ([Your own launchers](configure.md#your-own-launchers)). Its folders list, the Recent and Favourite
-  rows, is its own too, and the page checks the folder on that machine's disk.
-- **A New worktree is made on the lead only.** On a member the switch stays, off, and says "only on"
-  the lead's name.
+- **The lead's launcher rows are the crew's rows.** The rows in the lead's `launchers.toml`, and the
+  rows a phone added there, show on every machine you pick, and a tap starts the row on that machine.
+  A machine's own rows are its additions, and its own row wins on the same command. The page checks
+  each row where it would run: a missing agent or a missing folder reads unavailable
+  ([Your own launchers](configure.md#your-own-launchers)). A row you add from the phone goes to the
+  lead. The folders list, the Recent and Favourite rows, stays each machine's own, and the page
+  checks the folder on that machine's disk.
+- **A New worktree is made on the machine you pick.** That machine needs git and a multiplexer
+  that opens a space. Herdr, the Herdr core, tmux, tuios and tern open one; zellij does not. When
+  the machine cannot, the switch stays, off, and says why.
 - **A member from before 1.19.0 starts nothing by name.** The page lists its choices, disabled, with
   the reason "this machine runs an older Collie". Update the member to start agents on it
   ([Update, from the phone or the terminal](upgrading.md#update-from-the-phone-or-the-terminal)).

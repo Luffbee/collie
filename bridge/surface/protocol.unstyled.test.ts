@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HerdrCoreMux } from "../mux/herdr-core/adapter.ts";
 import type { WireRead } from "../mux/herdr-core/client.ts";
-import { FakeHcCore, KEY_HOLD_MS, ManualClock, type FakeInput } from "../mux/herdr-core/fake-core.ts";
+import { FakeHcCore, ManualClock, type FakeInput } from "../mux/herdr-core/fake-core.ts";
 import { parseAnsi } from "../../web/src/lib/ansi.ts";
 import { lineText, splitLines } from "../../web/src/lib/blocks.ts";
 import { loadProfiles, profileFor } from "../../web/src/lib/surface/profile.ts";
@@ -190,20 +190,20 @@ describe.each(HARNESSES)("$id: an unstyled idle frame on a plain-text core", (ha
     expect(fake.writes().filter((w) => w.kind === "text").map((w) => w.payload[0])).toContain("hello there");
   });
 
-  test("the core's 3 s key hold lands inside the probe's budget: still sent, and the hold is the writes' cost, not the reads'", async () => {
+  test("the core's 3 s key hold never applies: the probe's Backspace and the Enter are raw input (herdr-core#52), so sent with no hold in the gaps", async () => {
     const { send, program } = rig(harness, { answer: "late" });
     const answer = await send("hello there");
     expect(answer.receipt).toMatchObject({ outcome: "sent", profileId: harness.id });
     expect(program.submitted).toEqual(["hello there"]);
-    expect(answer.receipt?.gapsMs.probeWrite ?? 0).toBeGreaterThanOrEqual(KEY_HOLD_MS - BOUNDS.probe.ms);
-    expect(answer.receipt?.gapsMs.probe ?? 0).toBeLessThan(BOUNDS.probe.ms);
+    expect(answer.receipt?.gapsMs.probeWrite ?? 0).toBeLessThan(BOUNDS.probe.ms);
   });
 
-  test("a key that reaches the program later than the probe's read budget after its answer: refused probe_failed, nothing submitted", async () => {
+  // omp and pi submit with ctrl+q, a named key, which still waits out the hold.
+  test.if(harness.id === "claude")("a hold that would answer early and deliver keys 5 s later delays nothing: no key of a one-line send goes by name", async () => {
     const { send, program } = rig(harness, { answer: "early", ms: 5000 });
     const answer = await send("hello there");
-    expect(answer.receipt).toMatchObject({ outcome: "refused", reason: "probe_failed" });
-    expect(program.submitted).toEqual([]);
+    expect(answer.receipt).toMatchObject({ outcome: "sent", profileId: harness.id });
+    expect(program.submitted).toEqual(["hello there"]);
   });
 });
 
@@ -250,6 +250,7 @@ describe("a screen the core marks partial decides nothing", () => {
     expect(answer.receipt?.outcome).not.toBe("sent");
     expect(program.submitted).toEqual([]);
     expect(fake.writes().flatMap((w) => (w.kind === "keys" ? w.payload : []))).not.toContain("enter");
+    expect(fake.writes().some((w) => w.kind === "text" && w.payload.some((t) => t.includes("\r")))).toBe(false);
   });
 });
 

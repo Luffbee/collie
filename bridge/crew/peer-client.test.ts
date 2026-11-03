@@ -224,6 +224,12 @@ describe("crewUrl — an address is a machine, never a URL with extras", () => {
     );
   });
 
+  test("a list param rides the query once per value (ADR 0127's folder questions)", () => {
+    expect(crewUrl("laptop.example", "launchers", { cwd: ["~/a", "/srv/b"], session: "work" })).toBe(
+      "https://laptop.example/crew/v1/launchers?cwd=%7E%2Fa&cwd=%2Fsrv%2Fb&session=work",
+    );
+  });
+
   test("an address carrying a path, query, fragment or credentials is refused", () => {
     for (const bad of [
       "laptop.example:8787/evil",
@@ -1430,6 +1436,31 @@ describe("PeerClient — pairing_label_collision, the other 409 (§18.14)", () =
     const { fetch } = replying(collisionBody({ code: undefined }), { status: 409, protocol: OURS });
     const outcome = await client(fetch).pairing(laptop, sync);
     expect(outcome.ok === false && outcome.state).toBe("incompatible");
+  });
+});
+
+describe("PeerClient — the launcher copy to the deputy (ADR 0127 point 5)", () => {
+  const rows = [{ command: "make test", label: "Tests", kind: "command" as const, noPrompts: false }];
+
+  test("a 2xx is applied, and the body is `{ rows }` on the launchers-copy route", async () => {
+    const { fetch, calls } = replying({ rows: 1, applied: true });
+    expect(await client(fetch).launchersCopy(laptop, rows)).toBe("applied");
+    expect(calls[0]?.url).toContain("/crew/v1/launchers-copy");
+    expect(calls[0]?.init.method).toBe("POST");
+    expect(JSON.parse(String(calls[0]?.init.body))).toEqual({ rows });
+  });
+
+  test("a 404 is a deputy before the route: its router answers an unknown path so", async () => {
+    expect(await client(replying({ error: "not found" }, { status: 404, protocol: OURS }).fetch).launchersCopy(laptop, rows)).toBe("no_route");
+  });
+
+  test("any other answer, or none, is a failure the next sweep decides again", async () => {
+    expect(await client(replying({ error: "x" }, { status: 400, protocol: OURS }).fetch).launchersCopy(laptop, rows)).toBe("failed");
+    expect(await client(replying("", { status: 401, protocol: OURS }).fetch).launchersCopy(laptop, rows)).toBe("failed");
+    const dead: CrewFetch = async () => {
+      throw new Error("ECONNREFUSED");
+    };
+    expect(await client(dead).launchersCopy(laptop, rows)).toBe("failed");
   });
 });
 

@@ -111,6 +111,12 @@ The durable agents one Collie runs beside its multiplexer are not in `config.tom
 To read history from multiple agent home directories, provide a comma-separated list in
 `COLLIE_TRANSCRIPT_ROOT`.
 
+Pi-format journals default to `~/.omp/agent/sessions`, `~/.pi/agent/sessions` and
+`~/.gentle-shell/agent/sessions`. An explicit `PI_CODING_AGENT_DIR` replaces those
+homes; `COLLIE_PI_ROOT` can name a comma-separated list of session directories.
+Gentle Shell keeps the sessions of the pi it bundles in the last of these, so they open in
+Chat with no setting.
+
 [`docs/deployment.md`](deployment.md) covers custom domains and reverse proxies. Collie enforces a
 same-origin policy, so any custom hostname or external TLS terminator must be explicitly
 allowlisted:
@@ -118,6 +124,9 @@ allowlisted:
 ```bash
 COLLIE_ALLOWED_ORIGINS=https://collie.example.com
 ```
+
+A browser request from a loopback origin, such as `http://localhost:5173`, passes only when it names
+the bridge's own host and port, or when you list that origin here too.
 
 Without this setting, the UI will load as an empty page. See
 [Troubleshooting](troubleshooting.md#troubleshooting) for details.
@@ -457,6 +466,7 @@ Where the row opens depends on where you start it, not on the row. From the **Ne
 then the row in the Command select), Start creates a new Space named after its folder, and the
 row's label names the tab. From a **pane** — the switcher sheet you reach by
 swiping up — a tap opens a new **tab in that pane's own Space**, beside it, named after the row.
+If you later rename that pane from the phone, a tab that holds only that pane takes the new name too. A tab with more panes keeps its name.
 
 Either way the bridge types the `command` into the fresh shell and sends Enter. The command owns
 its own lifetime: one that closes itself takes the Space or tab with it, and `htop` stays until you
@@ -471,8 +481,9 @@ landing at the top of one.
 
 This file and the rows added from a phone (below) are the allowlist. `POST /api/launch` accepts
 only a `command` that matches one of those rows exactly, an agent id from the machine's own list (the
-machine types that agent's command itself), or a plain shell. Changes apply immediately without a
-restart, but an already-open tab re-reads the rows only on its next load.
+machine types that agent's command itself), or a plain shell. A phone names a row and never sends a
+line. Changes apply immediately without a restart, but an already-open tab re-reads the rows only on
+its next load.
 
 Two optional keys tell the phone more about a row:
 
@@ -500,8 +511,17 @@ A row with a fixed folder shows it, shortened under home; a cwd-less row says "h
 (the dashboard already implies home, so it says nothing there). Declare no rows and neither section
 appears.
 
-On a crew (several machines, one phone-facing lead), each machine reads its own copy of this file —
-a row launches on whichever machine's dashboard or pane you tapped it from, not on the lead.
+On a crew (several machines, one phone-facing lead), the lead's rows are the crew's rows. The New
+page offers them on every machine you pick, and a tap starts the row on the machine you picked. The
+lead sends the row to that machine over the crew link, and only the lead can: a machine refuses a row
+that a phone sends to it directly. A machine's own `launchers.toml` still works. Its rows are that
+machine's additions, and on the same `command` its own row wins, with its own `cwd`.
+
+Each row is checked where it would run. A row whose agent is not installed there reads unavailable,
+"not installed". A row with a fixed `cwd` that does not exist there reads unavailable, "no folder".
+A `~` in a `cwd` is the home folder of the machine that runs the row. A machine that runs a Collie
+from before this rule lists the lead's rows without the folder check, and refuses to start one until
+it updates ([Upgrading](upgrading.md#launcher-rows-in-a-crew)).
 
 The **Agent** select on the New page is Collie's own list: Claude Code, Codex, opencode, pi, omp,
 Grok, Hermes, Kiro, Muse, Antigravity and dsh-TUI. Kiro starts with its tool permissions left as you set
@@ -514,17 +534,21 @@ To verify, reload the dashboard and look under the herd. If a row fails to load,
 
 ### Launchers added from a phone
 
-A phone can add its own rows on a machine. They are kept in that machine's state folder, in
-`launchers-added.json`, never in `launchers.toml`, and never copied to another machine.
+A phone can add its own rows. They are kept in the lead's state folder, in `launchers-added.json`,
+never in `launchers.toml`. On a crew a row you add is the crew's row, not one machine's: it shows on
+every machine, whichever machine the New page had picked. Add, Rename and Remove are always answered
+by the lead. The deputy keeps a read-only copy of the lead's rows and serves them if it takes over
+([The deputy](crew.md#how-a-crew-is-wired)). A solo install is its own lead.
 
 On the New page, tap **Add your own** under the **Agent** select or under the **Command** select.
-It opens the page `/new/add` for the machine chosen there. Pick **Agent** or **Command** at the top.
+It opens the page `/new/add`. The machine chosen on the New page stays where the first run lands. Pick **Agent** or **Command** at the top.
 An agent has two ways: a **recipe** (a harness, option chips, and the exact line Collie will type)
 and **Write a command**. A command row is always written by hand. **Add** returns to the New page
-with the new row chosen. Below the form, **Added on this machine** lists every row a phone added
-there, with **Rename** and **Remove**, and the rows from `launchers.toml` with a lock and no
-actions. **How adding works** opens a short explainer with this machine's `launchers.toml` path and
-an example row you can copy.
+with the new row chosen. Below the form, **Added for the crew** lists every row a phone added on
+the lead, with **Rename** and **Remove**, and the rows from `launchers.toml` with a lock and no
+actions. A row that a member held from before this rule stays on that member and shows without
+**Rename** or **Remove**. **How adding works** opens a short explainer with the lead's `launchers.toml`
+path and an example row you can copy.
 
 ```toml
 [phone]
@@ -561,14 +585,14 @@ machine, and **Add** stays off. With it, **Check the line** shows the line with 
 character written as its code (for example `⟨U+200B⟩`) before **Add** turns on. It is at most 200 characters, and the bridge refuses a control character, a line
 or paragraph separator and a bidi control in it, both when it is added and each time it is read.
 
-A machine keeps at most 20 added rows. If a row has the same line as a row in `launchers.toml`, the
+The lead keeps at most 20 added rows. If a row has the same line as a row in `launchers.toml`, the
 row in `launchers.toml` wins. Each added row records the paired device that added it. Revoking that
 device removes its rows, from the phone or with `collie devices revoke`, and the audit log records
 every add, rename and removal.
 
 > **Caution.** A row that skips permission prompts carries a "No prompts" badge. Each device asks
 > once before it first starts that row, and shows the command, the folder and the machine. Set
-> `adds = false` to turn off every phone-added row on a machine.
+> `adds = false` on the lead to turn off every phone-added row.
 
 ### Reaching a durable agent (experimental)
 
@@ -613,7 +637,7 @@ On the New page, switch to **Shell**. The **Command** select then ends with two 
 **Recent** group, which lists the lines in that machine's history, and **Type a command…**. Pick
 **Type a command…** and a text field appears right under the select. Type the line and tap **Start**
 (or the return key, which reads **Go**). The line above **Start** says what runs and where, for
-example "Runs `htop` in ~/projects on bluefin". The worktree switch stays off for a one-off line.
+example "Runs `htop` in ~/projects on desk". The worktree switch stays off for a one-off line.
 
 Before the first run, Collie asks the machine to check the line. The check runs nothing and keeps
 nothing. If the line carries a flag that skips permission prompts, such as
@@ -791,10 +815,22 @@ Collie saves the file under `<state-dir>/uploads` with owner-only permissions an
 absolute path to your draft. The agent reads it from that path, because a terminal cannot take a
 pasted file. Uploads are swept 48 hours after they are written.
 
-A picked or pasted photo opens a sheet with a preview first. **Attach** sends the original file,
-untouched. **Edit** opens the tools Crop, Draw, Circle and Arrow, and a photo you changed goes up as
-a PNG. A tap on a photo's thumbnail in the composer opens the same tools, and the edited photo takes
-its place. A photo the browser cannot show attaches as it is, with no error.
+To mark up a photo before you send it:
+
+1. Pick a photo with the paperclip, or paste one into the message box.
+2. Look at the preview sheet that opens.
+3. Tap **Edit** to open the tools, or tap **Attach** to send the original as it is and stop here.
+4. Use **Crop**, **Draw**, **Circle** or **Arrow** on the photo.
+5. Tap **Undo** or **Redo** to step through your changes, or **Reset** to start over.
+6. Tap **Use this image**.
+
+The photo joins your draft as a thumbnail, and its marker, such as `[Image #1]`, stands in your text.
+A tap on the thumbnail opens the tools again. The edited photo then takes the place of the first one
+under the same number. **Cancel** closes the sheet and attaches nothing.
+
+**Use this image** with no change sends the original, the same as **Attach**. A photo you changed
+goes up as a PNG. A photo the browser cannot show attaches as it is, with no error. A browser with no
+canvas skips the sheet and attaches the photo as it is, and its thumbnail has no tools.
 
 | Setting | Default | What it does |
 | --- | --- | --- |

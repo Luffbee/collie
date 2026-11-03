@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,6 +11,7 @@ import {
   parsePiTranscript,
   piJournal,
   PiTranscriptSource,
+  piSessionFolderNames,
   resolveBlobPath,
   imageTooLargeNote,
   MAX_INLINE_IMAGE_CHARS,
@@ -1036,6 +1037,103 @@ describe("PiTranscriptSource — several sessions roots", () => {
   });
 });
 
+describe("PiTranscriptSource — a pane that names no session finds it by its folder (M79 spec 02)", () => {
+  // A multiplexer without pi's Herdr integration (herdr-core, tmux, zellij) gives the pane's folder only.
+  const ONE = "019f4665-7df0-7540-a64f-7068335f2101";
+  const TWO = "019f4665-7df0-7540-a64f-7068335f2102";
+  const OLD = "019f4665-7df0-7540-a64f-7068335f2103";
+
+  /** pi's session row, as the first row (pi) or after Oh My Pi's 256-byte title row. */
+  const sessionRow = (id: string, cwd: string) => JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-10-30T10:00:00.000Z", cwd });
+  const ompTitle = JSON.stringify({ type: "title", v: 1, title: "", updatedAt: "2026-10-30T10:00:00.000Z", pad: " ".repeat(180) });
+
+  async function fixture() {
+    const created = `${tmpdir()}/collie-pi-discover-${Math.floor(performance.now() * 1000)}`;
+    await mkdir(created, { recursive: true });
+    const base = await realpath(created);
+    const places = { home: join(base, "home"), tmp: join(base, "tmp") };
+    const piRoot = join(base, "pi-sessions");
+    const ompRoot = join(base, "omp-sessions");
+    /** Write one log into `root/folder`, its mtime `age` seconds ago. */
+    const log = async (root: string, folder: string, id: string, head: string, age: number) => {
+      const path = join(root, folder, `2026-10-30T10-00-00-000Z_${id}.jsonl`);
+      await mkdir(join(root, folder), { recursive: true });
+      await Bun.write(path, `${head}\n${speech("m1", "user", "hello")}\n`);
+      const when = new Date(Date.now() - age * 1000);
+      await utimes(path, when, when);
+      return path;
+    };
+    return { base, places, piRoot, ompRoot, log };
+  }
+
+  test("pi: the one log filed for the pane's folder is the pane's session", async () => {
+    const f = await fixture();
+    const cwd = "/srv/lab/proj";
+    const path = await f.log(f.piRoot, "--srv-lab-proj--", ONE, sessionRow(ONE, cwd), 5);
+    const src = new PiTranscriptSource([f.ompRoot, f.piRoot], f.places);
+    const ref = await src.discoverSession(cwd);
+    expect(ref).toEqual({ kind: "id", value: ONE });
+    expect(await src.resolve(ref ?? { kind: "id", value: "" })).toBe(path);
+    await rm(f.base, { recursive: true, force: true });
+  });
+
+  test("omp: a home folder's log (`-<relative>`, title row first) and a temp folder's (`-tmp-<relative>`) both resolve", async () => {
+    const f = await fixture();
+    const inHome = join(f.places.home, ".cache", "lab");
+    const inTmp = join(f.places.tmp, "lab");
+    await f.log(f.ompRoot, "-.cache-lab", ONE, `${ompTitle}\n${sessionRow(ONE, inHome)}`, 5);
+    await f.log(f.ompRoot, "-tmp-lab", TWO, `${ompTitle}\n${sessionRow(TWO, inTmp)}`, 5);
+    const src = new PiTranscriptSource([f.ompRoot, f.piRoot], f.places);
+    expect(await src.discoverSession(inHome)).toEqual({ kind: "id", value: ONE });
+    expect(await src.discoverSession(inTmp)).toEqual({ kind: "id", value: TWO });
+    await rm(f.base, { recursive: true, force: true });
+  });
+
+  test("a log whose session row names another cwd is skipped, even when it is newer", async () => {
+    // `/srv/lab-proj` and `/srv/lab/proj` share the folder name `--srv-lab-proj--`.
+    const f = await fixture();
+    await f.log(f.piRoot, "--srv-lab-proj--", TWO, sessionRow(TWO, "/srv/lab-proj"), 1);
+    await f.log(f.piRoot, "--srv-lab-proj--", ONE, sessionRow(ONE, "/srv/lab/proj"), 60);
+    const src = new PiTranscriptSource(f.piRoot, f.places);
+    expect(await src.discoverSession("/srv/lab/proj")).toEqual({ kind: "id", value: ONE });
+    expect(await src.discoverSession("/srv/lab-proj")).toEqual({ kind: "id", value: TWO });
+    expect(await src.discoverSession("/srv/elsewhere")).toBeNull();
+    await rm(f.base, { recursive: true, force: true });
+  });
+
+  test("of two logs for one folder the newest written wins (a resumed session is being written)", async () => {
+    const f = await fixture();
+    const cwd = "/srv/proj";
+    await f.log(f.piRoot, "--srv-proj--", OLD, sessionRow(OLD, cwd), 2);
+    await f.log(f.piRoot, "--srv-proj--", ONE, sessionRow(ONE, cwd), 300);
+    expect(await new PiTranscriptSource(f.piRoot, f.places).discoverSession(cwd)).toEqual({ kind: "id", value: OLD });
+    await rm(f.base, { recursive: true, force: true });
+  });
+
+  test("a pi or omp neighbour in the folder, an unknown cwd or a relative one: no session", async () => {
+    const f = await fixture();
+    const cwd = "/srv/proj";
+    await f.log(f.piRoot, "--srv-proj--", ONE, sessionRow(ONE, cwd), 5);
+    const adapter = piJournal(f.piRoot);
+    const src = new PiTranscriptSource(f.piRoot, f.places);
+    expect(adapter.sharedFolderBlind).toBe(true);
+    expect(await adapter.discover?.(cwd, { shared: true })).toBeNull();
+    expect(await src.discoverSession(cwd, { shared: true })).toBeNull();
+    expect(await src.discoverSession("")).toBeNull();
+    expect(await src.discoverSession("srv/proj")).toBeNull();
+    await rm(f.base, { recursive: true, force: true });
+  });
+
+  test("the folder names pi and Oh My Pi file a cwd under", () => {
+    const places = { home: "/home/dev", tmp: "/tmp" };
+    expect(piSessionFolderNames("/srv/a", places)).toEqual(["--srv-a--"]);
+    expect(piSessionFolderNames("/home/dev/projects/x", places)).toEqual(["--home-dev-projects-x--", "-projects-x"]);
+    expect(piSessionFolderNames("/home/dev", places)).toEqual(["--home-dev--", "-"]);
+    expect(piSessionFolderNames("/tmp/lab", places)).toEqual(["--tmp-lab--", "-tmp-lab"]);
+    expect(piSessionFolderNames("/tmp", places)).toEqual(["--tmp--", "-tmp"]);
+  });
+});
+
 describe("resolveImageUrl — only this collie's own blobs and inline images", () => {
   const hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1763,5 +1861,100 @@ describe("the pi probe — the session cost", () => {
       await Bun.write(log, `${[header(), ...rows].join("\n")}\n`);
       expect(await probe()).toBeCloseTo(20, 6);
     });
+  });
+});
+
+describe("PiTranscriptSource: a log older than the harness process is not the pane's (M79 spec 06)", () => {
+  const OLD = "019f4665-7df0-7540-a64f-7068335f2111";
+  const NEW = "019f4665-7df0-7540-a64f-7068335f2112";
+  const cwd = "/srv/stale";
+  /** The old log started at 10:00:00 and was last written at 10:30:00. */
+  const OLD_START = Date.parse("2026-10-30T10:00:00.000Z");
+  const OLD_WRITTEN = Date.parse("2026-10-30T10:30:00.000Z");
+
+  const sessionRow = (id: string) =>
+    JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-10-30T10:00:00.000Z", cwd });
+
+  async function fixture() {
+    const created = `${tmpdir()}/collie-pi-stale-${Math.floor(performance.now() * 1000)}`;
+    await mkdir(created, { recursive: true });
+    const base = await realpath(created);
+    const places = { home: join(base, "home"), tmp: join(base, "tmp") };
+    const root = join(base, "pi-sessions");
+    /** One log named from its start time, last written at `writtenMs`. */
+    const log = async (id: string, startMs: number, writtenMs: number) => {
+      const stamp = new Date(startMs).toISOString().replaceAll(":", "-").replace(".", "-");
+      const path = join(root, "--srv-stale--", `${stamp}_${id}.jsonl`);
+      await mkdir(join(root, "--srv-stale--"), { recursive: true });
+      await Bun.write(path, `${sessionRow(id)}\n`);
+      await utimes(path, new Date(writtenMs), new Date(writtenMs));
+    };
+    /** A source whose pid 4242 started at `startMs`; any other pid is unreadable. */
+    const source = (startMs: number | null) =>
+      new PiTranscriptSource(root, places, { processStartMs: async (pid) => (pid === 4242 ? startMs : null) });
+    return { base, log, source };
+  }
+
+  const withPid = { processes: [{ argv: ["pi"], pid: 4242 }] };
+
+  test("an older log and a pid that started after it: no session", async () => {
+    const f = await fixture();
+    await f.log(OLD, OLD_START, OLD_WRITTEN);
+    expect(await f.source(Date.parse("2026-10-30T12:00:00.000Z")).discoverSession(cwd, withPid)).toBeNull();
+    await rm(f.base, { recursive: true, force: true });
+  });
+
+  test("the same log and a pid that started before it: the log", async () => {
+    const f = await fixture();
+    await f.log(OLD, OLD_START, OLD_WRITTEN);
+    expect(await f.source(OLD_START - 60_000).discoverSession(cwd, withPid)).toEqual({ kind: "id", value: OLD });
+    await rm(f.base, { recursive: true, force: true });
+  });
+
+  test("no pid, or a start that cannot be read: the newest log as before", async () => {
+    const f = await fixture();
+    await f.log(OLD, OLD_START, OLD_WRITTEN);
+    const late = f.source(Date.parse("2026-10-30T12:00:00.000Z"));
+    expect(await late.discoverSession(cwd)).toEqual({ kind: "id", value: OLD });
+    expect(await late.discoverSession(cwd, { processes: [{ argv: ["pi"] }] })).toEqual({ kind: "id", value: OLD });
+    expect(await f.source(null).discoverSession(cwd, withPid)).toEqual({ kind: "id", value: OLD });
+    await rm(f.base, { recursive: true, force: true });
+  });
+
+  test("the slack admits a log that started one second after the process", async () => {
+    const f = await fixture();
+    const processStart = Date.parse("2026-10-30T12:00:00.000Z");
+    await f.log(NEW, processStart + 1000, processStart + 1000);
+    expect(await f.source(processStart).discoverSession(cwd, withPid)).toEqual({ kind: "id", value: NEW });
+    await rm(f.base, { recursive: true, force: true });
+  });
+
+  test("the slack admits a log that started 4 s before the process and refuses one 6 s before", async () => {
+    const f = await fixture();
+    const processStart = Date.parse("2026-10-30T12:00:00.000Z");
+    await f.log(NEW, processStart - 4000, processStart - 4000);
+    expect(await f.source(processStart).discoverSession(cwd, withPid)).toEqual({ kind: "id", value: NEW });
+    await rm(f.base, { recursive: true, force: true });
+    const g = await fixture();
+    await g.log(NEW, processStart - 6000, processStart - 6000);
+    expect(await g.source(processStart).discoverSession(cwd, withPid)).toBeNull();
+    await rm(g.base, { recursive: true, force: true });
+  });
+
+  test("an older log the harness is writing now (a resumed session) is still the pane's", async () => {
+    const f = await fixture();
+    const processStart = Date.parse("2026-10-30T12:00:00.000Z");
+    await f.log(OLD, OLD_START, processStart + 20_000);
+    expect(await f.source(processStart).discoverSession(cwd, withPid)).toEqual({ kind: "id", value: OLD });
+    await rm(f.base, { recursive: true, force: true });
+  });
+
+  test("of an older and a newer log, the newer one is taken once the process has started between them", async () => {
+    const f = await fixture();
+    const processStart = Date.parse("2026-10-30T12:00:00.000Z");
+    await f.log(OLD, OLD_START, OLD_WRITTEN);
+    await f.log(NEW, processStart + 2000, processStart + 9000);
+    expect(await f.source(processStart).discoverSession(cwd, withPid)).toEqual({ kind: "id", value: NEW });
+    await rm(f.base, { recursive: true, force: true });
   });
 });

@@ -65,7 +65,8 @@ import { MIRROR_INVERT, MIRROR_SPACE } from "@/components/mirror-space";
 import { StatusDot } from "@/components/status-badge";
 import { WalkyCard } from "@/components/walky-card";
 import { WalkyIds } from "@/components/walky-id-chip";
-import { useWalkyLog, useWalkyReads, useWalkySelf } from "@/components/walky-log";
+import { useWalkyLive, useWalkyLog, useWalkyReads, useWalkySelf } from "@/components/walky-log";
+import { sentTargetWords } from "@/components/walky-name-chip";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
 import { Collapse } from "@/components/ui/collapse";
@@ -86,7 +87,6 @@ import {
   shellLineOf,
   stateWord,
   standingOf,
-  targetWord,
   type EnvelopeHeader,
   type WalkyCommand,
   type WalkyRow,
@@ -428,10 +428,10 @@ export const ItemView = memo(function ItemView({ item }: { item: ChatItem }) {
     case "image":
       return <ChatImage url={item.url} alt={t("transcript.attachmentAlt")} />;
     case "tool":
-      if (item.image === undefined) return <ToolCard tool={item.tool} status={item.status} waiting={waiting} />;
+      if (item.image === undefined) return <ToolCard tool={item.tool} status={item.status} waiting={waiting} callId={item.id} />;
       return (
         <div className="flex flex-col gap-1.5">
-          <ToolCard tool={item.tool} status={item.status} waiting={waiting} />
+          <ToolCard tool={item.tool} status={item.status} waiting={waiting} callId={item.id} />
           <ChatImage url={item.image} alt={t("transcript.toolImageAlt")} />
         </div>
       );
@@ -835,6 +835,8 @@ function WaitingArea({ waiting, line }: { waiting?: CardWaiting; line?: boolean 
 interface ToolCardProps {
   tool: ChatToolCall;
   status: ChatToolStatus;
+  /** The chat item's id. It is the card's identity: the subagent sheet keys its state by it. */
+  callId: string;
   waiting?: CardWaiting;
   preview?: boolean;
 }
@@ -877,6 +879,7 @@ function WalkyToolCard({ command, ...props }: ToolCardProps & { command: WalkyCo
   useLocale();
   const log = useWalkyLog();
   const self = useWalkySelf();
+  const live = useWalkyLive();
   const output = "output" in props.tool ? props.tool.output : undefined;
   let receipt: string | null = null;
   let inbox: WalkyRow | null = null;
@@ -886,7 +889,7 @@ function WalkyToolCard({ command, ...props }: ToolCardProps & { command: WalkyCo
     // A line "Message to <target>" is about a message this pane sent: a row that reached this pane is not one.
     if (standing?.standing === "held" && directionOf(standing.row, self) === "sent") {
       receipt = t("walky.composer.outcome", {
-        label: targetWord(standing.row.receipt.target),
+        label: sentTargetWords(standing.row, live, self),
         state: stateWord(standing.row.receipt),
       });
     }
@@ -915,6 +918,7 @@ export function ToolCard(props: ToolCardProps) {
 function ToolCardBody({
   tool,
   status,
+  callId,
   waiting,
   preview,
   walky,
@@ -924,7 +928,8 @@ function ToolCardBody({
   // `data-waiting` lets a host find the card of the thing it is waiting on (scroll to it, see if it
   // is on screen).
   const anchor = waiting?.id;
-  const subagentCardKey = anchor ?? (tool.kind === "task" ? `${tool.agent ?? ""}:${tool.summary}` : "");
+  // Two calls can share an agent and a summary, so the sheet keys by the item id, never by that text.
+  const subagentCardKey = callId;
   const taskAgent = tool.kind === "task" ? tool.agent : undefined;
   const taskSummary = tool.kind === "task" ? tool.summary : "";
   const taskAgentId = tool.kind === "task" ? tool.agentId : undefined;

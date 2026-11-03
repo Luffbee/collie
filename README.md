@@ -64,7 +64,7 @@ Prefer to have your agent do it? Ask it to run `collie skill` and follow the bri
 - **Push notifications** when an agent blocks on user input
 - **Quick actions and slash commands** configured per agent
 - **Keys board you arrange**: `Esc`, `Ctrl+C`, arrows and modifier combinations, plus wider keys, your own chords and sequences, sticky `Ctrl`/`Alt`/`Shift`, presets (Claude Code, Prefix, Vim) and a layout code to share
-- **Start from the phone**: a **+ New** button opens one page where you pick the machine, an agent or a command, the folder and an optional new worktree; each machine shows which agents it has, a lost reply never opens a second pane, and you can add your own launchers from the phone
+- **Start from the phone**: a **+ New** button opens one page where you pick the machine, an agent or a command, the folder and an optional new worktree; each machine shows which agents it has, a lost reply never opens a second pane, and your own launchers, the lead's and the ones you add from the phone, show on every machine of a crew
 - **Output search** and full conversation history beyond standard terminal scrollback
 - **LaTeX equations** in Chat, History and Markdown file previews, with inline and display math ([syntax](./docs/changes.md#equations))
 - **Files screen**: the files of an agent's workspace folder with the changes marked, and a Changes segment with what it changed in its git repos, as diffs with syntax colour, and its last commit, read-only
@@ -171,6 +171,7 @@ and that is the only way to install it on a phone.
 | --- | --- |
 | [**Install in five minutes**](./docs/five-minute-install.md) | The recommended setup, step by step: Tailscale, Herdr and Collie on your computer, then a paired phone with Collie on its home screen |
 | [**Claude Code in tmux or Herdr, on your phone**](./docs/claude-code-on-your-phone.md) | Keep Claude Code running in tmux or Herdr when SSH drops. Manage sessions, start new agents and worktrees, approve prompts, and send Esc or Ctrl from your phone with push alerts. |
+| [**Walky talky**](./docs/walky-talky.md) | Messages between agent sessions: `collie walky who`, `send`, `reply`, `inbox` and `status`, pane tokens, receipts, how a message crosses a crew and how its outcome comes back, the phone's cards and composer, installing the skill into your agents, and the limits |
 
 ### Sessions
 
@@ -203,7 +204,6 @@ and that is the only way to install it on a phone.
 | [**Deployment**](./docs/deployment.md) | Front doors other than the default: an identity-aware proxy, a reverse proxy with no Tailscale, an off-host ingress, several Collies on one host (one per user, or several instances for one user), and a crew's standby door |
 | [**Commands**](./docs/commands.md) | Every `collie` verb, the census verbs that show what a Collie knows (`status`, `mux list`, `sessions`, `crew status`), putting `collie` on your PATH, and the Herdr actions that mirror the verbs on a Herdr-managed install |
 | [**Crews**](./docs/crew.md) | Several machines' Collies behind one URL: invite, join, deputy, failover, and a machine that runs several Collies |
-| [**Walky talky**](./docs/walky-talky.md) | Messages between agent sessions: `collie walky who`, `send`, `reply`, `inbox` and `status`, pane tokens, receipts, how a message crosses a crew and how its outcome comes back, the phone's cards and composer, installing the skill into your agents, and the limits |
 | [**Voice input and Web Push**](./docs/voice-and-push.md) | The microphone in the composer, and notifications when an agent is waiting on you |
 | [**Manage & update**](./docs/upgrading.md) | Update from the phone or the terminal, roll back, update a crew, cross a major, stop, uninstall, and upgrading a 0.x install to 1.0 |
 | [**Troubleshooting**](./docs/troubleshooting.md) | Symptoms in the words you would actually search for |

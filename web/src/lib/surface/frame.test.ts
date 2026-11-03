@@ -694,6 +694,17 @@ describe("the interior walk on rules with no prompt glyph (M56 spec 14)", () => 
     expect(findInputFrame(lines(RULE, "  line one", "  line two", RULE, ...footer), PI)!.interior.text).toBe("line one line two");
   });
 
+  // M80 spec 04 (lab, pi 1.4.0, 2026-11-01): a message with rule rows of its own. Its last typed rule
+  // was read as the top edge, the box read `end`, and the send ended typed_not_submitted (mismatch).
+  it("reads rule rows the draft holds as draft rows: only a row as wide as the box is its edge", () => {
+    const typed = "─".repeat(20);
+    const frame = findInputFrame(lines("reply", RULE, "Reply with only OK.", typed, "some text", typed, "end", RULE, ...footer), PI)!;
+    expect(frame.top).toBe(1);
+    expect(frame.interior.text).toBe(`Reply with only OK. ${typed} some text ${typed} end`);
+    // A typed rule as wide as the box is still read as the edge: the reader cannot tell the two apart.
+    expect(findInputFrame(lines("reply", RULE, "some text", RULE, "end", RULE, ...footer), PI)!.interior.text).toBe("end");
+  });
+
   it("reads the Working label on the top rule", () => {
     const frame = findInputFrame(lines("reply", "── ⠴ Working ──────────────", "", RULE, ...footer), PI)!;
     expect(frame.label).toBe("⠴ Working");

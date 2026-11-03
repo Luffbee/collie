@@ -452,6 +452,10 @@ const WORKSPACE_KEYS = {
   // The space's own folder when the multiplexer keeps one (Changes view root, ADR 0065). Optional and
   // not a crew dimension: it is present on a solo instance whenever the mux reports it.
   folder: true,
+  // The branch of that folder and, for a worktree, the base it was cut from (M81 spec 06). Optional
+  // and absent when unknown; the baseline's spaces carry no folder, so the golden bodies carry neither.
+  gitHead: true,
+  base: true,
   // A crew dimension, and the SAME one a pane and a session carry: Herdr numbers spaces per machine,
   // so `(host, workspaceId)` is a space's identity in a crew and `workspaceId` alone collides. Like
   // `PaneWire.host` it is present exactly when `servers` is, which is never in this baseline — the
@@ -599,8 +603,10 @@ describe("solo zero-tax — wire shapes carry no crew dimension", () => {
     ]);
     expect(Object.keys(WORKSPACE_KEYS).toSorted()).toEqual([
       "activeTabId",
+      "base",
       "focused",
       "folder",
+      "gitHead",
       "host",
       "isWorktree",
       "label",
@@ -846,13 +852,15 @@ describe("solo zero-tax — routes", () => {
       // This host's own launcher rows, read live off its `launchers.toml` — a SOLO route that
       // legitimately extends this list, named here rather than exempted. Session-scoped and
       // read-gated through the same closure `/api/launch` rides, so a `?host=` call forwards to
-      // the peer that runs the rows rather than reading the lead's own file.
+      // the peer that runs the rows, and a lead adds its own rows to that answer (ADR 0127). A solo
+      // instance has no member to forward to, so its answer is its own rows alone.
       "/api/launchers",
-      // Rows a phone adds, removes and renames on THIS machine (ADR 0094) — three SOLO writes that
-      // legitimately extend this list, named here rather than exempted. Session-scoped and write-gated
-      // through the same closure `/api/launch` rides, so a `?host=` call lands in that member's own
-      // store. A fourth path, the crew's forget (`FORGET_DEVICE_PATH`), is refused on the browser path
-      // and served on the link only, so it registers no browser route here.
+      // Rows a phone adds, removes and renames (ADR 0094) — three SOLO writes that legitimately extend
+      // this list, named here rather than exempted. Write-gated through the same closure `/api/launch`
+      // rides, but since ADR 0127 point 4 they are NOT forwarded: the lead answers them from its own
+      // store whatever `?host=` says, so a phone adds for the whole crew. A fourth path, the crew's
+      // forget (`FORGET_DEVICE_PATH`), is refused on the browser path and served on the link only, so it
+      // registers no browser route here.
       "/api/launchers/added",
       "/api/launchers/added/remove",
       "/api/launchers/added/rename",
@@ -1020,6 +1028,7 @@ const CONFIG_KEYS = {
   surfaceShadow: true,
   sendProtocol: true,
   walky: true,
+  walkyPairLimit: true,
   accountWindows: true,
   skipServe: true,
   basePath: true,
@@ -1088,6 +1097,8 @@ describe("solo zero-tax — config", () => {
       "vapidSubject",
       // Walky talky (M62): whether this machine takes messages for its panes. A solo switch, on by default.
       "walky",
+      // The walky talky pair cap, messages per ten minutes between two panes on this machine. Default 6.
+      "walkyPairLimit",
       "zellijBin",
     ]);
     expect(keys.filter((k) => /crew|peer|lead|federat/i.test(k))).toEqual([]);
@@ -1176,6 +1187,7 @@ describe("solo zero-tax — config", () => {
       "COLLIE_VAPID_PUBLIC",
       "COLLIE_VAPID_SUBJECT",
       "COLLIE_WALKY",
+      "COLLIE_WALKY_PAIR_LIMIT",
       "COLLIE_ZELLIJ_BIN",
     ]);
   });
@@ -1347,6 +1359,10 @@ const CREW_STATE_DIR_ENTRIES = [
   // the boot path, no open, no rename; a solo instance finds nothing and says nothing.
   "pack-trust.json",
   "standby-devices.json",
+  // The lead's launcher rows, kept as a read-only copy on the DEPUTY (ADR 0127 point 5). The same
+  // structural reason as the registry above: it is written only by a `POST /crew/v1/launchers-copy`
+  // from this collie's own lead while a warrant names this machine, which a solo instance cannot reach.
+  "standby-launchers.json",
 ];
 
 /** Every `.ts` module under `dir`, recursively, excluding tests. */

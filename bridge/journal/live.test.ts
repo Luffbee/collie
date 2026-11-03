@@ -577,6 +577,91 @@ describe("a reset is a new numbering", () => {
   });
 });
 
+describe("a log rewritten in place at the same size (#642)", () => {
+  // The cursor already sits at the end, so a resume reads nothing and no reset fires. The fake's size
+  // is its row count, so swapping rows one for one is the equal-size rewrite.
+  test("a rewrite with a newer mtime rebuilds from one extra read", async () => {
+    const fx = fakeJournal([say("u1"), say("u2")]);
+    const live = windows(fx);
+    const one = await live.window(fx.adapter, ref(), { limit: 10 });
+    expect(fx.calls.readSince).toBe(1);
+
+    fx.state.lines = [say("w1"), say("w2")];
+    fx.state.mtimeMs += 1;
+    fx.settle();
+    const two = await live.window(fx.adapter, ref(), { limit: 10, after: { gen: one!.gen, rev: one!.rev } });
+    expect(two?.gen).not.toBe(one!.gen);
+    expect(two?.upserts.map((e) => [e.uuid, e.seq])).toEqual([
+      ["w1", SEQ_BASE],
+      ["w2", SEQ_BASE + 1],
+    ]);
+    // The resume that found nothing, then the fresh read that became the new generation.
+    expect(fx.calls.readSince).toBe(3);
+  });
+
+  test("an mtime touch over the same bytes keeps the rows and the generation", async () => {
+    const fx = fakeJournal([say("u1"), say("u2")]);
+    const live = windows(fx);
+    const one = await live.window(fx.adapter, ref(), { limit: 10 });
+
+    fx.state.mtimeMs += 1;
+    fx.settle();
+    const two = await live.window(fx.adapter, ref(), { limit: 10, after: { gen: one!.gen, rev: one!.rev } });
+    expect(two?.gen).toBe(one!.gen);
+    expect(two?.rev).toBe(one!.rev);
+    expect(two?.upserts).toEqual([]);
+    const all = await live.window(fx.adapter, ref(), { limit: 10 });
+    expect(all?.upserts.map((e) => [e.uuid, e.seq])).toEqual([
+      ["u1", SEQ_BASE],
+      ["u2", SEQ_BASE + 1],
+    ]);
+  });
+
+  test("a truncating rewrite still rebuilds from the reset alone", async () => {
+    const fx = fakeJournal([say("u1"), say("u2"), say("u3")]);
+    const live = windows(fx);
+    const one = await live.window(fx.adapter, ref(), { limit: 10 });
+
+    fx.state.lines = [say("w1")];
+    fx.state.mtimeMs += 1;
+    fx.state.rewound = true;
+    fx.settle();
+    const two = await live.window(fx.adapter, ref(), { limit: 10, after: { gen: one!.gen, rev: one!.rev } });
+    expect(two?.gen).not.toBe(one!.gen);
+    expect(two?.upserts.map((e) => e.uuid)).toEqual(["w1"]);
+    expect(fx.calls.readSince).toBe(2);
+  });
+
+  test("a plain append folds into the same generation", async () => {
+    const fx = fakeJournal([say("u1")]);
+    const live = windows(fx);
+    const one = await live.window(fx.adapter, ref(), { limit: 10 });
+
+    fx.append(say("u2"));
+    fx.settle();
+    const two = await live.window(fx.adapter, ref(), { limit: 10, after: { gen: one!.gen, rev: one!.rev } });
+    expect(two?.gen).toBe(one!.gen);
+    expect(two?.upserts.map((e) => [e.uuid, e.seq])).toEqual([["u2", SEQ_BASE + 1]]);
+    expect(fx.calls.readSince).toBe(2);
+  });
+
+  test("an older page after a compaction carries the generation the next poll answers with", async () => {
+    const fx = fakeJournal(thread(10));
+    const live = windows(fx);
+    const one = await live.window(fx.adapter, ref(), { limit: 10 });
+
+    // Compacted in place: every row is new and the row count, so the size, is unchanged.
+    fx.state.lines = thread(10).map((line) => line.replace(/"p(\d)/g, '"c$1'));
+    fx.state.mtimeMs += 1;
+    fx.settle();
+    const older = await live.older(fx.adapter, ref(), { seq: SEQ_BASE + 27, uuid: "c9" }, 3);
+    expect(older?.gen).not.toBe(one!.gen);
+    const next = await live.window(fx.adapter, ref(), { limit: 10, after: { gen: one!.gen, rev: one!.rev } });
+    expect(next?.gen).toBe(older!.gen);
+    expect(older?.upserts[0]?.uuid).toBe("c3");
+  });
+});
+
 // ── Older turns, off disk ────────────────────────────────────────────────────
 
 describe("older turns are read only when a reader asks", () => {

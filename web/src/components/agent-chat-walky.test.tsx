@@ -207,6 +207,7 @@ describe("the Chat card and the id chip open the Messages sheet on their message
     const sent: WalkyRow = {
       ...fixtureWalkySent,
       from: { ...fixtureWalkySent.from, address: `local/${agent.paneId}` },
+      to: "local/w6:p3",
       receipt: { ...fixtureWalkySent.receipt, target: "local/w6:p3" },
     };
     withJournal(turns.slice(1));
@@ -215,7 +216,7 @@ describe("the Chat card and the id chip open the Messages sheet on their message
     const dialog = await screen.findByRole("dialog", { name: "Messages" });
     const rows = [...dialog.querySelectorAll('[data-slot="walky-list-row"]')];
     expect(rows.map((r) => r.getAttribute("data-direction"))).toEqual(["sent", "received"]);
-    expect(within(dialog).getByText("To local/w6:p3")).toBeInTheDocument();
+    expect(within(dialog).getByText("Sent to local/w6:p3")).toBeInTheDocument();
     expect(within(dialog).getAllByRole("button", { name: /^Reply/ })).toHaveLength(1);
   });
 

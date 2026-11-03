@@ -145,6 +145,9 @@ zellij 0.44.2).
 
 > **Note.** Collie manages active sessions, but it does not create or restart them.
 
+Zellij has no **New worktree**. A worktree opens as a new space, and Collie cannot open one on
+zellij.
+
 Zellij 0.44 and later reports each pane's folder, so zellij panes get the Files button and show
 their branch. An older zellij reports no folder, and its panes have neither.
 
@@ -204,7 +207,7 @@ Some things work differently on tuios:
 - Show in terminal moves every terminal that shows the pane's tuios session, a tuios-web tab included.
   tuios cannot move a terminal to another tuios session. If no terminal shows the pane's tuios session,
   Collie refuses and names the tuios session the terminal shows.
-- The **New worktree** switch on the New page stays, off, and says it needs Herdr.
+- A **New worktree** opens as a new tuios session.
 
 ### herdr-core notes
 
@@ -250,15 +253,19 @@ What works:
 - History and Chat for a Claude pane, once `collie hooks install claude` is done. The core does not
   know the agent's conversation, so the hook supplies it from the terminal's `HC_TERMINAL_ID`. The
   hook never changes the agent name or the status the core reported.
+- History and Chat for a pi or Oh My Pi pane, with no hook. Collie finds the pane's session log from
+  the pane's folder: pi keeps one log folder per working directory, and the newest log whose header
+  names that folder is the pane's.
 
 What looks different on the core:
 
 - **The mirror has no colour.** The core hands out the screen as plain text. The phone shows the
   words and the layout of the screen, and none of the agent's colours.
-- **History needs a hook.** The core does not know the agent's conversation. A Claude pane has History
-  and Chat once `collie hooks install claude` is done. pi and Oh My Pi have no such hook, so their
-  panes have no History and no Chat card on the core. Their screen, their sends and their cards still
-  work.
+- **Claude's History needs a hook.** The core does not know the agent's conversation. A Claude pane has
+  History and Chat once `collie hooks install claude` is done. pi and Oh My Pi need no hook, because
+  Collie finds their log from the pane's folder. A fresh pi or Oh My Pi pane shows an empty Chat until
+  the agent's first reply, because pi writes its log only then. An older log in the same folder is not
+  shown for a pane whose program started after it, and `pi --resume` keeps its Chat.
 - **A send takes a few seconds longer.** The core holds a key for about three seconds after Collie
   types text. Collie waits for it, and a send to an agent takes about six seconds.
 - **The last viewer sets the width.** The terminal has the width of the last window that looked at it.
@@ -267,20 +274,23 @@ What looks different on the core:
 - **Some dialogs cannot be answered from the phone yet.** A dialog of pi, opencode or Oh My Pi that
   marks the chosen row by colour alone shows no tappable options on the core, because the core sends
   no colour. The card offers Escape, and you answer on the screen. This waits for a colour option in
-  the core (`HC_API.md` lists the ask). Claude and Codex dialogs are read from their words and work.
+  the core, asked for in [herdr-core issue 68](https://github.com/herdrdev/herdr-core/issues/68). Claude and Codex dialogs are read from their words and work.
   So does pi's question, when the core answers the read.
-- **A history read can stall behind a dialog.** On a pi pane that shows a dialog, the core may not
-  answer a read of older lines. The phone then shows no card for that dialog.
+- **The mirror shows the screen; older lines come when you ask.** The core holds a terminal's keys
+  while it reads older lines, and under a dialog one such read takes about 25 seconds. So the phone's
+  mirror reads the screen alone, and Load older at the top of the mirror reads the lines above it,
+  once per tap. While the agent waits on you, Load older waits too, and says so.
 
 What the core cannot do:
 
-- Rename a terminal, a tab or a space, and create a space. The names belong to herdr-app.
+- Rename a terminal, a tab or a space. The names belong to herdr-app. A new space is named after
+  its folder.
 - Focus a terminal, so "Show in terminal" is missing. herdr-app keeps focus on its own screen.
 - Show colour. The core hands out the screen as text only.
-- Show History for an agent other than Claude yet, or for any pane before its hooks are installed.
+- Show History for a Claude pane before its hook is installed, or for an agent other than Claude, pi and Oh My Pi.
 - Show a terminal on another machine. Terminals of machines added to the core (`box/t7`) are not
   shown. Add that machine to your [crew](crew.md) and its own Collie shows them.
-- Open a worktree, or list sessions.
+- List sessions.
 
 `collie doctor` has two rows for it. `hc-socket` dials the socket and shows the core's version and how
 many terminals it keeps. `hc-version` shows `hc --version`. [Troubleshooting](troubleshooting.md)
@@ -516,6 +526,7 @@ exact specification.
 | ["Show in terminal"](../MUX_CONTRACT.md#capabilities) | yes | yes | **no**, zellij accepts the request and moves nothing |
 | [open / rename / close a tab](../MUX_CONTRACT.md#capabilities) | yes | yes (opening is refused on the tmux crash case above) | yes |
 | [open a space](../MUX_CONTRACT.md#capabilities) | yes | yes | **no**, a session it made would be invisible to it |
+| [a **New worktree**](../MUX_CONTRACT.md#contract-owned-rules) | yes, with git | yes, with git | **no**, it cannot open a space |
 | [pane history](../MUX_CONTRACT.md#capabilities) | from Herdr's own pane record | from the beacon's session key | from the beacon's session key |
 
 Without active beacons, tmux, zellij and tern present panes as raw shells, and pane history is marked
@@ -644,7 +655,7 @@ away with Enter. It never holds them, and they do not wait behind other held sen
 later message on that pane waits behind the held ones. A held text lasts 30 minutes, a held command
 10 minutes. After that the row says the message was not sent, and offers Resend. A walky talky
 message is also held over a draft, never typed into it, and its hold lasts 60 minutes
-([Walky talky](walky-talky.md)). Your own send over a draft is still refused, with Append and Replace. Before Collie refuses, adds to or clears a draft, it types one probe character and removes it, to prove that the box takes keys; when the box on the screen does not take keys, the send is refused and nothing is deleted. Focus that pane on the desktop or resize it, so the agent draws its screen again, then send again. Some commands never
+([Walky talky](walky-talky.md)). Your own send over a draft is still refused, with Append and Replace. Before Collie refuses, adds to or clears a draft, it types one probe character and removes it, to prove that the box takes keys; when the box on the screen does not take keys, the send is refused and nothing is deleted. Focus that pane on the desktop or resize it, so the agent draws its screen again, then send again. A busy agent can also show typed keys seconds late, for example Claude Code with a subagent running under its agents footer. Collie waits about 3 seconds for the probe character when the agent is not in a turn, and the send goes on when it shows. When it shows later than that, the first send is refused because the probe character did not show, and Collie's characters (⌁) show in the box a little later. When the box holds only those characters and its probe is late again, the refusal says so: wait a moment and send again, and Collie takes them out first. A pane Collie reads at fewer rows than the box takes (a tab full of splits squeezes each pane) is refused with the rows read and the rows the box needs: zoom or resize it, or close the panes beside it. Some commands never
 wait, and Collie refuses them during a turn. On Claude Code these are `/clear`, `/exit`, `/quit`,
 `/logout`, `/resume`, `/branch` and every `!` line. On Codex these are `/quit`, `/exit`, `/new`,
 `/resume`, `/logout` and every `!` line. On Hermes these are `/exit`, `/quit`, `/clear`, `/new`,
@@ -816,12 +827,12 @@ on the last rows stops it: Collie types nothing there, and the phone offers Type
 | Agent | Enter during a turn | Send key | Probe | Checked against |
 | ----- | ------------------- | -------- | ----------------- | --------------- |
 | OpenCode | Queues the message | Enter | Yes | 1.18.33 |
-| pi | Steers the turn; Alt+Enter queues | Alt+Enter, Ctrl+Q on Windows and in WSL | Short texts and sends into a turn | 1.1.0 |
+| pi | Steers the turn; Alt+Enter queues | Alt+Enter, Ctrl+Q on Windows and in WSL | Short texts and sends into a turn | 1.1.0; screens of 1.4.0 |
 | OMP | Steers the turn; Ctrl+Q queues | Ctrl+Q | Yes | 18.4.10 |
 | Grok | Not measured | Enter | Yes | 1.0.41 |
-| Antigravity (`agy`) | Not measured | Enter | Yes | Screens of 1.4.8 |
+| Antigravity (`agy`) | Not measured | Enter | Yes | Screens of 1.4.8, one of 1.4.12 |
 | Muse | Not measured | Enter | Yes | 1.4.7 |
-| Hermes (classic CLI) | Interrupts the turn by default; Hermes's `/busy` can make it queue or steer | Enter | Yes | 0.22.2 |
+| Hermes (classic CLI) | Interrupts the turn by default; Hermes's `/busy` can make it queue or steer | Enter | Yes | 0.22.2, screens of 0.22.5 |
 | Cursor CLI (`cursor-agent`) | Queues the message | Enter | Yes | 2026.10.16 |
 | Kiro (`kiro-cli`) | Steers the turn; Collie holds a send until the turn ends | Enter | Short texts | 2.32.0 |
 
@@ -842,6 +853,9 @@ Collie checks that the character lands in the box, then removes it.
   So Collie sends with Alt+Enter, and with Ctrl+Q on Windows and in WSL.
   pi shows a queued message as a `Follow-up:` row above the box.
   A box taller than 30 rows does not read as a box. The screen reads as unknown, and a send needs your tap.
+  Gentle Shell 4.5.1, which bundles pi 1.4.0, draws a float editor instead: a left rail of `▎` rows
+  under a `✿ waiting for input` line. Collie reads that box too. In its NORMAL or SELECT mode it does
+  not read as a box, and a send needs your tap.
 
 - **OMP** lets you choose the border style of its box, so Collie knows five of them.
   One is the open box with a status row on top. Others are a rule pair, a rule with no bottom rule,

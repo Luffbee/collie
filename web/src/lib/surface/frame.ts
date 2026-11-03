@@ -224,6 +224,22 @@ function anchored(text: string, anchor: CompiledAnchor): RegExpExecArray | null 
   return anchor.pattern.exec(trimmed);
 }
 
+/**
+ * Whether a row may be the edge of the box whose bottom edge is `bottomText`: an edge spans the box, so
+ * it is at least as wide as the bottom edge. A narrower row in the shape of an edge is a rule the draft
+ * holds (`────`, a table border, a markdown rule), and the walk crosses it as a draft row. Lab, pi 1.4.0
+ * over tmux and Herdr, 2026-11-01: the canary's 15-rule message was typed in full, but its last typed
+ * rule (20 cells) was read as the top edge of the 120-cell box, so the box read `end` and the send ended
+ * typed_not_submitted (mismatch). Only a bare edge is measured: a top edge with a label (the anchor's
+ * `label` group) is drawn narrower than the box by Claude Code (`── refactor the auth module ──` over a
+ * wider bottom rule). Null (no drawn bottom edge: an open box, or a blank top) measures nothing. A typed
+ * rule as wide as the box still reads as an edge.
+ */
+function spansBox(text: string, bottomText: string | null, top: CompiledAnchor): boolean {
+  if (bottomText === null || displayWidth(text.trimEnd()) >= displayWidth(bottomText.trimEnd())) return true;
+  return (anchored(text, top)?.groups?.label?.trim() ?? "").length > 0;
+}
+
 /** The edge a row is, as the frame walk sees it: one of the three anchors. A row that matches the
  *  bottom anchor also matches the top one on a bare edge; the walk only needs to know it is an edge.
  *  A blank row is never an edge here, so a blank row inside a draft is crossed like any other. */
@@ -658,10 +674,17 @@ export function frameAt(rows: readonly FrameRow[], bottom: number, idle: IdlePro
 
   const strict = blankTop(idle);
   const budget = idle.frame.maxDraftRows;
+  // The width an edge row must reach ({@link spansBox}); a blank top edge measures nothing.
+  const span = c.top.blank ? null : bottomText;
+  /** The edge a row is, a prompt row or a row as wide as the box: a narrower rule is the draft's. */
+  const edgeAt = (row: string): "prompt" | "bottom" | "top" | null => {
+    const edge = frameEdge(row, idle);
+    return edge === null || edge === "prompt" || spansBox(row, span, c.top) ? edge : null;
+  };
   let crossed = 0;
   let i = bottom - 1;
   let blankRun = 0;
-  while (i >= 0 && frameEdge(texts[i]!, idle) === null && crossed < budget) {
+  while (i >= 0 && edgeAt(texts[i]!) === null && crossed < budget) {
     // A box with blank edges has no edge glyph to stop at: a row with text left of the indent ends
     // it, and so do two blank rows in a row (a blank edge is one row, so a second one is outside).
     if (strict && !interiorRow(texts[i]!, idle)) return null;
@@ -688,7 +711,7 @@ export function frameAt(rows: readonly FrameRow[], bottom: number, idle: IdlePro
       i--;
     }
     if (i < 0) return null;
-    topMatch = anchored(texts[i]!, c.top);
+    topMatch = spansBox(texts[i]!, span, c.top) ? anchored(texts[i]!, c.top) : null;
     top = i;
   }
   if (topMatch === null) return null;
@@ -819,7 +842,9 @@ function interiorFrameAt(rows: readonly FrameRow[], bottom: number, idle: IdlePr
     else top++;
     if (top > last || bottom - top > budget) return null;
   } else {
-    while (top >= 0 && bottom - top <= budget && anchored(texts[top]!, c.top) === null) top--;
+    // A rule the draft holds is crossed: only a row as wide as the box is its top edge ({@link spansBox}).
+    const span = open || c.top.blank ? null : bottomText;
+    while (top >= 0 && bottom - top <= budget && !(anchored(texts[top]!, c.top) !== null && spansBox(texts[top]!, span, c.top))) top--;
     if (top < 0 || bottom - top > budget) return null;
   }
   const topMatch = anchored(texts[top]!, c.top);

@@ -27,6 +27,10 @@ import { AuditLog, fileAuditAppender } from "./audit.ts";
 import { beaconReader, fileEdgeSpool, fileSourceStore, hooksInstalledProbe, procBeaconLiveness, registerHookTarget, type HookTargetRegistration } from "./beacon-io.ts";
 import { withAgentBeacons } from "./beacon/decorate.ts";
 import { withAgentHints } from "./beacon/hint.ts";
+import { repoFactsOf } from "./repo-facts.ts";
+import { withRepoFacts } from "./repo-facts-mux.ts";
+import { gitBinary } from "./changes.ts";
+import { withWorktreeCapability } from "./worktree-capability.ts";
 import { holdPrivateFile, loadConfig, loadConfigLayer, nonLoopbackBindRefusal, resolveConfigDir, type Config } from "./config.ts";
 import { applyConfigLayer } from "./config-source.ts";
 import {
@@ -37,10 +41,10 @@ import {
   privateRoot,
   type PrivateRoot,
 } from "./owner-only.ts";
-import type { AgentView, CrewMode, CrewStatusResponse } from "./types.ts";
+import type { AgentView, CrewMode, CrewStatusResponse, Launcher } from "./types.ts";
 import { EventPoker } from "./event-poker.ts";
 import { durableLogDir, moveFlatLogs, sourceLogDir } from "./durable/log.ts";
-import { GitHeads } from "./git-head.ts";
+import { GitHeads, nodeGitHeadDisk } from "./git-head.ts";
 import { exePathOf, exeReplaced } from "./exe-replaced.ts";
 import {
   herdrActionCommand,
@@ -72,6 +76,7 @@ import { pushTitle } from "./push-titles.ts";
 import { NotifyPrefsStore } from "./notify-prefs.ts";
 import { FolderStore } from "./folders.ts";
 import { WorktreeBaseStore } from "./worktree-bases.ts";
+import { spaceFolders } from "./space-view.ts";
 import { WorktreeReceiptStore } from "./worktree-receipts.ts";
 import { LaunchReceiptStore } from "./launch-receipts.ts";
 import { LaunchWindow, foregroundHarnessOf } from "./launch-window.ts";
@@ -168,6 +173,16 @@ import {
   syncedDevicesOf,
   type SyncedDevice,
 } from "./crew/standby-devices.ts";
+import {
+  copiedRowsOf,
+  copyDigest,
+  copyReportOf,
+  copyServed,
+  StandbyLauncherStore,
+  STANDBY_LAUNCHERS_VERSION,
+  type CopyRole,
+  type LauncherCopySeam,
+} from "./crew/standby-launchers.ts";
 import {
   adoptLeadership,
   clearRePin,
@@ -1354,6 +1369,9 @@ for (const source of programs.others) {
 // not of one herd. It is what decides whether a blind adapter's beacon capabilities are lifted —
 // never whether a beacon happens to be on disk, which would make the declaration flicker.
 const hooksInstalled = hooksInstalledProbe({ home: homedir(), env: process.env });
+// The git binary, found once at start: whether this host can make a worktree (bridge/worktree-add.ts)
+// is a fact about git and the multiplexer's `createSpace`, never about a multiplexer verb (M81).
+const worktreeGit = await gitBinary();
 
 /**
  * The adapter, with agent beacons around it when the multiplexer cannot see agents, or cannot see
@@ -1429,7 +1447,7 @@ function programAdapter(source: DurableSource): BuiltAdapter {
 // The Send Protocol's request store (M56 spec 05), one for the bridge, under the state directory.
 // Created only with the flag on, so an instance without it touches no new file. On start every request
 // a previous run left unsettled ends `unknown` (a crash), and settled ones past a week are dropped.
-const sendStore = cfg.sendProtocol ? new RequestStore(join(cfg.stateDir, "sends")) : null;
+const sendStore = cfg.sendProtocol ? new RequestStore(join(cfg.stateDir, "sends"), undefined, crewVersion) : null;
 if (sendStore !== null) {
   const recovered = sendStore.recover(SendProtocol.crashReceipt);
   if (recovered.length > 0) console.log(`[send] ${String(recovered.length)} send request(s) left unsettled by the last run read as unknown`);
@@ -1514,7 +1532,11 @@ const sendProfile = createPaneProfile({ versions: sendVersions, binaries: harnes
 const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
   const built = endpoint.kind === "program" ? programAdapter(endpoint.source) : terminalAdapter(endpoint.socketPath);
   const target = built.target;
-  const herdr = withBeaconsIfBlind(built.adapter, target);
+  // The repo facts wrapper sits OUTSIDE the beacon and hint wrappers and is applied once, for every mux:
+  // `repoRoot`, `isWorktree` and `folder` come from the space's folder on disk (M81/03), never a spawn.
+  // The worktree capability sits just inside it, outside the beacon and hint wrappers: it reads their
+  // declaration and lifts `createWorktree` from `createSpace` plus git (bridge/worktree-capability.ts).
+  const herdr = withRepoFacts(withWorktreeCapability(withBeaconsIfBlind(built.adapter, target), { git: worktreeGit }), { facts: (folder) => repoFactsOf(folder, nodeGitHeadDisk, homedir()) });
   const engine = new StateEngine(herdr, cfg.pollMs, { museSessionName: museNames });
 
   // Event-poked polling: a long-lived watch on the multiplexer pokes an immediate re-poll on any
@@ -1539,7 +1561,10 @@ const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
   // The branch of every pane's folder rides the same poll, fired and not awaited, for the cache
   // probe's reason below: a poll never waits on a disk read. The reader keeps its own clocks, so a
   // poll every 1.5 s is not a read every 1.5 s, and it never throws.
-  engine.onUpdate((s) => void gitHeads.refresh([...s.agents, ...s.shellPanes].map((p) => p.cwd)));
+  // The space folders join it, so a space's own branch rides its view the same way (space-view.ts).
+  engine.onUpdate(
+    (s) => void gitHeads.refresh([...[...s.agents, ...s.shellPanes].map((p) => p.cwd), ...spaceFolders(s.workspaces)]),
+  );
 
   // The prompt-cache probe rides the same poll, and for the reason the tracker's header gives:
   // `localSnapshot` is synchronous, so the disk read cannot happen at serialise time. It is fired and
@@ -1974,6 +1999,7 @@ const walky = new WalkyService({
   host: walkyHost,
   memberId: walkyMemberId,
   enabled: () => cfg.walky,
+  pairLimit: cfg.walkyPairLimit,
   machine: hostname(),
   keyPem: () => (walkyMemberId === null ? null : (trustStore.current()?.self.keyPem ?? null)),
   warn: (line) => console.warn(line),
@@ -2114,6 +2140,69 @@ if (standbyStore !== null) await standbyStore.load();
 const syncedDevices = (): readonly SyncedDevice[] => standbyStore?.current()?.devices ?? [];
 
 /**
+ * The lead's launcher rows, kept as a read-only copy (ADR 0127 point 5, `crew/standby-launchers.ts`).
+ * Constructed for any machine with a trust store: a deputy receives the copy as a peer, and serves it
+ * after a takeover, when this process comes back up as the lead. Constructing it writes nothing; solo
+ * never reaches this line (§11).
+ */
+const launcherCopyStore = bootTrust !== null ? new StandbyLauncherStore(cfg.stateDir) : null;
+
+/** What this machine is in its crew now, for whose copy it may keep. Read through the store per call. */
+function copyRole(): CopyRole {
+  const held = trustStore.current();
+  return {
+    crewId: held?.crew?.crewId ?? null,
+    leads: held !== null && held.crew !== null && held.lead === null,
+    leadMemberId: held?.lead?.memberId ?? null,
+    deputy: holdsOwnWarrant(),
+  };
+}
+
+/**
+ * Remove the copy once it is not this machine's to hold: a demotion, a different lead, another crew.
+ * Run at boot and whenever the trust store changes under this process, with ONE rule both times
+ * (`copyKept`): the copy is loaded from disk and kept while this machine is still its lead's named
+ * deputy, or now leads the crew the copy is from, and cleared otherwise. Never an unconditional clear:
+ * a deputy that reboots while its lead is down is exactly the one about to need the copy. Never
+ * throws: a copy that could not be removed is still never served while this machine is cold, and the
+ * next change tries again.
+ */
+async function reconcileLauncherCopy(): Promise<void> {
+  if (launcherCopyStore === null) return;
+  try {
+    if (await launcherCopyStore.reconcile(copyRole())) {
+      console.log("[crew] this machine is no longer its lead's deputy: removed its copy of the lead's launcher rows");
+    }
+  } catch (err) {
+    console.warn(`[crew] could not remove the copy of the lead's launcher rows: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+await reconcileLauncherCopy();
+
+/**
+ * The read of the rows a launch here matches, handed over by the server once it is built
+ * (`LauncherCopySeam.source`). The lead's sync to its deputy sends exactly that list; `null` before.
+ */
+let crewLauncherRows: (() => Promise<Launcher[]>) | null = null;
+
+/** What the server reads of the copy. The copy is served only while this machine leads its crew. */
+const launcherCopySeam: LauncherCopySeam | undefined =
+  launcherCopyStore === null
+    ? undefined
+    : {
+        served: () => {
+          const held = trustStore.current();
+          return copyServed(launcherCopyStore.current(), {
+            crewId: held?.crew?.crewId ?? null,
+            leads: held !== null && held.crew !== null && held.lead === null,
+          });
+        },
+        source: (read) => {
+          crewLauncherRows = read;
+        },
+      };
+
+/**
  * What the two standby-shaped crew routes need from this process (`router.ts` → `StandbySurface`).
  *
  * `undefined` on a lead and on solo — a lead has no lead to be silent, no warrant naming itself and
@@ -2140,6 +2229,22 @@ const standbySurface: CrewRouterDeps["standby"] =
           const own = readableRegistry();
           return own === null ? [] : collisionReportOf(own, standbyStore.current());
         },
+        // ADR 0127 point 5: the launcher copy's report and its write, beside the device registry's.
+        copyDigest: () => copyReportOf(launcherCopyStore?.current() ?? null),
+        applyCopy:
+          launcherCopyStore === null
+            ? undefined
+            : async (copy) => {
+                // Wholesale, never a merge, and into its own file: never `launchers.toml` or
+                // `launchers-added.json`, which stay this machine's own.
+                await launcherCopyStore.replace({
+                  version: STANDBY_LAUNCHERS_VERSION,
+                  crewId: copy.crewId,
+                  from: copy.from,
+                  at: Date.now(),
+                  rows: copy.rows,
+                });
+              },
         applySync: async (sync) => {
           // Wholesale, never a merge: the lead's registry is the whole truth, so a revocation there
           // has to be able to REMOVE a device here.
@@ -2419,6 +2524,18 @@ const crewLead = (() => {
       collision: (labels) => {
         pairingCollision = labels === null || labels.length === 0 ? null : { at: Date.now(), labels };
       },
+    },
+    // ADR 0127 point 5: the crew's launcher rows to the DEPUTY, beside its device registry. The rows
+    // are the ones a launch on this lead matches, its own and any copy it serves after a takeover.
+    launchersCopy: {
+      deputy: () => trustStore.current()?.deputy ?? null,
+      current: async () => {
+        const held = trustStore.current();
+        if (crewLauncherRows === null || held === null || held.crew === null) return null;
+        const rows = copiedRowsOf(await crewLauncherRows(), homedir());
+        return { rows, digest: copyDigest(rows) };
+      },
+      push: (link, rows) => client.launchersCopy(link, rows),
     },
     // §18.10's fast path: a member told this lead, in as many words, that it follows somebody else.
     // Best-effort and time-boxed (it works only while this lead is still in that member's anchor
@@ -2982,6 +3099,7 @@ const server = startServer({
   machines: machineWatch,
   crew,
   pairing,
+  launcherCopy: launcherCopySeam,
   localCredential,
   stt,
   crewLead,
@@ -3037,7 +3155,11 @@ const server = startServer({
             // compiled that drives no durable program — passes `undefined` and ignores both, which is
             // a correct peer.
             onFollow,
-            onMembershipChange: crewStoreChanged,
+            onMembershipChange: () => {
+              crewStoreChanged();
+              // A warrant naming another deputy, or none, ends this machine's copy (ADR 0127 point 5).
+              void reconcileLauncherCopy();
+            },
             // Gap A (§18.9), and its rotation-shaped sibling. Two receipts, one holder, in memory.
             onLeadDialled: (at) => leadContact.record(at),
             // M20/02: a peer that speaks to us is due. It marks the member due now and dials nothing;
