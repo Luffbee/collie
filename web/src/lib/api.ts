@@ -17,6 +17,7 @@ import { abortSignalAfter, abortSignalAny } from "./env";
 import { asJsonObject, asJsonString, parseJsonObject, type JsonObject } from "./json";
 import { readHeldCancelAnswer, readSendReceipts, readSendReply, type SendReply } from "./send-protocol";
 import { readReportContext, type ReportContext } from "./report/context";
+import type { TroubleSignal } from "./report/signal";
 import { REQUEST_ID, type HeldCancelAnswer, type SendReceiptRow, type SendRequestBody } from "./surface/send";
 import type { AnswerBody } from "./surface/ask";
 import { boundedDraft, CLEAR_OUTCOMES, CLEAR_REASONS, type ClearBody, type ClearReceipt } from "./surface/clear";
@@ -86,6 +87,9 @@ import type {
   GoBackStartResponse,
   ReleaseLine,
   ReleaseLineReceipt,
+  TelemetryReceipt,
+  TelemetrySetting,
+  TelemetryView,
   UploadResponse,
   WorktreeBaseChoice,
   WorktreeCreateResponse,
@@ -1720,6 +1724,16 @@ export async function fetchWalkyWho(signal?: AbortSignal): Promise<WalkyWho> {
 }
 
 /**
+ * POST /api/walky/off (M89 spec 04): the operator turns one session's walky talky off or on. Scoped like
+ * a pane write, so a pane on a crew member is set on that member, which enforces it. An idempotent set:
+ * the bridge answers the value it now holds, and a retry of the same value changes nothing.
+ */
+export async function setWalkyOff(paneId: string, off: boolean, scope?: Scope): Promise<boolean> {
+  const got = await req<{ off: boolean }>(withScope("/api/walky/off", scope), { method: "POST", body: JSON.stringify({ pane: paneId, off }) });
+  return got.off;
+}
+
+/**
  * POST /api/walky/<id>/cancel (M62 spec 03): the sender takes a held operator message back. The bridge
  * answers one result per target; a message that typed, or is going out now, keeps its receipt and the
  * result says `already typed`. An agent's message is not the phone's to cancel (403, an error here).
@@ -2477,6 +2491,35 @@ export function setReleaseLine(a: { line: ReleaseLine; requestId: string }): Pro
     method: "POST",
     body: JSON.stringify({ line: a.line, requestId: a.requestId }),
   });
+}
+
+/**
+ * The anonymous install count's state (M86 spec 02): on or off, which switch decided, and the exact
+ * message the next ping would send. A read-gated GET that sends nothing.
+ */
+export function fetchTelemetry(signal?: AbortSignal): Promise<TelemetryView> {
+  return req<TelemetryView>("/api/telemetry", { signal });
+}
+
+/**
+ * Set this machine's install-count switch from the phone (M86 spec 02). The answer is the state the
+ * machine now holds, which the card shows as it is. One request id per tap, reused on a retry of the
+ * same tap, so a repeated request answers with the same receipt.
+ */
+export function setTelemetry(a: { setting: TelemetrySetting; requestId: string }): Promise<TelemetryReceipt> {
+  return req<TelemetryReceipt>("/api/telemetry", {
+    method: "POST",
+    body: JSON.stringify({ setting: a.setting, requestId: a.requestId }),
+  });
+}
+
+/**
+ * One trouble signal (M86 spec 05): a trouble card showed, and the bridge counts it for its next ping.
+ * Fire and forget, through the transport below the busy signal: a count is no tap of the person's, so
+ * the progress bar never shows it. The bridge answers 204 whether or not it counted.
+ */
+export async function postTroubleSignal(signal: TroubleSignal): Promise<void> {
+  await doReq<undefined>("/api/telemetry/trouble", { method: "POST", body: JSON.stringify(signal) });
 }
 
 /**

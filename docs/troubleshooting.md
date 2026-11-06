@@ -13,8 +13,8 @@ yet** · **the phone says Collie cannot read a screen the agent is not showing**
 and the phone offers a report** · **a send is refused and `⌁` shows in the box later** · **something looks wrong on a Herdr core (`herdr-core`) pane** ·
 **an agent is greyed
 out on the New page** · **Start says there is no folder, or says it could not confirm** ·
-**walky talky: send is refused, "run this inside a pane"** · **walky talky: the message sits in the
-inbox and was not typed** · **walky talky: "no log record on this machine"** · **walky talky: the
+**WalkyTalky: send is refused, "run this inside a pane"** · **WalkyTalky: the message sits in the
+inbox and was not typed** · **WalkyTalky: "no log record on this machine"** · **WalkyTalky: the
 skill is stale** · **a durable agent does not show up, or says Unreachable**.
 
 **`herdr plugin …` fails with `Error: Os { code: 2, kind: NotFound, message: "No such file or
@@ -241,6 +241,30 @@ crew member's pane does not offer a report yet; use the steps above.
 
 **A send is refused, and `⌁` shows in the box a few seconds later.** The agent was busy and showed the keys Collie typed late. Before Collie types a message, it types one probe character (`⌁`) and looks for it in the box. When the agent is not in a turn and the character does not show at once, Collie looks twice more over about 3 seconds. Claude Code with a subagent running (the agents footer under the box, `● main` and `◯ general-purpose`) can take longer than that, so the send is refused with "the probe character did not show in the box", and the character shows later. A send after that finds only those characters in the box. If the agent is still slow, the refusal says that the agent showed the keys late and to wait. Wait until the agent shows what you type at the desk without delay, then send again: Collie takes its own characters out of the box first, and then types your message. Nothing you typed is lost, and no Enter was pressed.
 
+**Every send to Claude Code is held, and the empty box shows a dim suggestion.** Claude Code with the
+next-steps plugin draws a dim suggestion in the empty box, with the cursor on its first letter.
+Collie read that letter as typed text and held every send. Fix: update Collie to 1.26.0 or newer. The box
+then reads empty again.
+
+**With Claude Code's verbose mode on, every send needs two taps.** A token count row, such as
+`230267 tokens`, shows under a "Heads up" notice. Collie did not know that row and read the box as
+not idle. Fix: update Collie to 1.26.0 or newer. The row is now part of the notice, and a send goes through.
+
+**Every send to a Hermes session is refused with "no-match", after the session got a title.** Hermes
+draws the title inside the top rule of its box (`── Session Title ─`). Collie knew only a bare rule.
+Fix: update Collie to 1.26.0 or newer. Chat for the same session also showed the box and the status bar
+again inside the mirror. That is fixed too.
+
+**Antigravity shows "Collie cannot read this dialog" while a sub-agent runs.** Antigravity lists a
+running sub-agent in a band between two rules under its box. Collie took the lower rule for the bottom
+of the box. Fix: update Collie to 1.26.0 or newer. The pane then reads as idle and takes a send. A
+row in that band that Collie does not know still blocks the send, and a send with a draft already in
+the box can still be refused while the sub-agent runs.
+
+**On Android the keyboard hides when you tap a word the spellchecker marked.** Chrome's suggestion
+menu took the focus away from the keyboard. Fix: update Collie to 1.26.0 or newer. The composer now
+turns the browser's spellchecker off. Gboard's own corrections are unchanged.
+
 **An update started from the phone stays at staging.** On Collie up to 1.6.0, an update tapped on
 the phone could stage the new version and then stop: the runner that performs the swap was never
 started, the service kept serving the old version, and the run record sat at `staging` with the lock
@@ -356,8 +380,11 @@ The core sends no colour, so the suggestion read as typed text. Fix: update Coll
 Collie then tells a suggestion from a draft with a one-key probe, and the send goes on.
 
 **A pane has no History and no Chat card.** For Claude, run `collie hooks install claude`, then restart
-the Claude in that pane. For pi and Oh My Pi nothing fixes it yet: the core keeps no conversation, and
-those two agents have no hook that names it. The pane keeps its screen, sends and cards.
+the Claude in that pane. For pi and Oh My Pi, check the session directories in the bridge's environment:
+the bridge does not inherit a pane's project-local profile. Set `COLLIE_PI_ROOT` to include those
+`sessions` directories and the defaults used by other panes, then restart that Collie instance
+([Journal roots](configure.md#what-each-section-holds)). Two unnamed pi or Oh My Pi sessions in the
+same working directory are ambiguous; start each with its explicit session path or ID to resume it.
 
 **A dialog of a pi pane does not show on the phone.** On the core, a read of older lines can stall
 while pi shows a dialog, and Collie then reads the pane as unreadable after five seconds. This is
@@ -367,8 +394,10 @@ known and waits for the core. Answer on the screen, or press the keys in the Key
 colour alone, and the core sends no colour. Escape works. Answer with the Keys tray. This waits for a
 colour option in the core.
 
-**A send takes about six seconds.** The core holds a key for three seconds after Collie types, and a
-send has two such waits. Nothing is wrong, and a send is not sent twice. Wait for the receipt.
+**A multiline send arrives in pieces or times out.** Multiline insertion and Oh My Pi's follow-up
+submit key use direct input to avoid the core's three-second named-key quiet wait. Other named
+keys, such as navigation chords, can still wait while the terminal is receiving input. If a send's
+outcome is unknown, inspect the terminal before trying again: some text may already have arrived.
 
 **A pane is narrow on the phone after herdr-app showed it.** The last window that looked at the
 terminal sets its width. Look at the pane in herdr-app on a wider window, or close the herdr-app view.
@@ -381,15 +410,20 @@ case. Fix: update Collie to 1.25.2 or newer.
 Claude reads `$CLAUDE_CONFIG_DIR/settings.json` when that variable is set, and the install ignored it.
 Fix: update Collie to 1.25.2 or newer, then run `collie hooks install claude` again.
 
+**An empty Oh My Pi input shows "Draft in terminal" with a running-agent hint.** The core supplies
+plain text without the hint's colour or italic styling. Collie recognises the right-aligned
+agent-navigation and thinking-effort hints as empty-editor chrome; the same words typed at the
+start of the input remain a draft.
+
 **A send to an Oh My Pi pane ends "typed, not submitted", and the text stays in the box.** omp shows a
 grey completion after your last word, and the core sends it as plain text. Collie sees more text than
 it typed and does not press Enter. Clear the box with the Keys tray and send again, or press Enter
 on the screen. This is known.
 
-## Walky talky
+## WalkyTalky
 
-Six symptoms of walky talky come up most. Each one has a command that shows the cause
-([Walky talky](walky-talky.md)).
+Six symptoms of WalkyTalky come up most. Each one has a command that shows the cause
+([WalkyTalky](walky-talky.md)).
 
 **`collie walky send` says "run this inside a pane, or send from the phone".** The command ran
 outside an agent's pane, in a plain terminal for example. Collie names the sender from the pane's
@@ -413,7 +447,7 @@ stayed busy, or a dialog stayed open, for the whole 60-minute hold: Collie never
 a dialog. "box not free" means Collie could not read a free input box. "pane busy" means an earlier
 message was still being typed there after 2 minutes. "pane replaced" means another session took the
 pane while the message waited. "no terminal" and "bridge restarted" are the other two. Run `collie
-walky inbox` in that pane, or open Messages in the pane's menu on the phone. Collie does not type the
+walky inbox` in that pane, or open WalkyTalky in the pane's menu on the phone. Collie does not type the
 message again.
 
 **`collie walky send` says "not sent: pane replaced".** The address ends with a token, such as
@@ -422,7 +456,7 @@ type the message there. Run `collie walky who` and send to the new address. A re
 "not sent: sender gone" has the same cause: the pane that sent the message has closed, or another
 pane holds its id now.
 
-**A header in a pane shows "no log record on this machine".** The phone found a walky talky header in
+**A header in a pane shows "no log record on this machine".** The phone found a WalkyTalky header in
 the screen text, and this machine's log holds no message with that id. Someone or something typed
 the line, or the log dropped it after 7 days or 2,000 lines, or another Collie holds it. Run
 `collie walky status <id>`: "no record of <id> on this machine" confirms it. For a pane on a crew

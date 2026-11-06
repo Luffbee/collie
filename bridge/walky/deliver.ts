@@ -34,7 +34,7 @@ import type { LogRecord, Placement, WalkyLog } from "./log.ts";
 import { MEMBER_LIMIT, PAIR_LIMIT, pairKey, RateLimiter, senderKey } from "./rate.ts";
 import { HERE_FROM_PHONE, hereWithoutFolder, MEMBER_UNREACHABLE, OUT_OF_SCOPE, RefusalCounter, scopeEmpty, scopeIsMember, scopeTooWide, type RefusalCounts } from "./refusals.ts";
 import { seenHash, WalkySeen } from "./seen.ts";
-import { formatEnvelope, receiptReason, SEND_ID, type WalkyMessage, type WalkyReceipt, type WalkyReceiptState, type WalkyTarget, type WalkyVerified } from "./types.ts";
+import { formatEnvelope, receiptReason, SEND_ID, RESTING, SENDER_OFF, WALKY_OFF, type WalkyMessage, type WalkyReceipt, type WalkyReceiptState, type WalkyTarget, type WalkyVerified } from "./types.ts";
 
 /**
  * How long a held send may wait before the message is left in the inbox only: one clock per message,
@@ -54,6 +54,24 @@ export const HELD_POLL_MS = 2000;
 export const LANE_WAIT_MS = 2 * 60 * 1000;
 /** The reason of a message that waited out {@link LANE_WAIT_MS}. */
 export const PANE_BUSY = "pane busy";
+/**
+ * How long an agent pane must have been done or idle before a fan-out leaves it alone (M85): a session
+ * that rested this long gets the message in its inbox only, because typing wakes it for a cold turn.
+ * A constant, not a setting: one rule for every mux and harness.
+ */
+export const REST_MS = 15 * 60_000;
+
+/**
+ * Whether a pane rests: it is `done` or `idle`, and has been for {@link REST_MS} or more by the pane's
+ * `activeAt`, the last status change the bridge saw (ADR 0003). Any other state, and a pane with no
+ * `activeAt`, never rests: a wrong "not resting" types a message, a wrong "resting" holds one back.
+ */
+export function isResting(pane: Pick<WalkyPane, "state" | "activeAt">, now: number): boolean {
+  if (pane.state !== "done" && pane.state !== "idle") return false;
+  if (pane.activeAt === null) return false;
+  return now - pane.activeAt >= REST_MS;
+}
+
 /** The reason of a held message its sender took back (M62 spec 03). */
 export const CANCELLED_BY_SENDER = "cancelled by sender";
 /** The reason of a held message the target pane's owner dropped (M62 spec 03). */
@@ -89,8 +107,15 @@ export interface WalkyPane {
   readonly label: string;
   /** The pane's status word, as the snapshot gives it. */
   readonly state: string;
+  /**
+   * Epoch ms of the pane's last status change, from the activity ledger (bridge/activity.ts), or null
+   * when the bridge has none for it. A resting pane is read from it (see {@link isResting}).
+   */
+  readonly activeAt: number | null;
   /** False when the session has no Send Protocol (no screen, or COLLIE_SEND_PROTOCOL=0). */
   readonly terminal: boolean;
+  /** True when the session turned its walky talky off (M89, off.ts): no agent message goes in or out. */
+  readonly off: boolean;
 }
 
 /**
@@ -386,6 +411,7 @@ export class WalkyDeliverer {
    *   `id reused`                       the id is taken by another message
    *   `only the operator may broadcast` an agent named `all` or `<member>/all`
    *   `that is your own pane`           the target is the sender's own pane
+   *   `your walky talky is off`         the sending agent's own pane is off (M89)
    *   `thread depth`                    the reply chain is deeper than 4 in this bridge's log
    *   `off`                             COLLIE_WALKY=off on this machine
    *   `ambiguous pane`                  more than one session has a pane with the target's id (and token)
@@ -393,6 +419,7 @@ export class WalkyDeliverer {
    *   `sender gone`                     a reply's pane is gone, now in another session, or another instance
    *   `not an agent pane`               the target is a shell
    *   `rate limit` / `pair limit`       a cap is full: the sender's, the lead's per member, or the pair's
+   *   `walky talky off`                 the target session is off, for an agent's message ({@link place})
    */
   async deliver(message: WalkyMessage, sender: SenderPane | null, options: DeliverOptions = {}): Promise<WalkyReceipt[]> {
     const verified = options.verified ?? "local";
@@ -409,6 +436,7 @@ export class WalkyDeliverer {
     const remote = address.kind !== "all" && !isSelf(address.memberId, this.deps.memberId);
     if (remote && options.localOnly === true) return refuse("no such pane");
     if (message.from.address !== null && this.ownPane(message.from.address, message.to)) return refuse("that is your own pane");
+    if (this.senderOff(message, sender)) return refuse(SENDER_OFF);
     if (this.threadDepth(message) > THREAD_DEPTH_MAX) return refuse("thread depth");
     if (remote) return this.capped(message, 1, options) ?? this.remote(message, address.memberId, sender);
     if (!this.deps.enabled()) return refuse("off");
@@ -466,7 +494,7 @@ export class WalkyDeliverer {
         receipts.push(held);
         continue;
       }
-      receipts.push(this.place(message, target, pane, sender, verified));
+      receipts.push(this.place(message, target, pane, sender, verified, address.kind !== "pane"));
     }
     // The crew leg: routed now, or (on a repeat) the receipts its first run wrote.
     if (routesOn) receipts.push(...(await this.remote(message, "all", sender)));
@@ -477,14 +505,40 @@ export class WalkyDeliverer {
   /**
    * Log one message for one pane of this bridge and start typing it: seen first, then logged, then
    * typed, so a crash between any two never types twice. Answers the `accepted` receipt.
+   *
+   * THE RESTING RULE (M85) sits here. `fan`: the message reached this pane through a scope, `all` or
+   * `<member>/all`, not by its own address. A fan-out pane that rests ({@link isResting}) keeps the log
+   * line and the inbox entry, and the receipt ends `inbox-only: resting` at once, with no Send Protocol
+   * call, unless the sender asked to wake (`message.wake`). A message to one address is always typed.
+   *
+   * THE OFF RULE (M89) sits here too, first, because a direct send, a reply, a scope pane and a pane a
+   * lead routed all end in this one step: an agent's message to a session that is off is refused. It is
+   * not logged, not in the inbox and not typed, and `wake` does not override it. An operator's message
+   * never reads the flag.
    */
-  private place(message: WalkyMessage, target: string, pane: WalkyPane, sender: SenderPane | null, verified: WalkyVerified): WalkyReceipt {
+  private place(message: WalkyMessage, target: string, pane: WalkyPane, sender: SenderPane | null, verified: WalkyVerified, fan = false): WalkyReceipt {
+    if (message.kind === "agent" && pane.off) return this.refusal(message.id, target, WALKY_OFF, verified);
     const accepted = this.receipt(message.id, target, "accepted", { verified });
     this.seen.add(message, target);
     const record = this.deps.log.record(message, target, { session: pane.session, paneId: pane.paneId, instance: pane.instance }, accepted, sender);
     this.deps.log.inboxAdd(pane.session, pane.paneId, pane.instance, message);
+    if (fan && message.wake !== true && isResting(pane, this.now())) {
+      const rests = this.next(record, "inbox-only", RESTING);
+      this.deps.log.update(rests);
+      return rests;
+    }
     this.track(this.inLane(record, pane));
     return accepted;
+  }
+
+  /**
+   * Whether the agent sending this message sits in a pane that is off (M89): its reply could not come
+   * back. Only the machine that owns the sender's pane knows: a message a crew hop brought has no sender
+   * pane here.
+   */
+  private senderOff(message: WalkyMessage, sender: SenderPane | null): boolean {
+    if (message.kind !== "agent" || sender === null) return false;
+    return this.deps.host.panes().some((pane) => pane.off && isPaneOf(pane, sender));
   }
 
   /** Whether a bare word names a member: `local`, this bridge, or any member the crew lists. */
@@ -531,6 +585,7 @@ export class WalkyDeliverer {
     if (options.localOnly === true) return this.scopeDelivery(message, address, options, done);
     // The same id again: what it already holds. A scope is expanded once.
     if (done.size > 0) return withoutAnsweredLegs([...done.values()]);
+    if (this.senderOff(message, sender)) return refuse(SENDER_OFF);
     const resolved = this.scopeOf(message, address);
     if (!resolved.ok) return refuse(resolved.reason);
     const { scope } = resolved;
@@ -579,7 +634,7 @@ export class WalkyDeliverer {
     for (const target of caps.full) receipts.push(this.refusal(message.id, target, "pair limit", verified));
     for (const pane of local) {
       const target = `${self}/${pane.paneId}`;
-      if (!caps.full.has(target)) receipts.push(this.place(message, target, pane, sender, verified));
+      if (!caps.full.has(target)) receipts.push(this.place(message, target, pane, sender, verified, true));
     }
     for (const memberId of unreachable) receipts.push(this.unreachableLine(message, memberId, sender, verified));
     const legs = await Promise.all([...remote].map(([memberId, ids]) => this.remoteScope(message, memberId, ids.filter((paneId) => !caps.full.has(`${memberId}/${paneId}`)), sender)));
@@ -619,7 +674,7 @@ export class WalkyDeliverer {
     const caps = this.scopeCaps(message, [target], options, false);
     if ("refused" in caps) return refuse(caps.refused);
     if (caps.full.has(target)) return refuse("pair limit");
-    return [this.place(message, target, pane, null, verified)];
+    return [this.place(message, target, pane, null, verified, true)];
   }
 
   /**
@@ -817,6 +872,11 @@ export class WalkyDeliverer {
   /** Type one logged message into its pane, and write how it ended. `answered`: the Send Protocol answered. */
   private async type(record: LogRecord, pane: WalkyPane, answered: () => void = () => undefined): Promise<void> {
     const { message, target } = record;
+    // A message that waited in the lane: the session may have turned off since it was placed.
+    if (this.turnedOff(record)) {
+      this.refuseOff(record);
+      return;
+    }
     if (!pane.terminal) {
       this.deps.log.update(this.next(record, "inbox-only", "no terminal"));
       return;
@@ -866,7 +926,7 @@ export class WalkyDeliverer {
         this.deps.host.cancelHeld(session, paneId, sendId);
         const after = this.deps.host.sendState(sendId);
         if (after?.outcome === "cancelled" || after?.outcome === "expired") {
-          this.deps.log.update(this.next(record, "inbox-only", HELD_PAST, sendId));
+          this.heldPast(record, sendId);
           return;
         }
         if (after === null || after.outcome === "held") {
@@ -879,7 +939,7 @@ export class WalkyDeliverer {
       // end. The ended row goes too, so the phone offers no Resend of a walky envelope.
       if (result.outcome === "expired" && this.now() >= until) {
         this.deps.host.cancelHeld(session, paneId, sendId);
-        this.deps.log.update(this.next(record, "inbox-only", HELD_PAST, sendId));
+        this.heldPast(record, sendId);
         return;
       }
       // The release found another instance at the pane (`stillMeant`): the message stays in the inbox.
@@ -887,6 +947,11 @@ export class WalkyDeliverer {
         this.deps.log.update(this.next(record, "inbox-only", "pane replaced", sendId));
         return;
       }
+    }
+    // The release found the session off (`stillMeant`): refused, and out of the inbox.
+    if (result.outcome === "refused" && result.reason === "pane_gone" && this.turnedOff(record)) {
+      this.refuseOff(record, sendId);
+      return;
     }
     if (result.outcome === "sent" || result.outcome === "effective") {
       this.deps.log.update(this.next(record, "delivered", undefined, sendId));
@@ -900,6 +965,30 @@ export class WalkyDeliverer {
       return;
     }
     this.deps.log.update(this.next(record, "inbox-only", reasonOf(result), sendId));
+  }
+
+  /** A hold's one clock ran out. The message stays in the inbox, unless the session turned off meanwhile. */
+  private heldPast(record: LogRecord, sendId: string): void {
+    if (this.turnedOff(record)) this.refuseOff(record, sendId);
+    else this.deps.log.update(this.next(record, "inbox-only", HELD_PAST, sendId));
+  }
+
+  /** Whether this record is an agent's message whose pane instance is off now (M89). */
+  private turnedOff(record: LogRecord): boolean {
+    if (record.message.kind !== "agent" || record.session === null || record.paneId === null) return false;
+    const pane = this.deps.host.panes().find((candidate) => candidate.session === record.session && candidate.paneId === record.paneId);
+    return pane?.off === true && (record.instance === null || pane.instance === record.instance);
+  }
+
+  /**
+   * A placed message meets a session that turned off before it was typed: the receipt ends `refused`,
+   * the refusal is counted, and the inbox entry goes, so the session finds no agent mail and the sender
+   * knows to go through the operator (M89, decisions 2 and 5).
+   */
+  private refuseOff(record: LogRecord, sendId?: string): void {
+    this.refusals.count(WALKY_OFF);
+    this.deps.log.update(this.next(record, "refused", WALKY_OFF, sendId));
+    if (record.session !== null && record.paneId !== null && record.instance !== null) this.deps.log.ack(record.session, record.paneId, record.instance, [record.message.id]);
   }
 
   /** Whether the log's newest receipt for this record has left `accepted`: someone else settled it. */
@@ -945,14 +1034,15 @@ export class WalkyDeliverer {
   /**
    * The Send Protocol's last check before a held send goes out (its `releaseCheck`, M62 spec 02): false
    * when the send is a walky message of this log whose pane is gone or holds another instance now, so a
-   * replaced pane never takes it. A request this log does not know, or a record from before instances,
-   * goes ahead.
+   * replaced pane never takes it. An agent's message to a session that turned off is not meant any more
+   * either (M89). A request this log does not know, or a record from before instances, goes ahead.
    */
   stillMeant(sendId: string, session: string, paneId: string): boolean {
     if (!SEND_ID.test(sendId)) return true;
     const id = sendId.slice(0, sendId.lastIndexOf("-"));
     const record = this.deps.log.all(id).find((candidate) => candidate.session === session && candidate.paneId === paneId && sendIdOf(candidate.message.id, candidate.target) === sendId);
     if (record === undefined || record.instance === null) return true;
+    if (this.turnedOff(record)) return false;
     const pane = this.deps.host.panes().find((candidate) => candidate.session === session && candidate.paneId === paneId);
     return pane !== undefined && pane.instance === record.instance;
   }

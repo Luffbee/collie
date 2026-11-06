@@ -45,8 +45,21 @@ import { sidName } from "../bridge/sddl.ts";
 import { DEVICES_FILENAME, isExpired, parseRegistryText } from "../bridge/pairing.ts";
 import { pairedRegistryOf } from "./pairing.ts";
 import { sameBuild } from "../bridge/version.ts";
-import { readOwnSnapshot } from "./snapshot-read.ts";
+import {
+  parseTelemetryRecord,
+  parseTelemetryDecider,
+  TELEMETRY_DECIDERS,
+  telemetrySwitchWarning,
+  type TelemetryDecider,
+  telemetryOrigin,
+  telemetryPath,
+  telemetryState,
+} from "../bridge/telemetry.ts";
+import { asJsonBoolean, asJsonObject, asJsonString, parseJson } from "../web/src/lib/json.ts";
+import { identityHeader, readOwnSnapshot } from "./snapshot-read.ts";
 import { collieVersionBare, type CliContext } from "./context.ts";
+import { CrewOpsStore } from "../bridge/crew/ops-store.ts";
+import { crewDelta, deltaLines } from "./crew-delta.ts";
 import { aboutCrew, bad, ok, skipped, warn, type DoctorStatus, type Finding } from "./finding.ts";
 import { parseAccountWindowsSetting } from "../bridge/account-windows-setting.ts";
 import { accountWindowsDoctorLine, grokAuthPath, hasOpencodeGoEntry, opencodeAuthPath } from "../bridge/account-windows.ts";
@@ -143,6 +156,11 @@ export interface DoctorDeps {
   readonly link: LinkReader;
   /** Read-only use: `load()` and nothing else. */
   readonly store: TrustStore;
+  /**
+   * The ops store, for `crew-candidates` (`cli/crew-delta.ts`): `load()` and nothing else. Absent
+   * reads as "no crew to compare", so the finding is omitted.
+   */
+  readonly ops?: Pick<CrewOpsStore, "load">;
   /**
    * The injected transport — the `hello` probe and one `snapshot` READ per member, plus one GET of
    * THIS bridge's own `/api/snapshot` (the history section, issue #137). Every one of them is a
@@ -268,6 +286,7 @@ export async function cmdDoctor(deps: DoctorDeps, args: readonly string[]): Prom
     frontDoor(deps, mode),
     pairedDevices(deps, mode),
     muxFinding(deps),
+    ...(await crewCandidates(deps)),
     // A durable program has no binary or listing to ask. Six rows say which transport is configured,
     // whether its socket or its URL and token may be used, and whether the program answers, and a
     // seventh whether the lead is new enough to show its panes: only when `durable` is the
@@ -288,6 +307,8 @@ export async function cmdDoctor(deps: DoctorDeps, args: readonly string[]): Prom
     skillWalkyTalky(deps),
     ...walkyRefusals(deps),
     accountWindowsFinding(deps),
+    // Whether the anonymous install ping is on and which switch decided (M86 spec 01). Info only.
+    ...(await telemetryFindings(deps)),
     // The Whistle model (ADR 0096): one finding when the model, or the host engine that needs it, is
     // on this host, and none otherwise. A host that never heard of Whistle reads exactly as before.
     ...(await whistleModelFindings(deps)),
@@ -413,6 +434,28 @@ const HERDR_ONLY_PREFIX = "integration-";
 // button off (M43 spec 08). Dropped on Windows, the same way the multiplexer scoping above drops it.
 const NOT_ON_WINDOWS = new Set(["hook-python3"]);
 
+/**
+ * `crew-candidates` (M84/04): where a multiplexer's machine list and this crew differ, the same
+ * lines `collie start` and `crew status` print. Always `ok`: it tells and never fails the doctor.
+ * Omitted (not `skipped`) when nothing differs, so an install with no such list reads as before.
+ * `--json` carries the delta itself as `data`.
+ */
+async function crewCandidates(deps: DoctorDeps): Promise<readonly Finding[]> {
+  if (deps.ops === undefined) return [];
+  const delta = await crewDelta({ exec: deps.exec, store: deps.store, ops: deps.ops, host: deps.host });
+  const lines = deltaLines(delta);
+  if (lines.length === 0) return [];
+  return [
+    {
+      ...ok("crew-candidates", lines.join("; ")),
+      data: {
+        missing: delta.missing.map((m) => ({ source: m.source, targets: [...m.targets] })),
+        forgotten: delta.forgotten.map((f) => ({ memberId: f.memberId, source: f.source })),
+      },
+    },
+  ];
+}
+
 /** Whether a check has anything to say on this host. */
 function appliesToHost(check: string, host: Host): boolean {
   return host.platform !== "win32" || !NOT_ON_WINDOWS.has(check);
@@ -436,7 +479,7 @@ async function render(
   const heading = `collie doctor — ${collieVersionBare(deps.ctx.root, (p) => deps.files.read(p))} · mode ${mode}`;
   // The first line, before the heading, so a person with two lanes sees which one this run read.
   const instance = instanceLine(deps.ctx);
-  const crewNote = ["crew: none — this collie is not in a crew.", soloCrewHint(deps.host)];
+  const crewNote = ["crew: none — this collie is not in a crew.", soloCrewHint(deps.host, deps.ctx.env)];
   // One findings list, two renderings. The terminal gets the columns laid out and the statuses
   // coloured; everything else gets exactly the lines below, which are what `--json`'s human twin has
   // always printed and what scripts/collie-cli.test.sh greps.
@@ -1223,29 +1266,6 @@ async function ownSnapshot(deps: DoctorDeps): Promise<SnapshotRead> {
   return readOwnSnapshot(deps, { extraHeaders: identityHeader(deps) });
 }
 
-/**
- * The identity this verb shows its own bridge, or nothing when none is configured (issue #238).
- *
- * `checkAccess` (bridge/server.ts) fails closed on a request with no `Tailscale-User-Login` while
- * `tailscale serve` is in front, because an absent header is not evidence of a local caller: a TAGGED
- * node arrives without one too. So this verb could not read its own snapshot, and reported a healthy
- * bridge as one that had not answered.
- *
- * Sending the configured login GRANTS NOTHING THAT WAS NOT ALREADY THERE. The login is an identity,
- * not a secret, and the bridge already accepts the header from any caller that reaches its port —
- * `curl -H 'Tailscale-User-Login: …' http://127.0.0.1:<port>/api/snapshot` answers 200 today, which is
- * how the reporter demonstrated the bug. The alternative, a loopback exemption, is the one thing that
- * must NOT be done: `tailscale serve` dials the bridge from loopback itself, so every tailnet request
- * would take it.
- *
- * With no login configured the header is omitted rather than invented: the bridge is then either open
- * to the tailnet (it warns about that itself at boot) or it refuses, and a refusal reads as a refusal.
- */
-function identityHeader(deps: DoctorDeps): Record<string, string> | undefined {
-  const login = deps.ctx.env.COLLIE_TRUSTED_USER ?? "";
-  return login === "" ? undefined : { "Tailscale-User-Login": login };
-}
-
 /** A thunk that runs at most once: the first caller pays, every later one shares the same promise. */
 function once<T>(run: () => Promise<T>): () => Promise<T> {
   let pending: Promise<T> | null = null;
@@ -1920,6 +1940,50 @@ function walkyRefusals(deps: DoctorDeps): Finding[] {
 }
 
 /**
+ * `telemetry` — whether this install sends its anonymous daily ping, and which switch decided it
+ * (M86 spec 01). Info only: off is a choice. A pure read: it makes no ID and writes no file.
+ *
+ * THE RUNNING BRIDGE DECIDES, NOT THIS SHELL. A service reads its own `.env`, so `COLLIE_TELEMETRY` in
+ * the shell that runs `collie doctor` says nothing about the bridge that would send. The bridge is asked
+ * first, over the route the Settings card uses (`GET /api/telemetry`, the local read credential), and
+ * the line says it is the bridge's answer. With no bridge answering, this verb evaluates the switches
+ * from its own environment and config file and says that it did, and that the service reads its own
+ * `.env`. A value of `COLLIE_TELEMETRY` that nobody knows is a warning of its own: it reads as off.
+ */
+export async function telemetryFindings(deps: Pick<DoctorDeps, "ctx" | "files" | "fetch">): Promise<Finding[]> {
+  const asked = await readOwnSnapshot(deps, { path: "/api/telemetry", extraHeaders: identityHeader(deps) });
+  const bridge = asked.kind === "body" ? bridgeTelemetryAnswer(asked.text) : null;
+  const unknown = telemetrySwitchWarning(deps.ctx.env);
+  const switchWarning =
+    unknown === null
+      ? []
+      : [warn("telemetry-switch", unknown, "set COLLIE_TELEMETRY to 0 or 1, in the service .env for a service, then run `collie restart`")];
+  if (bridge !== null) {
+    return [ok("telemetry", `${bridge.on ? "on" : "off"}, decided by ${TELEMETRY_DECIDERS[bridge.decidedBy]} (as the running bridge sees it)`), ...switchWarning];
+  }
+  const { env, configLayer, root, stateDir } = deps.ctx;
+  const setting = parseTelemetryRecord(deps.files.read(telemetryPath(stateDir))).setting;
+  const state = telemetryState({
+    env,
+    origin: telemetryOrigin(env, configLayer),
+    setting,
+    version: collieVersionBare(root, (p) => deps.files.read(p)),
+  });
+  const own = `${state.on ? "on" : "off"}, decided by ${TELEMETRY_DECIDERS[state.decidedBy]}`;
+  return [ok("telemetry", `${own} (as this shell sees it; the service reads its own .env)`), ...switchWarning];
+}
+
+/** The bridge's `GET /api/telemetry` body, or null when it is not that: an older bridge, or another answer. */
+function bridgeTelemetryAnswer(text: string): { on: boolean; decidedBy: TelemetryDecider } | null {
+  const doc = asJsonObject(parseJson(text));
+  if (doc === undefined) return null;
+  const on = asJsonBoolean(doc.on);
+  const decidedBy = parseTelemetryDecider(asJsonString(doc.decidedBy));
+  if (on === undefined || decidedBy === undefined) return null;
+  return { on, decidedBy };
+}
+
+/**
  * `account-windows` — whether the bridge reads the operator's own harness logins to ask the vendors for
  * the 5-hour and 7-day windows (ADR 0118), what each harness reads and where it asks. Never a warning:
  * off is a choice, and on reads nothing until a pane of the harness exists. OpenCode and Grok are off
@@ -2209,6 +2273,7 @@ export function doctorDeps(base: {
     ...base,
     link: realLinkFs,
     store: new TrustStore(base.ctx.stateDir),
+    ops: new CrewOpsStore(base.ctx.stateDir),
     fetch: (url, init) => fetch(url, init),
     // The bridge's own reader, seams and all (`bridge/beacon-io.ts`), so `doctor` counts what the
     // running bridge counts. Both of its seams are reads; neither can create the directory.

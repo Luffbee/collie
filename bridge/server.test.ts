@@ -85,7 +85,9 @@ import {
   withHsts,
   arrivedOverHttps,
   chatBodyForMux,
+  telemetryTroubleRoute,
 } from "./server.ts";
+import { createTelemetry, readTelemetryRecord, telemetryPath, type TroubleSignal } from "./telemetry.ts";
 import {
   createPairLimiter,
   pairSourceKey,
@@ -93,7 +95,7 @@ import {
   PAIR_WINDOW_MS,
 } from "./pair-limit.ts";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, rm, truncate, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -151,6 +153,7 @@ import { grokJournal } from "./journal/grok.ts";
 import { museJournal } from "./journal/muse.ts";
 import { TranscriptStore } from "./journal/store.ts";
 import { LiveWindows } from "./journal/live.ts";
+import { piJournal, piSessionFolderNames } from "./journal/pi.ts";
 import type { JournalAdapter } from "./journal/types.ts";
 import {
   MUX_LOGO_PATH,
@@ -2114,6 +2117,8 @@ describe("parseNotifyPrefsPatch", () => {
     // `{ cache: true }` became an empty patch and the bridge answered with the old value.
     expect(parseNotifyPrefsPatch({ cache: true })).toEqual({ cache: true });
     expect(parseNotifyPrefsPatch({ machines: false })).toEqual({ machines: false });
+    expect(parseNotifyPrefsPatch({ individual: true })).toEqual({ individual: true });
+    expect(parseNotifyPrefsPatch({ individual: "yes" })).toBeNull();
     expect(parseNotifyPrefsPatch({ blocked: false, done: true, updates: false, cache: false })).toEqual({
       blocked: false,
       done: true,
@@ -3597,6 +3602,35 @@ describe("the widened snapshot composes with the host scope (M22/06)", () => {
   });
 });
 
+// The serialiser lives in `serve()`, which bun test cannot stand up, so the Tasks mark's sources are
+// pinned where they are read. Behaviour is in bridge/todos.test.ts (`JournalTodos`).
+describe("the pane's todos: the journal plan is the third source, and takes the mask like the others", () => {
+  const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+
+  test("the tracker answers first, the journal plan only where it has nothing, and the mask covers both", () => {
+    expect(src).toContain("const journalTodos = live === null || journals === null ? null : new JournalTodos(journals, live, () => Date.now());");
+    expect(src).toContain("const readTodos = opts.todos?.get(p) ?? journalTodos?.get(p);");
+    expect(src).toContain("const todos = readTodos !== undefined && cfg.redact ? maskTodoList(readTodos) : readTodos;");
+  });
+});
+
+// Pinned where it is read, for the reason the Tasks block above gives. Behaviour, including the
+// absent field and the mask itself, is in bridge/jobs-journal.test.ts (`JournalJobs`, `maskJobList`).
+describe("the pane's jobs: read from the live windows, attached beside the subagents, and masked", () => {
+  const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+
+  test("the reader is built over the live windows and its list takes the mask before it is attached", () => {
+    expect(src).toContain("const journalJobs = live === null || journals === null ? null : new JournalJobs(journals, live, () => Date.now());");
+    expect(src).toContain("const readJobs = journalJobs?.get(p);");
+    expect(src).toContain("const jobs = readJobs !== undefined && cfg.redact ? maskJobList(readJobs) : readJobs;");
+  });
+
+  test("a pane with no jobs gets no key: the field is spread only when the list is there", () => {
+    expect(src).toContain("const withJobs = jobs === undefined ? withSubagents : { ...withSubagents, jobs };");
+    expect(src).toContain("const withUsage = readUsage === undefined ? withJobs : { ...withJobs, usage: readUsage };");
+  });
+});
+
 describe("the host gate — `?host=` selects among enrolled members and nothing else", () => {
   const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
 
@@ -3620,11 +3654,11 @@ describe("the host gate — `?host=` selects among enrolled members and nothing 
     // read that checks a typed line before it runs (ADR 0095, amendment), and a durable program's
     // conversation list and the items or reopen of one (M53 spec 11), and Sent's read and its two
     // writes, served by one function with one resolve for the read and one for the writes (ADR 0107),
-    // and the New page's folder browser (#467)) reach their runtime through the caller's resolver and
+    // and the New page's folder browser (#467), and a session's walky talky off switch (M89 spec 04)) reach their runtime through the caller's resolver and
     // nothing else. One of them, the launcher rows, hands the resolver the lead's merge (ADR 0127), and
     // two, the launch and the branch create, hand it the lead's row carry (ADR 0127 point 3).
     const carry = String.raw`undefined, leadRowCarry\(allowedLaunchers, homedir\(\)\)`;
-    expect([...src.matchAll(new RegExp(String.raw`await caller\.resolve\((?:leadRows|${carry})?\);`, "g"))]).toHaveLength(27);
+    expect([...src.matchAll(new RegExp(String.raw`await caller\.resolve\((?:leadRows|${carry})?\);`, "g"))]).toHaveLength(28);
     expect([...src.matchAll(/await caller\.resolve\(leadRows\);/g)]).toHaveLength(1);
     expect([...src.matchAll(new RegExp(String.raw`await caller\.resolve\(${carry}\);`, "g"))]).toHaveLength(2);
     // Exactly eight `registry.get(` calls remain, and each is a sanctioned one, named here rather
@@ -3797,6 +3831,113 @@ describe("the update write gate — POST api/update rides the pane path's own ga
     // A switch changes what is offered; it never starts the updater.
     expect(handler).not.toContain("action.start");
     expect(handler).not.toContain("updateAction");
+  });
+
+  test("api/telemetry: a read-gated GET, a write-gated POST with a request id and a replay, and the route sends no ping (M86 spec 01)", () => {
+    const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+    const at = src.indexOf('if (pathname === "/api/telemetry" && (req.method === "GET" || req.method === "POST"))');
+    expect(at).toBeGreaterThan(0);
+    const handler = src.slice(at, src.indexOf("\n      }\n", at));
+    // Both methods answer 503 without the seam, like the release line.
+    expect(handler).toContain('text("telemetry unavailable", 503)');
+    expect(handler).toContain('guard(req, cfg, "read", pairingGate)');
+    expect(handler).toContain('const denied = browserGate("write");');
+    expect(handler).toContain("parseTelemetryRequest(body)");
+    // A body with no setting is 400; a body with a setting and no request id is 400 too.
+    expect(handler).toContain("parsed.setting === null");
+    expect(handler).toContain("parsed.requestId === null");
+    expect(handler).toContain("jsonError(");
+    expect(handler).toContain("400,");
+    // Both refusals carry an api error code the phone translates, never a bare `{ error }` (M86 spec 02).
+    expect(handler).toContain('apiError("telemetry.setting_invalid")');
+    expect(handler).toContain('apiError("telemetry.request_id_required")');
+    expect(handler).not.toContain("jsonError({ error:");
+    // The replay answers the same body again and records nothing.
+    expect(handler).toContain("ping.choose({ setting: parsed.setting, requestId: parsed.requestId })");
+    expect(handler).toContain("if (!result.replay) {");
+    expect(handler).toContain("receipt.replay = true;");
+    // Only the timer sends: the route never reaches the network.
+    expect(handler).not.toContain("fetch(");
+    expect(handler).not.toContain("tick(");
+  });
+
+  test("api/telemetry/trouble: write-gated, no request id, no audit line, the body parsed by telemetryTroubleRoute (M86 spec 05)", () => {
+    const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+    const at = src.indexOf('if (pathname === "/api/telemetry/trouble" && req.method === "POST")');
+    expect(at).toBeGreaterThan(0);
+    const handler = src.slice(at, src.indexOf("\n      }\n", at));
+    expect(handler).toContain('const denied = browserGate("write");');
+    expect(handler).toContain("return telemetryTroubleRoute(opts.telemetry, body);");
+    // A count, not a command: no request id, nothing in the audit log, and never a ping from here.
+    expect(handler).not.toContain("requestId");
+    expect(handler).not.toContain("audit.record");
+    expect(handler).not.toContain("fetch(");
+    expect(handler).not.toContain("tick(");
+  });
+
+  describe("telemetryTroubleRoute (M86 spec 05)", () => {
+    const SIGNAL: TroubleSignal = { kind: "send", harness: "claude", version: "2.1.316", mux: "herdr" };
+    const telemetryIn = (stateDir: string, env: Record<string, string> = {}) =>
+      createTelemetry({
+        stateDir,
+        env,
+        origin: "env",
+        version: "1.27.0+fd5a796587",
+        installKind: "binary",
+        line: () => "stable",
+        crewMode: () => "solo",
+        now: () => Date.UTC(2026, 10, 6, 12),
+        fetch: async () => new Response("ok"),
+        os: "linux",
+        arch: "x64",
+        newId: () => "1".repeat(32),
+      });
+
+    test("a good body is a 204 and counts one", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "collie-trouble-route-"));
+      try {
+        const ping = telemetryIn(dir);
+        expect(telemetryTroubleRoute(ping, { ...SIGNAL }).status).toBe(204);
+        expect(telemetryTroubleRoute(ping, { ...SIGNAL }).status).toBe(204);
+        expect(readTelemetryRecord(dir).trouble).toEqual([{ ...SIGNAL, count: 2 }]);
+        expect(ping.view().next?.trouble).toEqual([{ ...SIGNAL, count: 2 }]);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    test("a bad body is a 400 telemetry.trouble_invalid and stores nothing", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "collie-trouble-route-"));
+      try {
+        const ping = telemetryIn(dir);
+        for (const body of [undefined, "send", { ...SIGNAL, paneId: "w1:p1" }, { ...SIGNAL, kind: "crash" }, { ...SIGNAL, mux: "bad mux" }]) {
+          const res = telemetryTroubleRoute(ping, body);
+          expect(res.status).toBe(400);
+          expect(await res.text()).toBe("telemetry.trouble_invalid");
+        }
+        expect(readTelemetryRecord(dir).trouble).toEqual([]);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    test("telemetry off: a 204, and the signal writes nothing", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "collie-trouble-route-"));
+      try {
+        const ping = telemetryIn(dir, { DO_NOT_TRACK: "1" });
+        ping.observe();
+        const before = readFileSync(telemetryPath(dir), "utf8");
+        expect(telemetryTroubleRoute(ping, { ...SIGNAL }).status).toBe(204);
+        expect(readFileSync(telemetryPath(dir), "utf8")).toBe(before);
+        expect(readTelemetryRecord(dir).trouble).toEqual([]);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    test("no telemetry seam is a 503", () => {
+      expect(telemetryTroubleRoute(undefined, { ...SIGNAL }).status).toBe(503);
+    });
   });
 
   test("update check GET: an unknown latest triggers a bounded on-demand poll before answering", () => {
@@ -5384,6 +5525,8 @@ describe("an input written to a pane makes its engine hot", () => {
     }
     expect(isTopologyWrite("/api/pane/w1%3Ap1/close", "POST")).toBe(true);
     expect(isTopologyWrite("/api/pane/w1%3Ap1/rename", "POST")).toBe(true);
+    // A walky talky switch set on a member buys the same hot spell (M89 spec 04).
+    expect(isTopologyWrite("/api/walky/off", "POST")).toBe(true);
     expect(isTopologyWrite("/api/launch", "GET")).toBe(false);
     expect(isTopologyWrite("/api/worktree/plan", "GET")).toBe(false);
     for (const path of ["/api/launch/recent/clear", "/api/launch/check", "/api/launchers", "/api/folders/star", "/api/pane/w1%3Ap1/reply", "/api/pane/w1%3Ap1/focus", "/api/pane/w1%3Ap1/upload"]) {
@@ -5632,7 +5775,7 @@ describe("journalRefOf — which session the history and chat routes read", () =
     const other = pane({ paneId: "w1:p2", agent: "omp" });
     expect(await journalRefOf(a, mine, [mine, other])).toBeNull();
     expect(seen).toEqual([{ shared: true }]);
-    expect(noSessionDetail(a, mine, [mine, other])).toBe("shared-folder");
+    expect(await noSessionDetail(a, mine, [mine, other])).toBe("shared-folder");
     // A pi pane beside an omp pane is the same: either one's log could be the newest.
     expect(await journalRefOf(a, pane({ agent: "pi" }), [pane({ agent: "pi" }), other])).toBeNull();
     // Alone in the folder, the walk answers.
@@ -5740,6 +5883,43 @@ describe("journalRefOf — which session the history and chat routes read", () =
       await writeFile(join(base, "active_sessions.json"), JSON.stringify([row]));
       const real = grokJournal([join(base, "sessions")]);
       expect(await journalRefOf(real, pane({ agentSession: reported }), [])).toEqual(resumed);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+  test("pi panes through cwd aliases refuse shared guessing but accept each contained named resume", async () => {
+    const base = await realpath(await mkdtemp(join(tmpdir(), "collie-pi-alias-wire-")));
+    try {
+      const cwd = join(base, "project");
+      const alias = join(base, "project-alias");
+      await mkdir(cwd, { recursive: true });
+      await symlink(cwd, alias);
+      const root = join(base, "sessions");
+      const folder = piSessionFolderNames(cwd, { home: homedir(), tmp: tmpdir() })[0]!;
+      const folderPath = join(root, folder);
+      await mkdir(folderPath, { recursive: true });
+      const older = "019f4665-7df0-7540-a64f-7068335f2201";
+      const newer = "019f4665-7df0-7540-a64f-7068335f2202";
+      const log = (id: string) => join(folderPath, `2026-10-30T10-00-00-000Z_${id}.jsonl`);
+      const header = (id: string) => JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-10-30T10:00:00.000Z", cwd });
+      await writeFile(log(older), `${header(older)}\n`);
+      await writeFile(log(newer), `${header(newer)}\n`);
+
+      const aliasedPiJournal = piJournal(root);
+      const aliased = pane({ agent: "omp", cwd: alias });
+      const canonical = pane({ paneId: "w1:p2", agent: "pi", cwd });
+      const panes = [aliased, canonical];
+      expect(await journalRefOf(aliasedPiJournal, aliased, panes)).toBeNull();
+      expect(await journalRefOf(aliasedPiJournal, canonical, panes)).toBeNull();
+      expect(await noSessionDetail(aliasedPiJournal, aliased, panes)).toBe("shared-folder");
+      expect(await noSessionDetail(aliasedPiJournal, canonical, panes)).toBe("shared-folder");
+
+      const olderRef = await journalRefOf(aliasedPiJournal, aliased, panes, { processes: [{ argv: ["omp", "--resume", log(older)] }] });
+      const newerRef = await journalRefOf(aliasedPiJournal, canonical, panes, { processes: [{ argv: ["pi", "--session", log(newer)] }] });
+      expect(olderRef).toEqual({ kind: "id", value: older });
+      expect(newerRef).toEqual({ kind: "id", value: newer });
+      expect(await aliasedPiJournal.source.resolve(olderRef!)).toBe(log(older));
+      expect(await aliasedPiJournal.source.resolve(newerRef!)).toBe(log(newer));
     } finally {
       await rm(base, { recursive: true, force: true });
     }

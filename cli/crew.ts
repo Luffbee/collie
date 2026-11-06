@@ -67,6 +67,7 @@ import { herdTagFor } from "../bridge/sessions.ts";
 import { compareSemver } from "../bridge/update.ts";
 import { sameBuild } from "../bridge/version.ts";
 import { collieVersionBare, DEFAULT_SERVE_PORT, type CliContext } from "./context.ts";
+import { crewDelta, deltaLines } from "./crew-delta.ts";
 import { groupMembersByHost } from "./host-groups.ts";
 import { EXIT, type Io } from "./io.ts";
 import { dropEnvAssignments } from "./push-keys.ts";
@@ -660,19 +661,33 @@ export const WINDOWS_CREW_SENTENCE =
  * print. Elsewhere it names the two ways in; on Windows both verbs refuse ({@link refuseCrewOnWindows}),
  * so it says that instead of suggesting a command that fails.
  */
-export function soloCrewHint(host: Host): string {
-  return host.platform === "win32"
+export function soloCrewHint(host: Host, env: Record<string, string | undefined> = {}): string {
+  return host.platform === "win32" && !crewsOnWindows(env)
     ? "  A Windows machine cannot join or lead a crew in this release."
     : "  `collie crew invite` here makes it a lead; `collie join …` makes it a peer.";
 }
 
 /**
+ * The opt-in that opens the crew-forming verbs on Windows: `COLLIE_CREWS_ON_WINDOWS=1`.
+ *
+ * Windows crews are untested upstream (docs/windows.md keeps them "not covered"), so the refusal
+ * stays the default and one environment variable consents to the experiment. The crew wire itself is
+ * platform-neutral — pinned mTLS between bridges, certificates minted in-process — and this build
+ * also fixes what a Windows lead actually tripped on: `crew add`'s ssh legs run without connection
+ * multiplexing, which Windows OpenSSH cannot do ({@link sshOptions}).
+ */
+export function crewsOnWindows(env: Record<string, string | undefined>): boolean {
+  return env.COLLIE_CREWS_ON_WINDOWS === "1";
+}
+
+/**
  * Refuse a crew-forming verb on a Windows host, before any argument, store, network or terminal is
  * touched. True when it refused; the caller returns `EXIT.FAIL`, as `collie update` does for its
- * own Windows refusal.
+ * own Windows refusal. {@link crewsOnWindows} consents past it.
  */
-export function refuseCrewOnWindows(deps: Pick<CrewDeps, "host" | "io">): boolean {
+export function refuseCrewOnWindows(deps: Pick<CrewDeps, "ctx" | "host" | "io">): boolean {
   if (deps.host.platform !== "win32") return false;
+  if (crewsOnWindows(deps.ctx.env)) return false;
   deps.io.err(`error: ${WINDOWS_CREW_SENTENCE}`);
   return true;
 }
@@ -1348,7 +1363,7 @@ export async function cmdCrewStatus(deps: CrewDeps, args: readonly string[]): Pr
   if (bare.has("json")) return await crewStatusJson(deps, data, bare.has("no-probe"));
   if (data === null || data.crew === null) {
     deps.io.out("mode: solo — this collie is not in a crew (no trust store, or an empty one).");
-    deps.io.out(soloCrewHint(deps.host));
+    deps.io.out(soloCrewHint(deps.host, deps.ctx.env));
     return EXIT.OK;
   }
 
@@ -1398,6 +1413,7 @@ export async function cmdCrewStatus(deps: CrewDeps, args: readonly string[]): Pr
   const members = data.lead === null ? data.peers : [data.lead, ...data.peers];
   if (members.length === 0) {
     deps.io.out("members: none yet — mint an invite and run `collie join` on the other machine.");
+    for (const line of await crewDeltaLines(deps)) deps.io.out(line);
     return EXIT.OK;
   }
 
@@ -1543,8 +1559,20 @@ export async function cmdCrewStatus(deps: CrewDeps, args: readonly string[]): Pr
     for (const l of schemedAddressLines(m.memberId, m.address, m.role)) row(l.text, l.tone);
     for (const l of unreachableLeadLines(m)) row(l.text, l.tone);
   }
+  // Under `--no-probe` too: nothing in the delta dials anyone (`cli/crew-delta.ts`).
+  for (const line of await crewDeltaLines(deps)) emit(line, "dim");
   if (deps.ui != null) await deps.ui.crewMembers(banked);
   return EXIT.OK;
+}
+
+/**
+ * Where a multiplexer's machine list and this crew differ, as `collie start` and `doctor` print it
+ * (M84/04). Only a lead gets it: a machine in no crew prints its "in no crew" block and spawns
+ * nothing (the solo branch above returns before this), and a peer has no crew to compare, which
+ * {@link crewDelta} answers without a spawn.
+ */
+async function crewDeltaLines(deps: CrewDeps): Promise<readonly string[]> {
+  return deltaLines(await crewDelta(deps));
 }
 
 /**
@@ -2039,6 +2067,9 @@ export async function cmdCrewRemove(deps: CrewDeps, args: readonly string[]): Pr
   deps.io.out("  own copy of the crew until its operator runs `collie leave` there. Either side alone ends");
   deps.io.out("  the link (§8.4) — this side is now ended.");
   for (const line of leaveTheOtherSideLines(deps, record)) deps.io.out(line);
+  // The one line `crew add` will need later: a removed machine still answers as a member, and the
+  // add refuses it (`✗ not joined`) until `collie leave` has run there.
+  deps.io.out(`  ${record?.sshHost ?? memberId} still runs Collie as a member; run \`collie leave\` there before you add it again.`);
   await applyLocally(deps, "the shortened roster");
   return EXIT.OK;
 }

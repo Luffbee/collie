@@ -42,6 +42,18 @@
   }
  },
  {
+  "fixture": "claude--background-work-exit-1.txt",
+  "frame": null
+ },
+ {
+  "fixture": "claude--background-work-exit-2.txt",
+  "frame": null
+ },
+ {
+  "fixture": "claude--background-work-exit-3.txt",
+  "frame": null
+ },
+ {
   "fixture": "claude--box-table-vs16-emoji.txt",
   "frame": null
  },
@@ -2167,6 +2179,86 @@
   }
  },
  {
+  "fixture": "claude--v2317-next-steps-suggestions-dismissed--w100.txt",
+  "frame": {
+   "top": 5,
+   "prompt": 6,
+   "bottom": 7,
+   "label": null,
+   "text": "Add unit tests for parse_csv_line covering quoted commas, doubled quotes, and empty fields.",
+   "placeholder": true,
+   "status": {
+    "first": 8,
+    "last": 8
+   },
+   "footer": null
+  }
+ },
+ {
+  "fixture": "claude--v2317-next-steps-suggestions-empty-box--w100.txt",
+  "frame": {
+   "top": 11,
+   "prompt": 12,
+   "bottom": 13,
+   "label": null,
+   "text": "Add unit tests for parse_csv_line covering quoted commas, doubled quotes, and empty fields.",
+   "placeholder": true,
+   "status": {
+    "first": 14,
+    "last": 14
+   },
+   "footer": null
+  }
+ },
+ {
+  "fixture": "claude--v2317-next-steps-suggestions-one-line-draft--w100.txt",
+  "frame": {
+   "top": 11,
+   "prompt": 12,
+   "bottom": 13,
+   "label": null,
+   "text": "also add a docstring",
+   "placeholder": false,
+   "status": {
+    "first": 14,
+    "last": 14
+   },
+   "footer": null
+  }
+ },
+ {
+  "fixture": "claude--v2317-survey-context-row--w160.txt",
+  "frame": {
+   "top": 7,
+   "prompt": 8,
+   "bottom": 9,
+   "label": "main",
+   "text": "",
+   "placeholder": false,
+   "status": {
+    "first": 10,
+    "last": 10
+   },
+   "footer": null
+  }
+ },
+ {
+  "fixture": "claude--v2317-survey-context-row-plain--w160.txt",
+  "frame": {
+   "top": 7,
+   "prompt": 8,
+   "bottom": 9,
+   "label": "main",
+   "text": "",
+   "placeholder": false,
+   "status": {
+    "first": 10,
+    "last": 10
+   },
+   "footer": null
+  }
+ },
+ {
   "fixture": "claude--v2317-verbose-tokens-notice-idle--w154.txt",
   "frame": {
    "top": 5,
@@ -2181,6 +2273,10 @@
    },
    "footer": null
   }
+ },
+ {
+  "fixture": "claude--v2318-model-picker-usage-notice-edge--w120.txt",
+  "frame": null
  },
  {
   "fixture": "claude--wizard-multiselect-checked.txt",

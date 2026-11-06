@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { mintIdentity } from "../crew/identity.ts";
-import { verifyMessage } from "./canonical.ts";
+import { canonicalMessage, verifyMessage } from "./canonical.ts";
 import { loadProfiles, profileFor, type VersionRange } from "../../web/src/lib/surface/profile.ts";
 import type { Surface } from "../../web/src/lib/surface/surface.ts";
 import { muxAck, muxOk, type MuxAck, type MuxGrid, type MuxOutcome } from "../mux/types.ts";
@@ -14,12 +14,12 @@ import { RowRing, SendProtocol, SessionLocks } from "../surface/protocol.ts";
 import { SurfaceShadow } from "../surface/shadow.ts";
 import type { AgentView } from "../types.ts";
 import { RequestStore } from "../surface/requests.ts";
-import { CANCELLED_BY_SENDER, DROPPED_BY_OWNER, HELD_LIMIT_MS, HELD_POLL_MS, reasonOf, sendIdOf, type SendResult, type WalkyHold, type WalkyHost, type WalkyPane } from "./deliver.ts";
+import { CANCELLED_BY_SENDER, DROPPED_BY_OWNER, HELD_LIMIT_MS, HELD_POLL_MS, isResting, REST_MS, reasonOf, sendIdOf, type SendResult, type WalkyHold, type WalkyHost, type WalkyPane } from "./deliver.ts";
 import { WalkyLog } from "./log.ts";
 import { RateLimiter } from "./rate.ts";
 import { OUT_OF_SCOPE } from "./refusals.ts";
 import { NOT_THE_SENDER, WalkyService, type WalkyServiceDeps } from "./service.ts";
-import type { WalkyTarget } from "./types.ts";
+import { RESTING, SENDER_OFF, WALKY_OFF, type WalkyTarget } from "./types.ts";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -27,7 +27,7 @@ afterEach(() => {
 });
 
 function pane(paneId: string, over: Partial<WalkyPane> = {}): WalkyPane {
-  return { session: "main", paneId, agent: true, harness: "agent-x", label: `repo#${paneId}`, state: "idle", instance: "aaaa", terminal: true, ...over };
+  return { session: "main", paneId, agent: true, harness: "agent-x", label: `repo#${paneId}`, state: "idle", activeAt: null, instance: "aaaa", terminal: true, off: false, ...over };
 }
 
 class FakeHost implements WalkyHost {
@@ -1633,5 +1633,335 @@ describe("the pair limit is a setting", () => {
     expect(await states("wt_aaaaaaaaaaa2", "local/w1:p1", panes[1]!)).toEqual(["accepted"]);
     expect(await states("wt_aaaaaaaaaaa3", "local/w1:p2", panes[0]!)).toEqual(["refused pair limit"]);
     expect(await states("wt_aaaaaaaaaaa4", "local/w1:p3", panes[0]!)).toEqual(["accepted"]);
+  });
+});
+
+describe("resting panes (M85 spec 01)", () => {
+  const NOW = 1_786_000_000_000;
+  const MIN = 60_000;
+  /** A pane whose status last changed `quiet` minutes before the rig's clock. */
+  const quiet = (paneId: string, minutes: number, over: Partial<WalkyPane> = {}) => pane(paneId, { label: "repo#main", state: "done", activeAt: NOW - minutes * MIN, ...over });
+  const agentOf = (from: WalkyPane) => ({ kind: "agent" as const, pane: from });
+
+  test("isResting: done or idle, quiet for 15 minutes or more; any other state or a missing time never rests", () => {
+    expect(isResting({ state: "done", activeAt: NOW - REST_MS }, NOW)).toBe(true);
+    expect(isResting({ state: "idle", activeAt: NOW - REST_MS - 1 }, NOW)).toBe(true);
+    expect(isResting({ state: "done", activeAt: NOW - REST_MS + 1 }, NOW)).toBe(false);
+    for (const state of ["working", "blocked", "unknown", "", "weird"]) expect(isResting({ state, activeAt: NOW - 600 * MIN }, NOW)).toBe(false);
+    expect(isResting({ state: "done", activeAt: null }, NOW)).toBe(false);
+    // A clock that ran backwards, or a time in the future, is not rest.
+    expect(isResting({ state: "done", activeAt: NOW + MIN }, NOW)).toBe(false);
+    expect(isResting({ state: "done", activeAt: Number.NaN }, NOW)).toBe(false);
+    expect(REST_MS).toBe(15 * MIN);
+  });
+
+  test("a done pane 20 minutes quiet in `here` ends inbox-only: resting, keeps the inbox entry, and gets no Send Protocol call", async () => {
+    const panes = [quiet("w1:p1", 0, { state: "working" }), quiet("w1:p2", 20)];
+    const r = rig(panes);
+    const answer = await r.service.send(send("wt_aaaaaaaaaaa1", "here"), agentOf(panes[0]!));
+    expect(answer).toMatchObject({ ok: true, receipts: [{ target: "local/w1:p2", state: "inbox-only", reason: RESTING }] });
+    await r.service.deliverer.settled();
+    expect(r.host.sends).toEqual([]);
+    expect(r.service.status("wt_aaaaaaaaaaa1").receipts[0]).toMatchObject({ state: "inbox-only", reason: "resting" });
+    expect(r.service.inbox("main", "w1:p2", "aaaa", false).map((entry) => entry.id)).toEqual(["wt_aaaaaaaaaaa1"]);
+    expect(r.service.status("wt_aaaaaaaaaaa1").totals).toEqual({ "inbox-only": 1 });
+  });
+
+  test("the same pane 10 minutes quiet is typed", async () => {
+    const panes = [quiet("w1:p1", 0, { state: "working" }), quiet("w1:p2", 10)];
+    const r = rig(panes);
+    await r.service.send(send("wt_aaaaaaaaaaa1", "here"), agentOf(panes[0]!));
+    await r.service.deliverer.settled();
+    expect(r.host.sends.map((sent) => sent.pane)).toEqual(["w1:p2"]);
+    expect(r.service.status("wt_aaaaaaaaaaa1").receipts[0]?.state).toBe("delivered");
+  });
+
+  test("an unknown pane 20 minutes quiet, and a pane with no activity time, are typed", async () => {
+    const panes = [quiet("w1:p1", 0, { state: "working" }), quiet("w1:p2", 20, { state: "unknown" }), quiet("w1:p3", 0, { activeAt: null })];
+    const r = rig(panes);
+    await r.service.send(send("wt_aaaaaaaaaaa1", "here"), agentOf(panes[0]!));
+    await r.service.deliverer.settled();
+    expect(r.host.sends.map((sent) => sent.pane)).toEqual(["w1:p2", "w1:p3"]);
+  });
+
+  test("`wake: true` types the 20 minute pane, and the message carries the flag", async () => {
+    const panes = [quiet("w1:p1", 0, { state: "working" }), quiet("w1:p2", 20)];
+    const r = rig(panes);
+    await r.service.send({ ...send("wt_aaaaaaaaaaa1", "here"), wake: true }, agentOf(panes[0]!));
+    await r.service.deliverer.settled();
+    expect(r.host.sends.map((sent) => sent.pane)).toEqual(["w1:p2"]);
+    expect(r.service.status("wt_aaaaaaaaaaa1").message?.wake).toBe(true);
+    // Without the flag the message has no `wake` key at all.
+    await r.service.send(send("wt_aaaaaaaaaaa2", "here"), agentOf(panes[0]!));
+    expect(r.service.status("wt_aaaaaaaaaaa2").message).not.toHaveProperty("wake");
+  });
+
+  test("a direct send to the resting pane's own address is typed", async () => {
+    const r = rig([quiet("w1:p2", 20)]);
+    await r.service.send(send("wt_aaaaaaaaaaa1", "local/w1:p2"), operator);
+    await r.service.deliverer.settled();
+    expect(r.host.sends.map((sent) => sent.pane)).toEqual(["w1:p2"]);
+    expect(r.service.status("wt_aaaaaaaaaaa1").receipts[0]?.state).toBe("delivered");
+  });
+
+  test("the operator's `all` follows the same rule, and `wake` turns it off", async () => {
+    const panes = [quiet("w1:p1", 20), quiet("w1:p2", 20, { state: "idle" }), quiet("w1:p3", 2), quiet("w1:p4", 0, { state: "working" })];
+    const r = rig(panes);
+    const answer = await r.service.send(send("wt_aaaaaaaaaaa1", "all"), operator);
+    expect(answer.ok && answer.receipts.map((receipt) => `${receipt.target} ${receipt.state}${receipt.reason === undefined ? "" : `: ${receipt.reason}`}`)).toEqual([
+      "local/w1:p1 inbox-only: resting",
+      "local/w1:p2 inbox-only: resting",
+      "local/w1:p3 accepted",
+      "local/w1:p4 accepted",
+    ]);
+    await r.service.deliverer.settled();
+    expect(r.host.sends.map((sent) => sent.pane)).toEqual(["w1:p3", "w1:p4"]);
+    r.host.sends.length = 0;
+    await r.service.send({ ...send("wt_aaaaaaaaaaa2", "all"), wake: true }, operator);
+    await r.service.deliverer.settled();
+    expect(r.host.sends.map((sent) => sent.pane)).toEqual(["w1:p1", "w1:p2", "w1:p3", "w1:p4"]);
+  });
+
+  test("the same id again answers the stored receipts and types nothing", async () => {
+    const panes = [quiet("w1:p1", 0, { state: "working" }), quiet("w1:p2", 20)];
+    const r = rig(panes);
+    await r.service.send(send("wt_aaaaaaaaaaa1", "here"), agentOf(panes[0]!));
+    const again = await r.service.send(send("wt_aaaaaaaaaaa1", "here"), agentOf(panes[0]!));
+    expect(again).toMatchObject({ ok: true, receipts: [{ target: "local/w1:p2", state: "inbox-only", reason: "resting" }] });
+    expect(r.host.sends).toEqual([]);
+  });
+
+  test("the broadcast's skipped list names shells and resting panes by reason", () => {
+    const r = rig([quiet("w1:p1", 20), quiet("w1:p2", 2), quiet("w1:p3", 0, { agent: false, harness: null, state: "idle" }), quiet("w1:p4", 20, { state: "working" })]);
+    expect(r.service.skipped().map((skipped) => `${skipped.address} ${skipped.reason}`)).toEqual(["local/w1:p1 resting", "local/w1:p3 shell"]);
+  });
+
+  test("a signed message with `wake` verifies, and without it the string is the one every older bridge computes", () => {
+    const identity = mintIdentity({ commonName: "collie-desk" });
+    const r = rig([quiet("w1:p1", 0)], { memberId: "desk", keyPem: () => identity.keyPem });
+    const plain = r.service.compose({ ...send("wt_aaaaaaaaaaa1", "all"), to: "all" }, operator);
+    const woken = r.service.compose({ ...send("wt_aaaaaaaaaaa1", "all"), to: "all", wake: true }, operator);
+    expect(plain !== null && verifyMessage(plain, identity.certPem)).toBe(true);
+    expect(woken !== null && verifyMessage(woken, identity.certPem)).toBe(true);
+    expect(canonicalMessage(woken!)).toBe(`${canonicalMessage(plain!)}\nwake`);
+    // Dropping the flag in transit breaks the signature: a hop cannot unset it.
+    expect(verifyMessage({ ...plain!, signature: woken!.signature }, identity.certPem)).toBe(false);
+  });
+});
+
+describe("a session with its walky talky off (M89)", () => {
+  const agentOf = (paneId: string, over: Partial<WalkyPane> = {}) => ({ kind: "agent" as const, pane: pane(paneId, over) });
+
+  test("an agent's message ends `refused: walky talky off`: nothing typed, nothing in the inbox, the refusal counted", async () => {
+    const r = rig([pane("w1:p1", { off: true }), pane("w1:p2", { instance: "bbbb" })]);
+    const answer = await r.service.send(send("wt_aaaaaaaaaaa1", "local/w1:p1"), agentOf("w1:p2", { instance: "bbbb" }));
+    expect(answer).toMatchObject({ ok: true, receipts: [{ target: "local/w1:p1", state: "refused", reason: WALKY_OFF }] });
+    await r.service.deliverer.settled();
+    expect(r.host.sends).toEqual([]);
+    expect(r.log.inbox("main", "w1:p1", "aaaa")).toEqual([]);
+    expect(r.service.refusals().counts[WALKY_OFF]).toBe(1);
+    expect(WALKY_OFF).toBe("walky talky off");
+  });
+
+  test("a reply to an off session is refused the same way", async () => {
+    const r = rig([pane("w1:p1"), pane("w1:p2", { instance: "bbbb" })]);
+    await r.service.send(send("wt_aaaaaaaaaaa1", "local/w1:p2"), agentOf("w1:p1"));
+    await r.service.deliverer.settled();
+    r.host.list = [pane("w1:p1", { off: true }), pane("w1:p2", { instance: "bbbb" })];
+    const answer = await r.service.send({ id: "wt_aaaaaaaaaaa2", to: null, body: "done", replyTo: "wt_aaaaaaaaaaa1" }, agentOf("w1:p2", { instance: "bbbb" }));
+    expect(answer).toMatchObject({ ok: true, receipts: [{ state: "refused", reason: WALKY_OFF }] });
+    expect(r.host.sends).toHaveLength(1);
+  });
+
+  test("an off pane in a scope is refused alone, and the others are typed; `wake` does not override it", async () => {
+    const r = rig([pane("w1:p1", { label: "repo#a" }), pane("w1:p2", { label: "repo#b", instance: "bbbb", off: true }), pane("w1:p3", { label: "repo#c", instance: "cccc" })]);
+    const answer = await r.service.send({ ...send("wt_aaaaaaaaaaa1", "here"), wake: true }, agentOf("w1:p1", { label: "repo#a" }));
+    if (!answer.ok) throw new Error(answer.error);
+    expect(answer.receipts.map(({ target, state, reason }) => ({ target, state, reason }))).toEqual([
+      { target: "local/w1:p2", state: "refused", reason: WALKY_OFF },
+      { target: "local/w1:p3", state: "accepted", reason: undefined },
+    ]);
+    await r.service.deliverer.settled();
+    expect(r.host.sends.map((sent) => sent.pane)).toEqual(["w1:p3"]);
+    expect(r.log.inbox("main", "w1:p2", "bbbb")).toEqual([]);
+  });
+
+  test("an off pane in a scope across a crew: the lead forwards the leg and reports the member's refusal, and the others are typed", async () => {
+    const legs: string[] = [];
+    const r = rig([pane("w1:p1", { label: "repo#a" }), pane("w1:p2", { label: "repo#b", instance: "bbbb" })], {
+      memberId: "desk",
+      knownMembers: () => ["desk", "laptop"],
+      // The sweep already says the member's pane is off. The lead does not enforce it.
+      remoteTargets: () => [{ address: "laptop/w1:p8#k3f9", memberId: "laptop", machine: "laptop", harness: "agent-x", label: "repo#c", state: "idle", walky: "off" }],
+      routeRemote: async (m, members, panes) => {
+        legs.push(`${members} ${(panes ?? []).join(",")}`);
+        return (panes ?? []).map((paneId) => ({ id: m.id, target: `${members}/${paneId}`, state: "refused" as const, reason: WALKY_OFF, verified: "lead" as const, at: 1, by: members }));
+      },
+    });
+    const answer = await r.service.send(send("wt_aaaaaaaaaaa1", "here"), agentOf("w1:p1", { label: "repo#a" }));
+    if (!answer.ok) throw new Error(answer.error);
+    expect(answer.receipts.map(({ target, state, reason }) => ({ target, state, reason }))).toEqual([
+      { target: "desk/w1:p2", state: "accepted", reason: undefined },
+      { target: "laptop/w1:p8", state: "refused", reason: WALKY_OFF },
+    ]);
+    expect(legs).toEqual(["laptop w1:p8"]);
+    expect(r.log.get("wt_aaaaaaaaaaa1", "laptop/w1:p8")?.receipt).toMatchObject({ state: "refused", reason: WALKY_OFF, by: "laptop" });
+    await r.service.deliverer.settled();
+    expect(r.host.sends.map((sent) => sent.pane)).toEqual(["w1:p2"]);
+  });
+
+  test("an off pane in a scope a lead routed here: the member refuses that pane, for an agent only", async () => {
+    const r = rig([pane("w1:p8", { label: "repo#c", off: true })], { memberId: "laptop" });
+    const routed = (id: string, kind: "agent" | "operator") => ({
+      v: 1 as const,
+      id,
+      kind,
+      from: { memberId: "desk", address: kind === "agent" ? "desk/w1:p1#aaaa" : null, harness: kind === "agent" ? "agent-x" : null, label: "repo#a" },
+      to: "repo",
+      replyTo: null,
+      at: 1_786_000_000_000,
+      body: "hello",
+      signer: "desk",
+      signature: "c2ln",
+    });
+    expect(await r.service.receive(routed("wt_aaaaaaaaaaa1", "agent"), "lead", true, undefined, "w1:p8")).toMatchObject([{ target: "laptop/w1:p8", state: "refused", reason: WALKY_OFF }]);
+    expect(await r.service.receive(routed("wt_aaaaaaaaaaa2", "operator"), "lead", true, undefined, "w1:p8")).toMatchObject([{ target: "laptop/w1:p8", state: "accepted" }]);
+    await r.service.deliverer.settled();
+    expect(r.host.sends).toHaveLength(1);
+  });
+
+  test("`skipped` does not list an off pane: the operator's `all` reaches it", () => {
+    const r = rig([pane("w1:p1", { off: true })]);
+    expect(r.service.skipped()).toEqual([]);
+    expect(r.service.who()[0]).toMatchObject({ address: "local/w1:p1#aaaa", walky: "off" });
+  });
+
+  test("an operator's message to an off pane is typed, to one pane and to `all`", async () => {
+    const r = rig([pane("w1:p1", { off: true })]);
+    await r.service.send(send("wt_aaaaaaaaaaa1", "local/w1:p1"), operator);
+    await r.service.send(send("wt_aaaaaaaaaaa2", "all"), operator);
+    await r.service.deliverer.settled();
+    expect(r.host.sends.map((sent) => sent.pane)).toEqual(["w1:p1", "w1:p1"]);
+    expect(r.service.status("wt_aaaaaaaaaaa1").receipts[0]?.state).toBe("delivered");
+    expect(r.service.status("wt_aaaaaaaaaaa2").receipts[0]?.state).toBe("delivered");
+  });
+
+  test("an off sender is refused `your walky talky is off`, for one pane, for a reply and for a scope", async () => {
+    const r = rig([pane("w1:p1", { off: true, label: "repo#a" }), pane("w1:p2", { instance: "bbbb", label: "repo#b" })]);
+    const from = agentOf("w1:p1", { off: true, label: "repo#a" });
+    expect(SENDER_OFF).toBe("your walky talky is off");
+    expect(await r.service.send(send("wt_aaaaaaaaaaa1", "local/w1:p2"), from)).toMatchObject({ ok: true, receipts: [{ state: "refused", reason: SENDER_OFF }] });
+    expect(await r.service.send(send("wt_aaaaaaaaaaa2", "here"), from)).toMatchObject({ ok: true, receipts: [{ state: "refused", reason: SENDER_OFF }] });
+    expect(await r.service.send(send("wt_aaaaaaaaaaa3", "repo"), from)).toMatchObject({ ok: true, receipts: [{ state: "refused", reason: SENDER_OFF }] });
+    await r.service.send(send("wt_aaaaaaaaaaa4", "local/w1:p1"), operator);
+    await r.service.deliverer.settled();
+    expect(await r.service.send({ id: "wt_aaaaaaaaaaa5", to: null, body: "no", replyTo: "wt_aaaaaaaaaaa4" }, from)).toMatchObject({ ok: true, receipts: [{ state: "refused" }] });
+    expect(r.host.sends.map((sent) => sent.pane)).toEqual(["w1:p1"]);
+    expect(r.log.inbox("main", "w1:p2", "bbbb")).toEqual([]);
+  });
+
+  test("an off sender is refused before a message leaves for another machine, and before a scope goes to the lead", async () => {
+    const routed: string[] = [];
+    const route = async (m: { id: string }, members: string) => {
+      routed.push(members);
+      return [{ id: m.id, target: members, state: "accepted" as const, verified: "local" as const, at: 1, by: "desk" }];
+    };
+    const off = pane("w1:p1", { off: true, label: "repo#a" });
+    const lead = rig([off], { memberId: "desk", routeRemote: route });
+    expect(await lead.service.send(send("wt_aaaaaaaaaaa1", "laptop/w1:p9"), { kind: "agent", pane: off })).toMatchObject({ ok: true, receipts: [{ state: "refused", reason: SENDER_OFF }] });
+    const member = rig([off], { memberId: "laptop", outcomesOnLead: true, routeRemote: route });
+    expect(await member.service.send(send("wt_aaaaaaaaaaa2", "here"), { kind: "agent", pane: off })).toMatchObject({ ok: true, receipts: [{ state: "refused", reason: SENDER_OFF }] });
+    expect(routed).toEqual([]);
+  });
+
+  test("the same id after the session turned on again is a fresh try: a refusal holds no seen entry", async () => {
+    const r = rig([pane("w1:p1", { off: true }), pane("w1:p2", { instance: "bbbb" })]);
+    const from = agentOf("w1:p2", { instance: "bbbb" });
+    expect(await r.service.send(send("wt_aaaaaaaaaaa1", "local/w1:p1"), from)).toMatchObject({ receipts: [{ state: "refused", reason: WALKY_OFF }] });
+    expect(r.service.status("wt_aaaaaaaaaaa1").receipts).toEqual([]);
+    r.host.list = [pane("w1:p1"), pane("w1:p2", { instance: "bbbb" })];
+    expect(await r.service.send(send("wt_aaaaaaaaaaa1", "local/w1:p1"), from)).toMatchObject({ receipts: [{ state: "accepted" }] });
+    await r.service.deliverer.settled();
+    expect(r.host.sends).toHaveLength(1);
+  });
+
+  test("a message a crew hop brought has no sender pane here: only the target's flag counts", async () => {
+    const r = rig([pane("w1:p1")], { memberId: "desk" });
+    const message = r.service.compose(send("wt_aaaaaaaaaaa1", "desk/w1:p1"), agentOf("w9:p9"));
+    if (message === null) throw new Error("no message");
+    expect(await r.service.receive({ ...message, from: { ...message.from, memberId: "laptop", address: "laptop/w9:p9#zzzz" } }, "lead", true)).toMatchObject([{ state: "accepted" }]);
+    r.host.list = [pane("w1:p1", { off: true })];
+    expect(await r.service.receive({ ...message, id: "wt_aaaaaaaaaaa2", from: { ...message.from, memberId: "laptop", address: "laptop/w9:p9#zzzz" } }, "lead", true)).toMatchObject([{ state: "refused", reason: WALKY_OFF }]);
+  });
+
+  test("a message held for a draft ends refused when the pane turned off before the release, and leaves the inbox", async () => {
+    const r = rig([pane("w1:p1"), pane("w1:p2", { instance: "bbbb" })]);
+    r.host.answer = { outcome: "held", reason: "draft_present" };
+    const sendId = sendIdOf("wt_aaaaaaaaaaa1", "local/w1:p1");
+    await r.service.send(send("wt_aaaaaaaaaaa1", "local/w1:p1"), agentOf("w1:p2", { instance: "bbbb" }));
+    expect(r.log.inbox("main", "w1:p1", "aaaa")).toHaveLength(1);
+    expect(r.service.deliverer.stillMeant(sendId, "main", "w1:p1")).toBe(true);
+    r.host.list = [pane("w1:p1", { off: true }), pane("w1:p2", { instance: "bbbb" })];
+    expect(r.service.deliverer.stillMeant(sendId, "main", "w1:p1")).toBe(false);
+    r.host.states.set(sendId, { outcome: "refused", reason: "pane_gone" });
+    await r.service.deliverer.settled();
+    expect(r.service.status("wt_aaaaaaaaaaa1").receipts[0]).toMatchObject({ state: "refused", reason: WALKY_OFF });
+    expect(r.log.inbox("main", "w1:p1", "aaaa")).toEqual([]);
+    expect(r.service.refusals().counts[WALKY_OFF]).toBe(1);
+  });
+
+  test("a hold that outlasts its clock in an off pane ends refused, not in the inbox", async () => {
+    const r = rig([pane("w1:p1"), pane("w1:p2", { instance: "bbbb" })]);
+    r.host.answer = { outcome: "held" };
+    await r.service.send(send("wt_aaaaaaaaaaa1", "local/w1:p1"), agentOf("w1:p2", { instance: "bbbb" }));
+    r.host.list = [pane("w1:p1", { off: true }), pane("w1:p2", { instance: "bbbb" })];
+    await r.service.deliverer.settled();
+    expect(r.service.status("wt_aaaaaaaaaaa1").receipts[0]).toMatchObject({ state: "refused", reason: WALKY_OFF });
+    expect(r.log.inbox("main", "w1:p1", "aaaa")).toEqual([]);
+  });
+
+  test("an operator's held message still goes: the release does not read the flag", async () => {
+    const r = rig([pane("w1:p1")]);
+    r.host.answer = { outcome: "held", reason: "draft_present" };
+    const sendId = sendIdOf("wt_aaaaaaaaaaa1", "local/w1:p1");
+    await r.service.send(send("wt_aaaaaaaaaaa1", "local/w1:p1"), operator);
+    r.host.list = [pane("w1:p1", { off: true })];
+    expect(r.service.deliverer.stillMeant(sendId, "main", "w1:p1")).toBe(true);
+    r.host.states.set(sendId, { outcome: "effective" });
+    await r.service.deliverer.settled();
+    expect(r.service.status("wt_aaaaaaaaaaa1").receipts[0]?.state).toBe("delivered");
+  });
+
+  test("a message that waited in the lane is refused when the pane turned off meanwhile", async () => {
+    const r = rig([pane("w1:p1"), pane("w1:p2", { instance: "bbbb" })]);
+    const gate = Promise.withResolvers<SendResult>();
+    const sent = r.host.send.bind(r.host);
+    let first = true;
+    r.host.send = async (...args) => {
+      if (!first) return sent(...args);
+      first = false;
+      await sent(...args);
+      return gate.promise;
+    };
+    const from = agentOf("w1:p2", { instance: "bbbb" });
+    await r.service.send(send("wt_aaaaaaaaaaa1", "local/w1:p1"), from);
+    await r.service.send(send("wt_aaaaaaaaaaa2", "local/w1:p1"), from);
+    r.host.list = [pane("w1:p1", { off: true }), pane("w1:p2", { instance: "bbbb" })];
+    gate.resolve({ outcome: "sent" });
+    await r.service.deliverer.settled();
+    expect(r.host.sends).toHaveLength(1);
+    expect(r.service.status("wt_aaaaaaaaaaa1").receipts[0]?.state).toBe("delivered");
+    expect(r.service.status("wt_aaaaaaaaaaa2").receipts[0]).toMatchObject({ state: "refused", reason: WALKY_OFF });
+    expect(r.log.inbox("main", "w1:p1", "aaaa").map((message) => message.id)).toEqual(["wt_aaaaaaaaaaa1"]);
+  });
+
+  test("turning it on lets the next send through", async () => {
+    const r = rig([pane("w1:p1", { off: true }), pane("w1:p2", { instance: "bbbb" })]);
+    const from = agentOf("w1:p2", { instance: "bbbb" });
+    expect(await r.service.send(send("wt_aaaaaaaaaaa1", "local/w1:p1"), from)).toMatchObject({ receipts: [{ state: "refused" }] });
+    r.host.list = [pane("w1:p1"), pane("w1:p2", { instance: "bbbb" })];
+    expect(await r.service.send(send("wt_aaaaaaaaaaa2", "local/w1:p1"), from)).toMatchObject({ receipts: [{ state: "accepted" }] });
+    await r.service.deliverer.settled();
+    expect(r.service.status("wt_aaaaaaaaaaa2").receipts[0]?.state).toBe("delivered");
   });
 });

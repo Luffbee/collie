@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { asJsonObject, asJsonString, parseJsonObject } from "../../../web/src/lib/json.ts";
 import type { JsonObject, JsonValue } from "../../json.ts";
-import { defaultHcSocket, HcClient, HcError, HcTimeout, readHcCore, type WireEvent } from "./client.ts";
+import { defaultHcSocket, HcClient, HcError, HcTimeout, parseTerminal, readHcCore, type WireEvent } from "./client.ts";
 
 // A unix-socket stand-in for the core, speaking the two modes HC_API.md records: plain JSON-RPC
 // lines, and framed mode after `hello {framed:true}`. Enough of each to prove the client's wire.
@@ -126,6 +126,13 @@ describe("HcClient over a unix socket", () => {
     expect(onStream.map((f) => f.kind)).toEqual([0, 2]);
     expect(onStream[0]?.payload.toString("utf8")).toBe("echo \"$HOME\" ä");
   });
+  test("framed raw input carries LF and DC1 unchanged", async () => {
+    const core = stand(() => {});
+    const client = new HcClient(core.path, 2000);
+    await client.typeRaw("t1", "first line\nsecond line\x11");
+    const input = core.framesIn.filter((got) => got.channel === 1 && got.kind === 0);
+    expect(input.map((got) => got.payload.toString("utf8"))).toEqual(["first line\nsecond line\x11"]);
+  });
 
   test("a stream comes up on the snapshot answer, reports events and `missed`, and drops what `missed` covered", async () => {
     const sockets: Socket[] = [];
@@ -232,5 +239,24 @@ describe("the default socket", () => {
     [{ XDG_RUNTIME_DIR: "/r" }, "/r/herdr-core/default.sock"],
   ])("with no /run/user/<uid> (macOS), %j dials %s", (env, path) => {
     expect(defaultHcSocket(env, 501, () => false, "/Users/u")).toBe(path);
+  });
+});
+
+describe("the foreground record of a terminal (#675)", () => {
+  const foregroundOf = (foreground: JsonValue) => parseTerminal({ address: "t1", foreground }).foreground;
+
+  test("pid and argv are read when the core sends them", () => {
+    expect(foregroundOf({ argv: ["omp", "--resume", "/x.jsonl"], cwd: "~", name: "omp", pid: 60190 })).toEqual({
+      name: "omp",
+      cwd: "~",
+      pid: 60190,
+      argv: ["omp", "--resume", "/x.jsonl"],
+    });
+  });
+
+  test("an older core that sends neither leaves both absent, and a pid that is not positive or an argv that is not words is dropped", () => {
+    expect(foregroundOf({ cwd: "~", name: "bash" })).toEqual({ name: "bash", cwd: "~" });
+    expect(foregroundOf({ cwd: "~", name: "bash", pid: 0, argv: ["a", 1] })).toEqual({ name: "bash", cwd: "~" });
+    expect(foregroundOf({ cwd: "~", name: "bash", pid: 1.5, argv: "bash" })).toEqual({ name: "bash", cwd: "~" });
   });
 });

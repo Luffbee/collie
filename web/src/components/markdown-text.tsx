@@ -589,6 +589,7 @@ function Block({ block, anchor, variant }: { block: MdBlock; anchor: string | nu
       // whether it had a bullet in front of it, and a list was the one place a code chip did not fit.
       return (
         <Tag
+          start={block.start}
           className={`ml-4 space-y-0.5 leading-relaxed ${block.ordered ? "list-decimal" : "list-disc"} marker:text-muted-foreground`}
         >
           {block.items.map((item, i) => (
@@ -601,8 +602,12 @@ function Block({ block, anchor, variant }: { block: MdBlock; anchor: string | nu
     }
     case "quote":
       return (
-        <blockquote className="border-l-2 pl-2.5 leading-relaxed text-muted-foreground italic">
-          <Spans spans={block.spans} />
+        // Italic only on the quote's prose: a code block or a table in it stays upright, as it reads
+        // everywhere else. `space-y-2` is the outer stack's, which does not reach inside.
+        <blockquote className="space-y-2 border-l-2 pl-2.5 leading-relaxed text-muted-foreground [&>:is(p,ul,ol)]:italic">
+          {block.blocks.map((inner, i) => (
+            <Block key={i} block={inner} anchor={null} variant={variant} />
+          ))}
         </blockquote>
       );
     case "table":

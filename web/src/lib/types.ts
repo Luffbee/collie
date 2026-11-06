@@ -17,6 +17,8 @@ export interface AgentView {
    * that session. Absent on a machine that predates it.
    */
   instance?: string;
+  /** True when the session turned its walky talky off (M89). Absent when on, and on an older machine. */
+  walkyOff?: true;
   workspaceId: string;
   workspaceLabel: string;
   workspaceNumber: number;
@@ -181,6 +183,12 @@ export interface AgentView {
    * or on an older bridge. Text only, never markup.
    */
   subagents?: PaneSubagent[];
+  /**
+   * The background jobs of this pane's session, running or ended in the last ten minutes. Mirrors
+   * `PaneJob` in bridge/jobs-journal.ts. **Absent, never a placeholder**, when there are none or on
+   * an older bridge. Text only, never markup.
+   */
+  jobs?: PaneJob[];
   /**
    * The model this pane's agent is on, in the harness's own words. Mirrors `PaneWire.model` in
    * bridge/types.ts. **Absent, never a placeholder**, and text only: read it through `modelLabel`
@@ -371,6 +379,21 @@ export interface PaneSubagent {
    * serves it, so the row is not a tap. Absent on a Claude Code subagent, whose transcript opens.
    */
   transcript?: false;
+}
+
+/** One background job of a pane's session. Mirrors `PaneJob` in bridge/jobs-journal.ts. */
+export interface PaneJob {
+  id: string;
+  /** The call's label, one line. Empty when the call named none. */
+  label: string;
+  /** The command it runs, one line, clipped. */
+  command: string;
+  /** ISO 8601. */
+  startedAt: string;
+  /** Absent while it runs, and on an end that named no code. */
+  exitCode?: number;
+  /** ISO 8601. Absent while it runs: a row with it has ended. */
+  endedAt?: string;
 }
 
 /**
@@ -1028,6 +1051,51 @@ export interface ReleaseLineReceipt {
   replay?: true;
 }
 
+/** Which switch decided the anonymous install count (`bridge/telemetry.ts`, a closed set). */
+export type TelemetryDecider =
+  | "do_not_track"
+  | "env"
+  | "config"
+  | "settings"
+  | "ci"
+  | "mirror"
+  | "dev_build"
+  | "url"
+  | "default";
+
+/** The phone's own switch: two words. */
+export type TelemetrySetting = "on" | "off";
+
+/** The exact message the next ping would send. A test on the bridge pins its key set. */
+export interface TelemetryPing {
+  v: number;
+  id: string;
+  day: string;
+  version: string;
+  os: string;
+  arch: string;
+  install: string;
+  line: string;
+}
+
+/** `GET /api/telemetry`: whether the count is on, which switch decided, and the next message. */
+export interface TelemetryView {
+  on: boolean;
+  decidedBy: TelemetryDecider;
+  /** The phone's switch as saved on the machine, or null when it never made one. */
+  setting: TelemetrySetting | null;
+  /** The exact JSON of the next ping; null when the count is off. */
+  next: TelemetryPing | null;
+}
+
+/** The answer of `POST /api/telemetry`: the same view, with the request id it answers. */
+export interface TelemetryReceipt extends TelemetryView {
+  ok: true;
+  requestId: string;
+  /** The same request id with the same setting was seen before; nothing changed this time. */
+  replay?: true;
+}
+
 /** The answer of `POST /api/update/back`: the same shape as a rollback's start. */
 export type GoBackStartResponse = RollbackStartResponse;
 
@@ -1365,7 +1433,19 @@ export interface PlanTask {
 export type ToolCall =
   | { kind: "edit"; path: string; added: number; removed: number; diff?: Hunk[]; created?: boolean }
   /** `background`: started and returned at once (`bash_background`, `monitor`). `ongoing`: it has not ended yet, though its start result is in. */
-  | { kind: "execute"; command: string; description?: string; exitCode?: number; background?: true; ongoing?: true }
+  | {
+      kind: "execute";
+      command: string;
+      description?: string;
+      exitCode?: number;
+      background?: true;
+      ongoing?: true;
+      jobId?: string;
+      /** Epoch ms. */
+      startedAt?: number;
+      /** Epoch ms. */
+      endedAt?: number;
+    }
   | { kind: "read"; path: string; range?: [number, number] }
   | { kind: "search"; query: string; where?: string; hits?: number }
   | { kind: "fetch"; url: string }
@@ -2498,6 +2578,9 @@ export interface NotifyPrefs {
   blocked: boolean;
   /** Push when an agent finishes its task. Default off. */
   done: boolean;
+  /** Send each alert as its own notification, one per agent, instead of one summary per machine.
+   *  Default off. */
+  individual: boolean;
   /** Push when a new Collie version is available (a restart or upgrade is waiting). Default on. */
   updates: boolean;
   /** Push before an agent pane's prompt cache expires. Default off, and it covers EVERY pane — the

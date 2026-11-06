@@ -11,6 +11,7 @@ import { ensureMuxChosen, pickHostOf } from "./mux.ts";
 import { resolveMux } from "../bridge/mux/herdr-core/pick.ts";
 import type { StatusView, Ui } from "./render.ts";
 import { censusLines, type CensusReader } from "./census.ts";
+import { crewDelta, deltaLines, type CrewDeltaDeps } from "./crew-delta.ts";
 import { cmdServeStatus, cmdUnserve, crewModeOnDisk, type ServeDeps } from "./serve.ts";
 import { phoneBlocked, SETUP_CLOSING, setupFindings, setupLines } from "./setup-findings.ts";
 import { pairedRegistryOf } from "./pairing.ts";
@@ -111,6 +112,12 @@ export interface LifecycleDeps extends ServeDeps {
   interactive?: boolean;
   /** The free-text ask the first-run picker uses. `null` means nobody answered. */
   prompt?(question: string): string | null | Promise<string | null>;
+  /**
+   * The trust store and the ops store, read to say where a multiplexer's machine list and the crew
+   * differ (`cli/crew-delta.ts`). Both are reads. Absent reads as "no crew to compare", so `start`
+   * prints no such line, which is what every test that is not about it sees.
+   */
+  crew?: Pick<CrewDeltaDeps, "store" | "ops">;
 }
 
 export type Tier = "systemd" | "launchd" | "taskscheduler" | "unsupervised";
@@ -1082,8 +1089,19 @@ export async function cmdStart(deps: LifecycleDeps): Promise<number> {
   if (chosen !== EXIT.OK) return chosen;
   const open = reportSetup(deps);
   const code = await launchBridge(deps);
+  if (code === EXIT.OK) await reportCrewDelta(deps);
   if (code === EXIT.OK && open) deps.io.err(SETUP_CLOSING);
   return code;
+}
+
+/**
+ * After the banner, where a multiplexer's machine list and the crew differ, one line each (M84/04).
+ * Stderr, like the setup rows. Silent when nothing differs, on a peer and on Windows
+ * ({@link crewDelta} runs nothing there), and when no crew seam is wired.
+ */
+async function reportCrewDelta(deps: LifecycleDeps): Promise<void> {
+  if (deps.crew === undefined) return;
+  for (const line of deltaLines(await crewDelta({ exec: deps.exec, host: deps.host, ...deps.crew }))) deps.io.err(line);
 }
 
 /** The start path of `restart`: settle the multiplexer, then launch. No setup check. */
@@ -1284,7 +1302,18 @@ export async function cmdExecBridge(deps: LifecycleDeps): Promise<number> {
   const spec = serviceSpec(deps.ctx, resolveTailscaleHosts(deps), deps.host);
   const env = { ...stringEnv(deps.ctx.env), ...bridgeEnvironment(spec) };
   for (const [k, v] of Object.entries(env)) process.env[k] = v;
-  await import("../bridge/index.ts");
+  try {
+    await import("../bridge/index.ts");
+  } catch (err) {
+    // The one place in the CLI that exits the process itself, against the rule in cli/program.ts
+    // that nothing may `process.exit()` (the exit code is `run`'s return value). For `_exec-bridge`
+    // the bridge IS the process. By the time a startup error reaches this catch the bridge has
+    // already opened its hold and walky sockets and started its poll loop and timers, so returning
+    // EXIT.FAIL would only set an exit code on a process that never ends: a dead bridge held alive,
+    // and a supervisor that restarts only an exit would never start it again (issue 699).
+    deps.io.err(`error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(EXIT.FAIL);
+  }
   return EXIT.OK;
 }
 

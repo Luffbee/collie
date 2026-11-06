@@ -11,7 +11,7 @@ import { readMessage, readReceipt } from "../bridge/walky/parse.ts";
 import { BARE_BAD_REQUEST, UNREAD_BY_OLDER_BRIDGE } from "../bridge/walky/refusals.ts";
 import type { WalkyTotals } from "../bridge/walky/service.ts";
 import { walkySocketPath } from "../bridge/walky/socket.ts";
-import { formatRead, mintWalkyId, OUTCOME_ON_LEAD, WALKY_ID, type WalkyMessage, type WalkyReceipt } from "../bridge/walky/types.ts";
+import { formatRead, mintWalkyId, OUTCOME_ON_LEAD, RESTING, SENDER_OFF, WALKY_ID, WALKY_OFF, type WalkyMessage, type WalkyReceipt } from "../bridge/walky/types.ts";
 
 // `collie walky`: walky talky from a terminal (M62 spec 02). It talks to the
 // running bridge over its local socket, `<stateDir>/walky/sock`, one JSON request per connection.
@@ -23,7 +23,7 @@ import { formatRead, mintWalkyId, OUTCOME_ON_LEAD, WALKY_ID, type WalkyMessage, 
 // bridges may run on one machine: the CLI asks each live one (the hook target registry, as the hold
 // does) until one knows its pane.
 
-export const WALKY_SUBCOMMANDS = ["who", "send", "reply", "inbox", "status", "cancel"] as const;
+export const WALKY_SUBCOMMANDS = ["who", "send", "reply", "inbox", "status", "cancel", "off", "on"] as const;
 
 /** How long `send` waits for the receipt to leave `accepted`. */
 export const SEND_WAIT_MS = 15_000;
@@ -141,6 +141,33 @@ function receiptsOf(value: JsonValue | undefined): WalkyReceipt[] {
 /** The line under a held receipt (M62 spec 02): when it will be typed, and not to send it again. */
 export const HELD_HINT = "typed when the box clears or the turn ends, up to 60 minutes. Do not send it again.";
 
+/** What an `inbox-only: resting` receipt reads (M85): a scope or `all` left the message for a session that rests. */
+export const RESTING_WORDS = "waiting in the inbox, not typed: the session rests";
+
+/** What a refusal from a session that turned its walky talky off reads (M89): the sender's next step is the operator. */
+export const WALKY_OFF_WORDS = `not sent: ${WALKY_OFF}. This session takes messages from its operator only. Ask your operator.`;
+
+/** What a refusal reads when the sender's own session is off (M89): the fix is one command. */
+export const SENDER_OFF_WORDS = `not sent: ${SENDER_OFF}. Turn it on: collie walky on`;
+
+/** What `collie walky off` prints. */
+export const OFF_WORDS = "walky talky off for this session. Other agents cannot message it; your operator still can. Turn it on: collie walky on";
+
+/** The warning beside `off` or `on` when another bridge on this machine is too old to read the verb. */
+export const OLDER_BRIDGE_SWITCH = "an older Collie bridge on this machine cannot read this switch; update it, or its panes still take agent messages";
+
+/** What `collie walky on` prints. */
+export const ON_WORDS = "walky talky on for this session.";
+
+/** The line under `who`'s table when the asker's own session is off. */
+export const YOU_ARE_OFF_WORDS = "Your walky talky is off. Turn it on: collie walky on";
+
+/** `who`'s STATE cell: the pane's state, and that its walky talky is off when it is. */
+function stateCell(row: JsonObject): string {
+  const state = asJsonString(row.state) ?? "-";
+  return row.walky === "off" ? `${state}, walky off` : state;
+}
+
 /** Whether a receipt is a held send: `accepted` with the reason that holds it (`draft present`, `turn running`). */
 export function isHeld(receipt: WalkyReceipt): boolean {
   return receipt.state === "accepted" && receipt.reason !== undefined;
@@ -160,10 +187,13 @@ export function stateWords(receipt: WalkyReceipt, elsewhere = false): string {
     case "delivered":
       return "typed into the pane";
     case "inbox-only":
+      if (receipt.reason === RESTING) return RESTING_WORDS;
       return reason === undefined ? "waiting in the inbox, not typed" : `waiting in the inbox, not typed: ${reason}`;
     case "unknown":
       return reason === undefined ? "may have arrived, will not be sent again" : `may have arrived, will not be sent again (${reason})`;
     case "refused":
+      if (receipt.reason === WALKY_OFF) return WALKY_OFF_WORDS;
+      if (receipt.reason === SENDER_OFF) return SENDER_OFF_WORDS;
       return reason === undefined ? "not sent" : `not sent: ${reason}`;
     case "expired":
       return "expired";
@@ -294,15 +324,17 @@ export async function cmdWalkyWho(deps: WalkyDeps, args: readonly string[]): Pro
   // A solo install with this one agent pane: nobody to message yet, and the reason in one line.
   if (scope === null && note === undefined && self !== undefined && self.startsWith(`${LOCAL_MEMBER}/`) && targets.length === 1 && asJsonString(targets[0]!.address) === self) {
     deps.io.out(`You are ${shown(self)}. No other agent pane yet. A message needs two.`);
+    if (answer.body.selfOff === true) deps.io.out(YOU_ARE_OFF_WORDS);
     return EXIT.OK;
   }
-  const rows = targets.map((row) => [row.address, row.machine, row.harness, row.label, row.state].map((cell) => shown(asJsonString(cell) ?? "-")));
+  const rows = targets.map((row) => [asJsonString(row.address), asJsonString(row.machine), asJsonString(row.harness), asJsonString(row.label), stateCell(row)].map((cell) => shown(cell ?? "-")));
   const head = ["ADDRESS", "MACHINE", "HARNESS", "LABEL", "STATE"];
   const widths = head.map((title, column) => Math.max(title.length, ...rows.map((row) => row[column]!.length)));
   const line = (cells: readonly string[]): string => cells.map((cell, column) => cell.padEnd(widths[column]!)).join("  ").trimEnd();
   deps.io.out(line(head));
   for (const row of rows) deps.io.out(`${line(row)}${row[0] === self ? "  (you)" : ""}`);
   if (note !== undefined) deps.io.out(note);
+  if (answer.body.selfOff === true) deps.io.out(YOU_ARE_OFF_WORDS);
   return EXIT.OK;
 }
 
@@ -320,13 +352,16 @@ interface SendArgs {
   readonly replyTo: string | null;
   readonly text: string | null;
   readonly json: boolean;
+  /** `--wake` (M85): a scope or `all` also types into sessions that rest. */
+  readonly wake: boolean;
 }
 
-/** `send <address> [text...]`, `--to` and `--reply-to` as aliases, `--` before a text that starts with a dash. */
+/** `send <address> [text...]`, `--to` and `--reply-to` as aliases, `--wake`, `--` before a text that starts with a dash. */
 export function parseSendArgs(args: readonly string[]): SendArgs | { readonly error: string } {
   let to: string | null = null;
   let replyTo: string | null = null;
   let json = false;
+  let wake = false;
   const words: string[] = [];
   let i = 0;
   for (; i < args.length; i++) {
@@ -349,12 +384,16 @@ export function parseSendArgs(args: readonly string[]): SendArgs | { readonly er
       json = true;
       continue;
     }
+    if (arg === "--wake") {
+      wake = true;
+      continue;
+    }
     if (arg.startsWith("--")) return { error: `unknown flag \`${arg}\`` };
     to = arg;
   }
   words.push(...args.slice(i));
   if (replyTo !== null && !WALKY_ID.test(replyTo)) return { error: `\`${replyTo}\` is not a message id` };
-  return { to, replyTo, text: words.length === 0 ? null : words.join(" "), json };
+  return { to, replyTo, text: words.length === 0 ? null : words.join(" "), json, wake };
 }
 
 function usage(deps: WalkyDeps, verb: (typeof WALKY_SUBCOMMANDS)[number], why: string): number {
@@ -365,11 +404,13 @@ function usage(deps: WalkyDeps, verb: (typeof WALKY_SUBCOMMANDS)[number], why: s
 
 const USAGE = {
   who: "usage: collie walky who [--workspace <repo>[#<branch>] | --here] [--json]",
-  send: "usage: collie walky send <address> [text...]   (no text: the body is read from stdin)",
+  send: "usage: collie walky send <address> [--wake] [text...]   (no text: the body is read from stdin; --wake types a scope or all into sessions that rest too)",
   reply: "usage: collie walky reply <id> [text...]   (no text: the body is read from stdin)",
   inbox: "usage: collie walky inbox [<id>] [--all] [--keep] [--json]",
   status: "usage: collie walky status <id> [--json]",
   cancel: "usage: collie walky cancel <id> [--json]   (a held message you sent; it stays in the inbox, not typed)",
+  off: "usage: collie walky off [--json]   (this session: other agents cannot message it, and it cannot message them)",
+  on: "usage: collie walky on [--json]   (this session: agents can message it again)",
 } as const satisfies Record<(typeof WALKY_SUBCOMMANDS)[number], string>;
 
 /** The body: the words on the command line, or stdin when there are none. */
@@ -394,9 +435,10 @@ function targetLine(target: JsonValue | undefined, fallback: string): string {
  * Send, then wait up to 15 s for each receipt to leave `accepted`, and print three lines: the id, the
  * pane it went to, and the state in words. A message not typed yet adds where to look later.
  */
-async function sendAndWait(deps: WalkyDeps, to: string | null, replyTo: string | null, body: string, json: boolean, first?: string): Promise<number> {
+async function sendAndWait(deps: WalkyDeps, to: string | null, replyTo: string | null, body: string, json: boolean, first?: string, wake = false): Promise<number> {
   const id = (deps.mintId ?? mintWalkyId)();
-  const answer = await request(deps, { op: "send", id, to, body, replyTo }, undefined, first);
+  // `wake` rides the request only when it is true: a request without it is the one every bridge reads.
+  const answer = await request(deps, wake ? { op: "send", id, to, body, replyTo, wake } : { op: "send", id, to, body, replyTo }, undefined, first);
   if (!answer.ok) return failure(deps, answer);
   let receipts = receiptsOf(answer.body.receipts);
   let elsewhere = new Set<string>();
@@ -436,7 +478,7 @@ export async function cmdWalkySend(deps: WalkyDeps, args: readonly string[]): Pr
   if (parseAddress(parsed.to) === null) return usage(deps, "send", `\`${parsed.to}\` is not an address: <member>/<pane>, <member>/<pane>#<token> as \`who\` prints it, <member>/all, all, <repo>, <repo>#<branch> or here`);
   const body = await bodyOf(deps, parsed.text);
   if (body === null) return usage(deps, "send", "no text: give it after the address, or on stdin");
-  return sendAndWait(deps, parsed.to, parsed.replyTo, body, parsed.json);
+  return sendAndWait(deps, parsed.to, parsed.replyTo, body, parsed.json, undefined, parsed.wake);
 }
 
 /** The first bridge that holds a message, and the message; else the words for why none does. */
@@ -461,6 +503,7 @@ export async function cmdWalkyReply(deps: WalkyDeps, args: readonly string[]): P
   if (windows(deps)) return EXIT.STATE;
   const parsed = parseSendArgs(args);
   if ("error" in parsed) return usage(deps, "reply", parsed.error);
+  if (parsed.wake) return usage(deps, "reply", "a reply goes to one pane: `--wake` is for a scope or `all`");
   const id = parsed.replyTo ?? parsed.to;
   if (id === null || !WALKY_ID.test(id)) return usage(deps, "reply", "name the message id to reply to (wt_ and 12 characters)");
   // The bridge that holds the message answers the reply: an older one asked first may know this pane
@@ -639,6 +682,45 @@ export async function cmdWalkyCancel(deps: WalkyDeps, args: readonly string[]): 
   else if (results.length === 1) deps.io.out(takeBackLine(results[0]!.result, results[0]!.receipt, false));
   else for (const entry of results) deps.io.out(takeBackLine(entry.result, entry.receipt, true));
   return results.length > 0 && results.every((entry) => entry.result === "taken" || entry.result === "repeat") ? EXIT.OK : EXIT.STATE;
+}
+
+/** Whether a bridge's answer says it could not read the request: a build before the verb. */
+function unreadVerb(error: string): boolean {
+  return error === UNREAD_BY_OLDER_BRIDGE || error.startsWith(BARE_BAD_REQUEST);
+}
+
+/**
+ * `walky off|on [--json]`: this pane's own flag (M89). Every bridge is asked, not only the first that
+ * takes it: a machine can run two Collies on one multiplexer, both know the pane, and either could type
+ * into it. A bridge that does not know the pane answers `not here` and changes nothing.
+ */
+async function cmdWalkySwitch(deps: WalkyDeps, verb: "off" | "on", args: readonly string[]): Promise<number> {
+  if (windows(deps)) return EXIT.STATE;
+  const unknown = args.find((arg) => arg !== "--json");
+  if (unknown !== undefined) return usage(deps, verb, `unknown argument \`${unknown}\``);
+  const answers = await Promise.all(socketPaths(deps).map((path) => request(deps, { op: verb }, path)));
+  if (!answers.some((answer) => answer.ok)) {
+    // The usual walk over the bridges, for the one reason it reports.
+    const answer = await request(deps, { op: verb });
+    if (!answer.ok) return failure(deps, answer);
+  }
+  // A bridge that cannot read the verb may still type into this pane: say so, never claim it.
+  if (answers.some((answer) => !answer.ok && unreadVerb(answer.error))) deps.io.err(`walky talky: ${OLDER_BRIDGE_SWITCH}`);
+  // The socket sets exactly the value asked for (an idempotent set), so the verb is the value held.
+  const off = verb === "off";
+  if (args.includes("--json")) deps.io.out(JSON.stringify({ off }));
+  else deps.io.out(off ? OFF_WORDS : ON_WORDS);
+  return EXIT.OK;
+}
+
+/** `walky off [--json]`: turn this session's walky talky off. */
+export function cmdWalkyOff(deps: WalkyDeps, args: readonly string[]): Promise<number> {
+  return cmdWalkySwitch(deps, "off", args);
+}
+
+/** `walky on [--json]`: turn this session's walky talky on again. */
+export function cmdWalkyOn(deps: WalkyDeps, args: readonly string[]): Promise<number> {
+  return cmdWalkySwitch(deps, "on", args);
 }
 
 /** A bare or misspelt `collie walky`: the sub-verbs, and a usage exit. */

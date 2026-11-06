@@ -3,6 +3,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { en } from "@/lib/i18n/messages/en";
 
 import { installApiStub } from "./fixtures/api";
+import { wearPlainLook } from "./fixtures/collie-theme";
 
 // THE VOICE TAKEOVER, measured in a real engine (design 3.3). The requirement is zero layout shift:
 // the takeover covers the whole composer block, from the mic's tap to the transcript, and nothing
@@ -94,8 +95,11 @@ test.beforeEach(async ({ page }) => {
       }
     };
     // Playwright's Linux WebKit ships no MediaRecorder at all (a real iPhone has one), and without one
-    // the composer draws no mic. A bare stand-in, only there when the engine has none: it makes a
-    // small clip so the upload happens. The Web Audio graph under test stays the engine's own.
+    // the composer draws no mic. A bare stand-in, only there when the engine has none. It models what
+    // Safari's recorder does: a chunk with bytes on every timeslice (the page asks for one a second),
+    // and a final chunk on stop. The page goes live on the first chunk with bytes (#709), so a stand-in
+    // that spoke only on stop would never let OK enable in a quiet room, where the fake microphone's
+    // analyser reads exact digital silence. The Web Audio graph under test stays the engine's own.
     if (!("MediaRecorder" in window)) {
       class StandInRecorder extends EventTarget {
         static isTypeSupported(type: string) {
@@ -103,17 +107,24 @@ test.beforeEach(async ({ page }) => {
         }
         state = "inactive";
         mimeType = "audio/mp4";
-        start() {
+        private timer: ReturnType<typeof setInterval> | null = null;
+        private chunk(bytes: number) {
+          const event = new Event("dataavailable");
+          Object.defineProperty(event, "data", { value: new Blob([new Uint8Array(bytes)], { type: "audio/mp4" }) });
+          voice.recorded += bytes;
+          this.dispatchEvent(event);
+        }
+        start(timeslice?: number) {
           this.state = "recording";
-          // Ready at once: its clip is made on stop, whenever that is.
-          voice.recorded += 1;
+          if (timeslice === undefined) return;
+          this.timer = setInterval(() => this.chunk(512), timeslice);
         }
         stop() {
           if (this.state === "inactive") return;
           this.state = "inactive";
-          const event = new Event("dataavailable");
-          Object.defineProperty(event, "data", { value: new Blob([new Uint8Array(2048)], { type: "audio/mp4" }) });
-          this.dispatchEvent(event);
+          if (this.timer !== null) clearInterval(this.timer);
+          this.timer = null;
+          this.chunk(2048);
           this.dispatchEvent(new Event("stop"));
         }
       }
@@ -165,6 +176,9 @@ async function rects(page: Page) {
 }
 
 test("the takeover opens, records, transcribes and closes without moving anything", async ({ page }) => {
+  // The takeover is measured on the field composer with a 1px rule. The default theme's box composer
+  // has its own case below.
+  await wearPlainLook(page);
   await page.goto("/pane/w1:p1");
   const mic = page.getByRole("button", { name: en["composer.mic.recordAria"] });
   await expect(mic).toBeVisible();
@@ -217,6 +231,24 @@ test("the takeover opens, records, transcribes and closes without moving anythin
   await expect(page.getByRole("textbox", { name: en["composer.placeholder.reply"] })).toHaveValue(TRANSCRIPT);
   await expect(region).toHaveCount(0);
   expect(await rects(page)).toEqual(before);
+});
+
+// THE BOX COMPOSER (the default theme Collie). OK is drawn in a row that copies the composer's box, so
+// it stands on the microphone it replaces: the same centre, to the half pixel, at rest and open.
+test("in the box composer the OK button stands on the microphone's centre", async ({ page }) => {
+  await page.goto("/pane/w1:p1");
+  await expect(page.locator('[data-slot="composer-box"]')).toHaveAttribute("data-layout", "box");
+  const mic = page.getByRole("button", { name: en["composer.mic.recordAria"] });
+  await expect(mic).toBeVisible();
+  const micBox = (await mic.boundingBox())!;
+
+  await mic.click();
+  const ok = page.getByRole("button", { name: en["composer.voice.okAria"] });
+  await expect(ok).toBeEnabled();
+  const okBox = (await ok.boundingBox())!;
+  expect(Math.abs(okBox.x + okBox.width / 2 - (micBox.x + micBox.width / 2))).toBeLessThanOrEqual(0.5);
+  expect(Math.abs(okBox.y + okBox.height / 2 - (micBox.y + micBox.height / 2))).toBeLessThanOrEqual(0.5);
+  expect(Math.abs(okBox.width - micBox.width)).toBeLessThanOrEqual(0.5);
 });
 
 test("two seconds of quiet after speech finishes the clip by itself; quiet alone never does", async ({ page }) => {

@@ -1,7 +1,6 @@
 import { Loader2, Play, TerminalSquare } from "lucide-react";
 
 import { cn } from "@/lib/utils";
-import { AgentIcon } from "@/components/agent-icon";
 import { CacheChip } from "@/components/cache-chip";
 import { HostChip } from "@/components/host-chip";
 import { PaneOrderToggle } from "@/components/pane-order-toggle";
@@ -15,9 +14,12 @@ import { pinMatcher, type Pin } from "@/lib/pins";
 import { paneName, panePlaceParts } from "@/lib/pane-name";
 import { paneSubtitle } from "@/lib/pane-marks";
 import { PaneBadge } from "@/components/pane-badge";
+import { PaneGlyph } from "@/components/ui/pane-glyph";
+import { UnseenMark } from "@/components/ui/unseen-mark";
 import { shortenHome } from "@/lib/shorten-home";
-import { bucketOf, isAttention, worstTriage, type TriageKey } from "@/lib/triage";
-import type { AgentStatus, AgentView, Launcher, ServerSummary, TabView } from "@/lib/types";
+import { bucketOf, isAttention, isUnseen, worstTriage, type TriageKey } from "@/lib/triage";
+import type { AgentStatus, AgentView, Launcher, ServerSummary, SessionSummary, TabView, WorkspaceView } from "@/lib/types";
+import type { Scope } from "@/lib/scope";
 import { t } from "@/lib/i18n";
 import { useFrozenRanks } from "@/hooks/use-frozen-ranks";
 import { useLocale } from "@/hooks/use-locale";
@@ -43,6 +45,16 @@ interface ThreadSidebarProps {
   tabs?: readonly TabView[];
   /** The snapshot's machine list, for the order machines run in: the lead first. */
   servers?: readonly ServerSummary[] | undefined;
+  /**
+   * The snapshot's spaces (`root.workspaces`). With them a linked git worktree folds under its open
+   * root workspace, as on the dashboard, and one whose root is not open is headed `repo › slug`
+   * (issue #666). Omit and every workspace stays its own group.
+   */
+  workspaces?: readonly WorkspaceView[] | undefined;
+  /** The view's address (`?h=` and `?s=`), so `workspaces` is matched to the session it describes. */
+  scope?: Scope | undefined;
+  /** The snapshot's session registry, to find each machine's primary session when matching `workspaces`. */
+  sessions?: readonly SessionSummary[] | undefined;
   /** Whether the Shells section is expanded, and how to fold it. Omit to leave it always open. */
   shellsOpen?: boolean;
   onShellsOpenChange?: (open: boolean) => void;
@@ -137,6 +149,9 @@ export function ThreadSidebar({
   onSelect,
   tabs,
   servers,
+  workspaces,
+  scope,
+  sessions,
   shellsOpen = true,
   onShellsOpenChange,
   pins = NO_PINS,
@@ -170,7 +185,8 @@ export function ThreadSidebar({
   }
 
   // The dashboard's grouping, so the switcher and the dashboard list the same panes in the same place.
-  const groups = groupPanesByWorkspace(agents, [], { order: "fixed", tabs, servers });
+  const groupOptions = { order: "fixed" as const, tabs, servers, workspaces, scope, sessions };
+  const groups = groupPanesByWorkspace(agents, [], groupOptions);
   // PINNED LEADS (ADR 0070): the dashboard's place order over agents AND shells (a shell sits after
   // its tab's agents, as on the dashboard), so the two surfaces agree by construction. Each pinned
   // pane then leaves its workspace section or Shells: listed once. A workspace section left with no
@@ -179,7 +195,7 @@ export function ThreadSidebar({
   const pinned =
     pins.length === 0
       ? NO_PANES
-      : pinnedRows(groupPanesByWorkspace(agents, shellPanes, { order: "fixed", tabs, servers }), isPinned);
+      : pinnedRows(groupPanesByWorkspace(agents, shellPanes, groupOptions), isPinned);
   const sections = shownGroups(groups, false, isPinned);
   const shellRows = pins.length === 0 ? shellPanes : shellPanes.filter((p) => !isPinned(p));
 
@@ -316,7 +332,7 @@ export function ThreadSidebar({
               roomy={roomy}
               key={g.key}
               id={`switch-ws-${g.key.replace(/[^A-Za-z0-9_-]/gu, "_")}`}
-              label={g.label}
+              label={g.heading ?? g.label}
               tone={roomy ? "quiet" : "strong"}
               mark={worstTriage(g.panes) === "needs" ? "blocked" : undefined}
               trailing={<StatusCounts panes={g.panes} className="shrink-0 text-[11px] text-muted-foreground" />}
@@ -493,9 +509,9 @@ function PaneRow({
         roomy ? "min-h-11 px-2 py-2.5" : "px-2.5 py-2",
         active ? "bg-accent text-accent-foreground" : "hover:bg-muted/60 active:bg-muted",
         // The switcher is exactly where you jump TO the thing that needs you, so it must be able to
-        // SHOW that — it renders every pane identically otherwise. Staying denser than the dashboard
-        // is fine; being unable to mark a blocked pane is not. (isAttention, so the rule isn't
-        // re-derived here.)
+        // SHOW that across the whole row, not only in the mark on the logo. Staying denser than the
+        // dashboard is fine; being unable to mark a blocked pane is not. (isAttention, so the rule
+        // isn't re-derived here.)
         //
         // The border is applied even to the ACTIVE row, so the two cues compose: the pane you're in
         // AND blocked keeps both its accent fill and its alarm edge. Only the fill is withheld,
@@ -507,13 +523,22 @@ function PaneRow({
       {isShell ? (
         <TerminalSquare className="size-3.5 shrink-0 text-muted-foreground" />
       ) : (
-        // Status is conveyed by the row's alarm edge and the heading's dot; the row leads with the logo.
-        <AgentIcon agent={pane.agent} className="size-5" />
+        // EVERY ROW SAYS ITS OWN STATUS (issue #695): the mark on the logo's corner, as the closed rail
+        // draws it. Before ADR 0063 the row's section said it. The heading's counts say how many panes
+        // work or wait, not which ones, so four panes in one space left the reader to open each one.
+        // The mark repaints and never moves the row. Its backing is the surface under it: the sidebar
+        // and the sheet are both on `--card`, the current row on `--accent`. A shell row keeps the bare
+        // glyph, as on the dashboard: nobody waits on a shell's status.
+        <PaneGlyph pane={pane} className="size-5" markOn={active ? "bg-accent" : "bg-card"} named />
       )}
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 items-baseline gap-1">
           <span className={cn("min-w-0 truncate text-sm font-medium", roomy && "leading-5", roomy && !active && "text-foreground")}>{name}</span>
           <PaneBadge pane={pane} className={cn("shrink-0 self-center", roomy && "text-muted-foreground")} />
+          {/* A finished pane nobody opened: the dashboard's square, after the name, so a row agrees with
+              the heading's `■` count. The slot is kept on every agent row, so a name truncates at one
+              width whether the mark is drawn or not (DESIGN.md §2). */}
+          {!isShell && <UnseenMark on={isUnseen(pane)} reserve />}
           {/* The cache reading trails the name, same corner as the dashboard row (agent-card.tsx,
               via PaneMeta), but without PaneMeta's session chip. `row`, not `button` — the whole row
               is already a `<button>`, and a button cannot nest inside one. The machine is the glyph

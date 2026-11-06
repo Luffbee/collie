@@ -107,7 +107,7 @@ What each field means for Collie:
 | `status` | The program's own OSC 7501 report, or null. See *Status*. |
 | `turn` | Goes up each time the status leaves `working`. |
 | `title` | The OSC title the program set. |
-| `foreground` | The foreground process group's leader: `{pid, name, argv, cwd}`, read about twice a second. A process name, not an agent identity. The adapter takes an agent from it only when the program sends no report (omp 18.6.1 sends none), through the same table as a report, with no status. |
+| `foreground` | The foreground process group's leader: `{pid, name, argv, cwd}`, read about twice a second. A process name, not an agent identity. The adapter takes an agent from it only when the program sends no report (omp 18.6.1 sends none), through the same table as a report, with no status. The adapter also reads `pid` and `argv` from it, for session discovery by the pane's command line (pi and omp), and for nothing else. |
 | `cols`, `rows` | The terminal size. The last ACTIVE attached viewer sets it. |
 | `keep` | Replace a lost program with a shell in place. herdr-app sets it on the terminals it shows. |
 | `parent`, `notify` | The terminal that started it, and whether that parent gets notes typed into it. |
@@ -190,10 +190,12 @@ about 3,030 ms after that write, whatever the gap between the two (gap 0: 3,033 
 the key reaches the program when the call starts or when it is answered was not probed. The 50 ms
 round trip quoted above was a key pressed well after the write. This is the core's own behaviour and
 an upstream ask. Raw input does not wait: since the change for herdr-core issue 52 (the maintainer's
-advice: type Enter as data on the attach channel), Collie types an unmodified Enter, Backspace and Tab as raw
-bytes (`\r`, `\x7f`, `\t`), so the Send Protocol's probe Backspace and its submitting Enter pay no hold.
-The hold stays for the keys that still go by name: a key with a modifier and every other named key.
-For those, the Send Protocol keeps the writes of its probe outside its read bound.
+advice: type Enter as data on the attach channel), Collie types unmodified Enter, Backspace and Tab as raw
+bytes (`\r`, `\x7f`, `\t`). Ctrl+J and Ctrl+Q use raw LF and DC1 (`\n`, `\x11`) as well, preserving
+multiline insertion and Oh My Pi's follow-up queue without a quiet wait. These Ctrl-only chords were
+checked on hc 0.1.18 with OMP 18.16.0 in legacy and extended kitty keyboard modes. Additional modifiers
+still use named keys, whose encoding depends on the terminal mode. The adapter keeps a short gap
+between text and a following raw control so the application does not consume the submit as a paste.
 
 The size rule is why the attach names the terminal's OWN size: "the last active viewer sets the
 size (active: it typed, resized, gained focus or sent FACTS)". Typing makes the attach active, so

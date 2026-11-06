@@ -10,8 +10,9 @@
 import { isScopeAddress, isSelf, paneAddress, parseAddress, LOCAL_MEMBER } from "./address.ts";
 import { signMessage } from "./canonical.ts";
 import { BODY_TOO_LONG, cleanBody } from "./clean.ts";
-import { CANCELLED_BY_SENDER, DROPPED_BY_OWNER, isFanOut, sendIdOf, withoutAnsweredLegs, WalkyDeliverer, type DelivererDeps, type SenderPane, type TakeBack, type WalkyPane } from "./deliver.ts";
+import { CANCELLED_BY_SENDER, DROPPED_BY_OWNER, isFanOut, isResting, sendIdOf, withoutAnsweredLegs, WalkyDeliverer, type DelivererDeps, type SenderPane, type TakeBack, type WalkyPane } from "./deliver.ts";
 import { sameInstance, type LogRecord, type WalkyLog } from "./log.ts";
+import { WalkyOff, type WalkyOffBy } from "./off.ts";
 import { MEMBER_UNREACHABLE, NO_ADDRESS, type RefusalCounts } from "./refusals.ts";
 import { headerField, WALKY_LABEL_MAX, type WalkyEntry, type WalkyMessage, type WalkyReceipt, type WalkyReceiptState, type WalkySkipped, type WalkyTarget, type WalkyVerified } from "./types.ts";
 
@@ -24,6 +25,8 @@ export interface SendInput {
   readonly to: string | null;
   readonly body: string;
   readonly replyTo: string | null;
+  /** M85: a scope or `all` also types into panes that rest. Absent: they get the inbox only. */
+  readonly wake?: boolean;
 }
 
 export type SendAnswer =
@@ -45,6 +48,8 @@ export interface WalkyServiceDeps extends DelivererDeps {
   readonly leadName?: () => string | null;
   /** On a lead: the shell panes the crew's members report, which a broadcast skips. */
   readonly remoteSkipped?: () => readonly WalkySkipped[];
+  /** The off flags, `<stateDir>/walky/off.json` (M89). The host's `panes()` reads the same store. Absent: in memory. */
+  readonly off?: WalkyOff;
 }
 
 /** What `who` on a crew member adds below its own panes: the roster is the lead's, and the command to run there. */
@@ -127,10 +132,12 @@ function entryOf(message: WalkyMessage, receipt: WalkyReceipt): WalkyEntry {
 export class WalkyService {
   readonly deliverer: WalkyDeliverer;
   private readonly now: () => number;
+  private readonly off: WalkyOff;
 
   constructor(private readonly deps: WalkyServiceDeps) {
     this.deliverer = new WalkyDeliverer(deps);
     this.now = deps.now ?? Date.now;
+    this.off = deps.off ?? new WalkyOff(null, this.now);
   }
 
   get log(): WalkyLog {
@@ -145,6 +152,11 @@ export class WalkyService {
   /** The instance token a pane of this bridge holds now, or null when no such pane is there. */
   instanceOf(session: string, paneId: string): string | null {
     return this.paneAt(session, paneId)?.instance ?? null;
+  }
+
+  /** Turn a pane's walky talky off or on (M89). Idempotent, and the last write wins. Answers the new value. */
+  setOff(pane: WalkyPane, off: boolean, by: WalkyOffBy): boolean {
+    return this.off.set(pane, off, by);
   }
 
   /** The address of a pane of this bridge, with its instance token when given (as `who` prints it). */
@@ -191,7 +203,8 @@ export class WalkyService {
       sender.kind === "agent"
         ? { memberId, address: paneAddress(memberId, sender.pane.paneId, sender.pane.instance), harness: sender.pane.harness, label: sender.pane.label }
         : { memberId, address: null, harness: null, label: headerField(sender.label, WALKY_LABEL_MAX) };
-    const message: WalkyMessage = { v: 1, id: input.id, kind: sender.kind, from, to: input.to, replyTo: input.replyTo, at: this.now(), body: clean.body, signer: null, signature: null };
+    const base: WalkyMessage = { v: 1, id: input.id, kind: sender.kind, from, to: input.to, replyTo: input.replyTo, at: this.now(), body: clean.body, signer: null, signature: null };
+    const message: WalkyMessage = input.wake === true ? { ...base, wake: true } : base;
     const key = this.deps.keyPem();
     return key === null || memberId === null ? message : signMessage(message, key, memberId);
   }
@@ -246,13 +259,18 @@ export class WalkyService {
     return this.deps.outcomesOnLead === true ? whoElsewhereNote(this.deps.leadName?.() ?? null) : null;
   }
 
-  /** The shell panes a broadcast skips: this machine's, then what a lead knows of its members. */
+  /**
+   * The panes a broadcast does not type into by default: this machine's shell panes and, since M85, its
+   * agent panes that rest ({@link isResting}); then what a lead knows of its members. `reason` says which.
+   */
   skipped(): WalkySkipped[] {
     const memberId = this.deps.memberId ?? LOCAL_MEMBER;
-    const local = this.deps.host
-      .panes()
-      .filter((pane) => !pane.agent)
-      .map((pane) => ({ address: this.addressOf(pane.paneId), memberId, machine: this.deps.machine, label: pane.label }));
+    const now = this.now();
+    const local = this.deps.host.panes().flatMap((pane): WalkySkipped[] => {
+      const reason = !pane.agent ? "shell" : isResting(pane, now) ? "resting" : null;
+      if (reason === null) return [];
+      return [{ address: this.addressOf(pane.paneId), memberId, machine: this.deps.machine, label: pane.label, reason }];
+    });
     return [...local, ...(this.deps.remoteSkipped?.() ?? [])];
   }
 
@@ -272,8 +290,14 @@ export class WalkyService {
     const local = this.deps.host
       .panes()
       .filter((pane) => pane.agent)
-      .map((pane) => ({ address: this.addressOf(pane.paneId, pane.instance), memberId, machine: this.deps.machine, harness: pane.harness, label: pane.label, state: pane.state }));
+      .map((pane) => this.targetRow(pane, memberId));
     return [...local, ...(this.deps.remoteTargets?.() ?? [])];
+  }
+
+  /** One pane of this bridge as `who` lists it. `walky` is there only while the session is off (M89). */
+  private targetRow(pane: WalkyPane, memberId: string): WalkyTarget {
+    const target: WalkyTarget = { address: this.addressOf(pane.paneId, pane.instance), memberId, machine: this.deps.machine, harness: pane.harness, label: pane.label, state: pane.state };
+    return pane.off ? { ...target, walky: "off" } : target;
   }
 
   /**

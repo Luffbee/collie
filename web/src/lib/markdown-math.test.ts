@@ -24,7 +24,7 @@ describe("inline equations", () => {
     expect(parseInline("[$x$](https://example.com)")).toMatchObject([{ kind: "link", spans: [math("x", "$x$")] }]);
     expect(parseMarkdown("- $x$\n\n> \\(y\\)")).toEqual([
       { kind: "list", ordered: false, items: [[math("x", "$x$")]] },
-      { kind: "quote", spans: [math("y", String.raw`\(y\)`)] },
+      { kind: "quote", blocks: [{ kind: "paragraph", spans: [math("y", String.raw`\(y\)`)] }] },
     ]);
   });
 

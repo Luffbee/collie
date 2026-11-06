@@ -328,6 +328,9 @@ const PANE_WIRE_KEYS = {
   // The pane's running subagents (bridge/subagents.ts). Not a crew dimension, and absent here: the
   // baseline builds no subagent tracker, so no golden byte moved.
   subagents: true,
+  // The pane's background jobs (bridge/jobs-journal.ts). Not a crew dimension, and absent here: the
+  // baseline polls no Chat window, so no golden byte moved.
+  jobs: true,
   // Not a crew dimension: the model the pane's agent is on, from the same probe as `cache` and absent
   // here for the same reason, so no golden byte moved.
   model: true,
@@ -383,6 +386,9 @@ const PANE_WIRE_KEYS = {
   // 2026-10-18). A live solo bridge carries it on every pane, the change this baseline records on
   // purpose; the harness builds its wire with no instance registry, so no golden byte moved.
   instance: true,
+  // Not a crew dimension: a session turned its walky talky off (M89). Present only while it is off,
+  // and this harness builds its body with no reader, so no golden byte moved.
+  walkyOff: true,
   // Not a crew dimension: the pane's usage dots (bridge/usage.ts, .adr/0115). Attached at serialise
   // time from the statusLine wrapper's file, and this harness builds its body with no reader, so no
   // golden byte moved.
@@ -532,6 +538,7 @@ describe("solo zero-tax — wire shapes carry no crew dimension", () => {
       "hooks",
       "host",
       "instance",
+      "jobs",
       "kind",
       "lastActiveAt",
       "lastSeenAt",
@@ -556,6 +563,7 @@ describe("solo zero-tax — wire shapes carry no crew dimension", () => {
       "todos",
       "turnId",
       "usage",
+      "walkyOff",
       "workspaceId",
       "workspaceLabel",
       "workspaceNumber",
@@ -922,6 +930,12 @@ describe("solo zero-tax — routes", () => {
       // unless the operator set COLLIE_SURFACE_SHADOW=1. It registers no crew route.
       "/api/surface",
       "/api/tab",
+      // The anonymous install ping's state and the phone's switch (M86 spec 01) — solo, no crew
+      // sibling: each machine is one install, and a member is switched by its own env or config.
+      "/api/telemetry",
+      // The trouble tally (M86 spec 05): the phone's one count when a trouble card showed. Solo for the
+      // same reason: the bridge the phone talks to counts it under its own install.
+      "/api/telemetry/trouble",
       // Starting an update from the phone (M15/05) — a SOLO route that legitimately extends this
       // list, named here rather than exempted. Write-gated through the same closure a send rides,
       // and it registers no crew sibling: a peer is levelled from the lead's terminal
@@ -948,6 +962,9 @@ describe("solo zero-tax — routes", () => {
       // the list of reachable targets (a read). SOLO routes; an address on another member is the crew
       // seam's business, never a route here.
       "/api/walky",
+      // A session's walky talky off switch (M89 spec 04): a write under the device gate, session-scoped,
+      // so a `?host=` set is forwarded to the member that owns the pane. Solo, it sets this bridge's own flag.
+      "/api/walky/off",
       "/api/walky/who",
       "/api/workspace",
       // The New sheet's branch from a FOLDER (M48, ADR 0093): the plan it shows before Start, and the
@@ -1289,6 +1306,10 @@ const STATE_DIR_ENTRIES = [
   // in this folder. Created by a bridge that computes a Surface (the Send Protocol, on by default, or
   // COLLIE_SURFACE_SHADOW=1) the first time it reads an agent pane or settles a send.
   "surface",
+  // The anonymous install ping's record (M86 spec 01): the random install ID, the first start, the
+  // last day sent, the phone's switch and the trouble tally (M86 spec 05). A NEW file; the ID and the
+  // tally are deleted the moment the ping is off, and an older build ignores the file.
+  "telemetry.json",
   // The detached updater's own stdout and stderr (#283), with the run before it kept beside it as
   // `update-runner.log.1`. Absent until the first update started from the phone: the bridge opens it
   // only to hand the descriptor to the runner it spawns.

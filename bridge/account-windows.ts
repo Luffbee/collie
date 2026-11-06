@@ -39,7 +39,7 @@
 // costs the reading, never the pane.
 
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { lstat, open, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -82,8 +82,25 @@ export const CODEX_FILES_MAX = 3;
 /** The Keychain item Claude Code keeps its login in on macOS. */
 export const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
 
+/** How many custom `CLAUDE_CONFIG_DIR` slots `AccountWindows` holds in memory before evicting the oldest. */
+export const MAX_CUSTOM_CONFIG_DIRS = 16;
+
+/**
+ * The macOS Keychain service name Claude Code uses for `configDir`: `"Claude Code-credentials"` for the
+ * default `~/.claude`, or suffixed with the first 8 hex chars of `sha256(CLAUDE_CONFIG_DIR.normalize("NFC"))`
+ * (2.1.318, read in its bundle; `security dump-keychain` shows `"svce"<blob>="Claude Code-credentials-<8 hex chars>"`).
+ * `configDir` is the RAW value of `CLAUDE_CONFIG_DIR`: Claude Code hashes the string as it stands, with no
+ * trim and no path clean-up, so `/profiles/work/` and `/profiles/work` are two different items. Only a
+ * blank value means the default.
+ */
+export function claudeKeychainService(configDir?: string): string {
+  if (configDir === undefined || configDir.trim() === "") return CLAUDE_KEYCHAIN_SERVICE;
+  const suffix = createHash("sha256").update(configDir.normalize("NFC")).digest("hex").slice(0, 8);
+  return `${CLAUDE_KEYCHAIN_SERVICE}-${suffix}`;
+}
+
 /** At most one ask per harness this often, however many turns end. */
-export const POKE_EVERY_MS = 60_000;
+export const POKE_EVERY_MS = 5 * 60_000;
 /** The steady ask while a pane of the harness exists. */
 export const ASK_EVERY_MS = 5 * 60_000;
 /** A reading older than this is not drawn: stale windows are worse than none. */
@@ -99,6 +116,8 @@ export const BACKOFF = {
   denied: 15 * 60_000,
   /** 429: the vendor asks us to slow down. The reading is kept. */
   limited: 15 * 60_000,
+  /** The longest wait after 429s in a row, whatever `Retry-After` says. */
+  limitedMax: 60 * 60_000,
   /** No answer, a timeout, or a 5xx. The reading is kept. */
   network: 2 * 60_000,
   /** A body this build cannot read. The reading is kept. */
@@ -368,18 +387,12 @@ export interface CredentialSeams {
   stat(path: string): Promise<{ readonly file: boolean; readonly mode: number; readonly size: number } | null>;
   read(path: string): Promise<string | null>;
   /** The Keychain item's text (macOS only), or null. Called only when the file is absent. */
-  keychain(): Promise<string | null>;
+  keychain(service?: string): Promise<string | null>;
   /** The plain files of a folder with their mtimes (links are not followed), or [] when it is not there. */
   list(path: string): Promise<ReadonlyArray<{ readonly name: string; readonly file: boolean; readonly mtimeMs: number }>>;
   /** The last `maxBytes` of a plain file, or null. */
   tail(path: string, maxBytes: number): Promise<string | null>;
   now(): number;
-}
-
-/** `$CLAUDE_CONFIG_DIR/.credentials.json`, else `~/.claude/.credentials.json`. */
-export function claudeCredentialsPath(env: Readonly<Record<string, string | undefined>>, home: string): string {
-  const dir = (env.CLAUDE_CONFIG_DIR ?? "").trim();
-  return join(dir === "" ? join(home, ".claude") : dir, ".credentials.json");
 }
 
 /**
@@ -421,11 +434,17 @@ export async function readLoginFile(
  * Read the operator's Claude login on this machine. The file first; on macOS, when the file is absent,
  * the Keychain item Claude Code keeps there. A file others may read is refused ({@link readLoginFile}).
  */
-export async function readClaudeLogin(seams: CredentialSeams): Promise<CredentialRead> {
-  const file = await readLoginFile(seams, claudeCredentialsPath(seams.env, seams.home));
+export async function readClaudeLogin(seams: CredentialSeams, configDir?: string): Promise<CredentialRead> {
+  // `raw` is the value as the session's environment held it: it feeds the Keychain hash untouched, and
+  // only the file path is cleaned up.
+  const raw = configDir ?? seams.env.CLAUDE_CONFIG_DIR ?? "";
+  const defaultDir = join(seams.home, ".claude");
+  const normalized = raw.trim() === "" ? defaultDir : join(raw, ".");
+  const explicitDir = normalized === defaultDir ? undefined : raw;
+  const file = await readLoginFile(seams, join(normalized, ".credentials.json"));
   if (file.ok) return claudeTokenFrom(file.text, seams.now());
   if (file.reason !== "missing" || seams.platform !== "darwin") return file;
-  const text = await seams.keychain();
+  const text = await seams.keychain(claudeKeychainService(explicitDir));
   return text === null ? { ok: false, reason: "missing" } : claudeTokenFrom(text.trim(), seams.now());
 }
 
@@ -519,13 +538,13 @@ export async function readGrokLogin(seams: CredentialSeams): Promise<CredentialR
 }
 
 /** The Keychain read, with its timeout. Its answer is the login JSON; it is never logged. */
-function keychainRead(): Promise<string | null> {
-  return new Promise((resolve) => {
+function keychainRead(service: string = CLAUDE_KEYCHAIN_SERVICE): Promise<string | null> {
+  return new Promise((done) => {
     execFile(
       "security",
-      ["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"],
+      ["find-generic-password", "-s", service, "-w"],
       { timeout: KEYCHAIN_TIMEOUT_MS, maxBuffer: CREDENTIAL_MAX_BYTES, encoding: "utf8" },
-      (error, stdout) => resolve(error === null ? stdout : null),
+      (error, stdout) => done(error === null ? stdout : null),
     );
   });
 }
@@ -597,12 +616,16 @@ export interface HttpAccountSource {
   readonly kind: "http";
   readonly harness: string;
   readonly url: string;
+  /** The resolved config directory this source reads its login from, when applicable. */
+  readonly configDir?: string;
   /** The login, read fresh for each ask. */
   login(): Promise<CredentialRead>;
   /** The headers of the one ask, built around the token. */
   headers(token: string): Record<string, string>;
   /** The windows in the vendor's answer, or null for a body this build cannot read. */
   parse(text: string): AccountReading | null;
+  /** Optional factory for a session running under a non-default config directory. */
+  readonly forConfigDir?: (configDir: string) => AccountSource;
 }
 
 /** A road that reads the harness's own files on this machine: no login, no request. */
@@ -615,18 +638,25 @@ export interface LocalAccountSource {
 /** One harness's road to its account windows. */
 export type AccountSource = HttpAccountSource | LocalAccountSource;
 
-export function claudeAccountSource(seams: CredentialSeams): AccountSource {
+export function claudeAccountSource(seams: CredentialSeams, configDir?: string): AccountSource {
+  // `configDir` stays raw (see {@link claudeKeychainService}); `resolvedDir` is the cleaned path the
+  // slot is keyed on. A session on the default dir always reads `<home>/.claude`, whatever the bridge's env says.
+  const raw = configDir ?? "";
+  const resolvedDir = raw.trim() === "" ? join(seams.home, ".claude") : join(raw, ".");
+  const readDir = raw.trim() === "" ? resolvedDir : raw;
   return {
     kind: "http",
     harness: "claude",
     url: CLAUDE_USAGE_URL,
-    login: () => readClaudeLogin(seams),
+    configDir: resolvedDir,
+    login: () => readClaudeLogin(seams, readDir),
     headers: (token) => ({
       Authorization: `Bearer ${token}`,
       "anthropic-beta": CLAUDE_OAUTH_BETA,
       Accept: "application/json",
     }),
     parse: parseAccountUsage,
+    forConfigDir: (dir) => claudeAccountSource(seams, dir),
   };
 }
 
@@ -727,11 +757,11 @@ export function defaultAccountSources(seams: CredentialSeams, harnesses: readonl
     .map(([, build]) => build(seams));
 }
 
-/** The transport. Only `status` and `text()` of the answer are read. */
+/** The transport. Only `status`, the `Retry-After` header and `text()` of the answer are read. */
 export type AccountFetch = (
   url: string,
   init: { method: "GET"; headers: Record<string, string>; signal: AbortSignal; redirect: "error" },
-) => Promise<{ status: number; text(): Promise<string> }>;
+) => Promise<{ status: number; headers?: { get(name: string): string | null }; text(): Promise<string> }>;
 
 export interface AccountWindowsOptions {
   /** False with `COLLIE_ACCOUNT_WINDOWS=0` (no harness on): nothing is read and nothing is asked. */
@@ -749,9 +779,28 @@ interface HarnessState {
   reading: (AccountReading & { at: number }) | undefined;
   lastAttempt: number;
   backoffUntil: number;
+  /** HTTP 429 answers in a row; a 200 resets it. Each one doubles the wait, up to three times. */
+  limitedInARow: number;
   inFlight: Promise<void> | null;
   /** The last state logged, so a repeated refusal is one line, not one a minute. */
   lastNote: string | null;
+}
+
+/**
+ * How long to wait after an HTTP 429. `retryAfter` is the header's value: seconds or an HTTP-date,
+ * and absent or unreadable counts as 0. The wait is the longer of that and {@link BACKOFF}`.limited`,
+ * doubled for each 429 already in a row (15, 30, 60 minutes), and never above `BACKOFF.limitedMax`.
+ */
+export function limitedWait(retryAfter: string | null, inARow: number, now: number): number {
+  const asked = Math.max(retryAfterMs(retryAfter, now), BACKOFF.limited);
+  return Math.min(asked * 2 ** Math.min(Math.max(inARow, 0), 2), BACKOFF.limitedMax);
+}
+
+function retryAfterMs(value: string | null, now: number): number {
+  const text = value?.trim() ?? "";
+  if (/^\d+$/.test(text)) return Number(text) * 1000;
+  const date = Date.parse(text);
+  return Number.isNaN(date) ? 0 : Math.max(date - now, 0);
 }
 
 /** A pane's turn ended: it was working (or held at a prompt) and now waits for the person. */
@@ -761,19 +810,28 @@ export function isTurnEnd(from: AgentStatus, to: AgentStatus): boolean {
 
 /**
  * The account windows of each harness with a source, in memory. `observe` runs on every poll,
- * `poke` when a turn ends; `limits` is synchronous and reads memory only.
+ * `poke` when a turn ends; `limits` is synchronous and reads memory (starting a background ask the
+ * first time a custom `configDir` is seen).
  */
 export class AccountWindows {
   private readonly states = new Map<string, HarnessState>();
   private readonly sources = new Map<string, AccountSource>();
+  private readonly customKeys = new Set<string>();
   /** The harnesses each mux session's last poll had panes of, so one session's poll forgets only its own. */
   private readonly scopes = new Map<string, Set<string>>();
+  /** The custom `harness\0configDir` keys each mux session's last `observeConfigDirs` named. */
+  private readonly customScopes = new Map<string, Set<string>>();
 
   constructor(private readonly opts: AccountWindowsOptions) {
     for (const source of opts.sources) {
       this.sources.set(source.harness, source);
-      this.states.set(source.harness, { reading: undefined, lastAttempt: -Infinity, backoffUntil: 0, inFlight: null, lastNote: null });
+      this.states.set(source.harness, { reading: undefined, lastAttempt: -Infinity, backoffUntil: 0, limitedInARow: 0, inFlight: null, lastNote: null });
     }
+  }
+
+  private static baseHarness(key: string): string {
+    const sep = key.indexOf("\u0000");
+    return sep === -1 ? key : key.slice(0, sep);
   }
 
   get enabled(): boolean {
@@ -786,6 +844,18 @@ export class AccountWindows {
     return false;
   }
 
+  private customKeyActive(key: string): boolean {
+    for (const keys of this.customScopes.values()) if (keys.has(key)) return true;
+    return false;
+  }
+
+  private keyPresent(key: string): boolean {
+    const harness = AccountWindows.baseHarness(key);
+    if (!this.present(harness)) return false;
+    if (!this.customKeys.has(key)) return true;
+    return this.customScopes.size === 0 || this.customKeyActive(key);
+  }
+
   /**
    * One mux session's poll: note which harnesses have panes, and ask for each that has none yet or
    * whose last ask is {@link ASK_EVERY_MS} old.
@@ -796,25 +866,95 @@ export class AccountWindows {
     for (const pane of panes) if (pane.kind !== "shell" && this.sources.has(pane.agent)) harnesses.add(pane.agent);
     this.scopes.set(scope, harnesses);
     const now = this.opts.now();
-    for (const [harness, state] of this.states) {
-      if (!this.present(harness)) continue;
-      if (state.reading === undefined || now - state.lastAttempt >= ASK_EVERY_MS) this.ask(harness, now);
+    for (const [key, state] of this.states) {
+      if (!this.keyPresent(key)) continue;
+      if (state.reading === undefined || now - state.lastAttempt >= ASK_EVERY_MS) this.ask(key, now);
     }
+  }
+
+  /**
+   * Note which custom `configDir`s have live panes of `harness` in `scope`, so closed profiles stop
+   * polling while active ones are registered and asked on schedule.
+   */
+  observeConfigDirs(harness: string, configDirs: ReadonlySet<string>, scope = ""): void {
+    if (!this.opts.enabled) return;
+    const factory = this.customFactory(harness);
+    const active = new Set<string>();
+    if (factory !== undefined) {
+      for (const dir of configDirs) {
+        const key = this.resolveKey(harness, dir, factory);
+        if (key !== undefined && key !== harness) active.add(key);
+      }
+    }
+    this.customScopes.set(scope, active);
   }
 
   /** A turn of `harness` ended: ask, unless an ask started in the last {@link POKE_EVERY_MS}. */
   poke(harness: string): void {
     if (!this.opts.enabled) return;
-    const state = this.states.get(harness);
-    if (state === undefined || !this.present(harness)) return;
+    if (!this.present(harness)) return;
     const now = this.opts.now();
-    if (now - state.lastAttempt < POKE_EVERY_MS) return;
-    this.ask(harness, now);
+    for (const [key, state] of this.states) {
+      if (AccountWindows.baseHarness(key) !== harness) continue;
+      if (!this.keyPresent(key)) continue;
+      if (now - state.lastAttempt < POKE_EVERY_MS) continue;
+      this.ask(key, now);
+    }
+  }
+
+  private customFactory(harness: string): ((configDir: string) => AccountSource) | undefined {
+    const base = this.sources.get(harness);
+    return base?.kind === "http" ? base.forConfigDir : undefined;
+  }
+
+  private resolveKey(harness: string, configDir: string, factory: (dir: string) => AccountSource): string | undefined {
+    const normalized = join(configDir, ".");
+    const base = this.sources.get(harness);
+    if (base?.kind === "http" && base.configDir !== undefined && base.configDir === normalized) return harness;
+    return this.ensureCustomKey(harness, normalized, configDir, factory);
+  }
+
+  /** The slot is keyed on the cleaned path; its source is built from `rawDir`, the value the session's env held. */
+  private ensureCustomKey(harness: string, normalized: string, rawDir: string, factory: (dir: string) => AccountSource): string | undefined {
+    const key = `${harness}\u0000${normalized}`;
+    if (this.customKeys.has(key)) {
+      this.customKeys.delete(key);
+      this.customKeys.add(key);
+      return key;
+    }
+    const now = this.opts.now();
+    if (this.customKeys.size >= MAX_CUSTOM_CONFIG_DIRS) {
+      let evict: string | undefined;
+      for (const candidate of this.customKeys) {
+        if (this.customKeyActive(candidate)) continue;
+        const st = this.states.get(candidate);
+        if (st !== undefined && (st.inFlight !== null || st.backoffUntil > now)) continue;
+        evict = candidate;
+        break;
+      }
+      if (evict === undefined) return undefined;
+      this.customKeys.delete(evict);
+      this.states.delete(evict);
+      this.sources.delete(evict);
+    }
+    this.customKeys.add(key);
+    this.sources.set(key, factory(rawDir));
+    this.states.set(key, { reading: undefined, lastAttempt: -Infinity, backoffUntil: 0, limitedInARow: 0, inFlight: null, lastNote: null });
+    if (this.present(harness)) this.ask(key, now);
+    return key;
   }
 
   /** The harness's 5-hour and 7-day windows now, or undefined when there is no fresh reading. */
-  limits(harness: string): UsageLimit[] | undefined {
-    const reading = this.fresh(harness);
+  limits(harness: string, configDir?: string): UsageLimit[] | undefined {
+    if (!this.opts.enabled) return undefined;
+    let key: string | undefined = harness;
+    if (configDir !== undefined) {
+      const factory = this.customFactory(harness);
+      if (factory === undefined) return undefined;
+      key = this.resolveKey(harness, configDir, factory);
+      if (key === undefined) return undefined;
+    }
+    const reading = this.fresh(key);
     if (reading === undefined) return undefined;
     const now = this.opts.now();
     const limits = reading.limits.filter((limit) => limit.resetsAt === undefined || limit.resetsAt > now);
@@ -896,6 +1036,7 @@ export class AccountWindows {
     }
     let status: number;
     let body: string;
+    let retryAfter: string | null = null;
     try {
       const answer = await this.opts.fetch(source.url, {
         method: "GET",
@@ -904,6 +1045,7 @@ export class AccountWindows {
         redirect: "error",
       });
       status = answer.status;
+      retryAfter = status === 429 ? (answer.headers?.get("retry-after") ?? null) : null;
       body = status === 200 ? await answer.text() : "";
     } catch {
       // The error is not logged: a transport's message is not ours to vouch for.
@@ -918,8 +1060,10 @@ export class AccountWindows {
       return;
     }
     if (status === 429) {
-      this.note(state, harness, "HTTP 429, asking again in 15 min");
-      this.back(state, BACKOFF.limited);
+      const wait = limitedWait(retryAfter, state.limitedInARow, this.opts.now());
+      this.note(state, harness, `HTTP 429, asking again in ${String(Math.ceil(wait / 60_000))} min`);
+      this.back(state, wait);
+      state.limitedInARow += 1;
       return;
     }
     if (status !== 200) {
@@ -927,6 +1071,7 @@ export class AccountWindows {
       this.back(state, BACKOFF.network);
       return;
     }
+    state.limitedInARow = 0;
     const reading = source.parse(body);
     if (reading === null) {
       this.note(state, harness, "an answer this build cannot read, asking again in 5 min");
@@ -967,7 +1112,7 @@ export function accountWindowsDoctorLine(
   const named = (name: string, tilde: string, path: string): string => ((env[name] ?? "").trim() === "" ? tilde : path);
   const keychain = platform === "darwin" ? " or the Keychain" : "";
   const where = {
-    claude: `reads ${named("CLAUDE_CONFIG_DIR", "~/.claude/.credentials.json", claudeCredentialsPath(env, home))}${keychain}, asks ${CLAUDE_USAGE_HOST}`,
+    claude: `reads ~/.claude/.credentials.json${keychain}${(env.CLAUDE_CONFIG_DIR ?? "").trim() === "" ? "" : ", plus the login under CLAUDE_CONFIG_DIR for each session that sets it"}, asks ${CLAUDE_USAGE_HOST}`,
     codex: `reads ${named("CODEX_HOME", "~/.codex/sessions", codexSessionsDir(env, home))}`,
     opencode: facts.opencodeGoKey
       ? `reads ${named("XDG_DATA_HOME", "~/.local/share/opencode/auth.json", opencodeAuthPath(env, home))}, asks ${OPENCODE_USAGE_HOST}`

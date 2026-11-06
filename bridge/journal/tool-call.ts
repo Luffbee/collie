@@ -63,8 +63,22 @@ export interface PlanTask {
 export type ToolCall =
   /** A file changed. `added`/`removed` count diff lines, not characters. `created`: the file is new. */
   | { kind: "edit"; path: string; added: number; removed: number; diff?: Hunk[]; created?: boolean }
-  /** A command ran. `exitCode` is absent where the harness does not record one. */
-  | { kind: "execute"; command: string; description?: string; exitCode?: number; background?: true; ongoing?: true }
+  /**
+   * A command ran. `exitCode` is absent where the harness does not record one. A `background` command
+   * answered before it ended: `ongoing` while no end has arrived, `jobId` the harness's name for the
+   * job, `startedAt` and `endedAt` epoch ms off the rows that started and ended it (ADR 0128).
+   */
+  | {
+      kind: "execute";
+      command: string;
+      description?: string;
+      exitCode?: number;
+      background?: true;
+      ongoing?: true;
+      jobId?: string;
+      startedAt?: number;
+      endedAt?: number;
+    }
   /** A file was read. `range` is [firstLine, lastLine], absent for a whole-file read. */
   | { kind: "read"; path: string; range?: [number, number] }
   /** A search over files or the web. `where` is the path, the glob, or "web". */
@@ -177,6 +191,20 @@ function str(o: JsonObject, ...keys: string[]): string | undefined {
       const joined = v.filter((x): x is string => typeof x === "string").join(" ").trim();
       if (joined !== "") return joined;
     }
+  }
+  return undefined;
+}
+
+/**
+ * The first non-empty string of a list field (`queries: ["a", "b"]`, `urls: [...]`). pi-web-access
+ * spells a batch call as a list; the first item is the row's one line and the rest are not counted.
+ */
+function firstOf(o: JsonObject, ...keys: string[]): string | undefined {
+  for (const k of keys) {
+    const v = o[k];
+    if (!Array.isArray(v)) continue;
+    const first = v.find((x): x is string => typeof x === "string" && x.trim() !== "");
+    if (first !== undefined) return first;
   }
   return undefined;
 }
@@ -396,14 +424,14 @@ export function classifyToolCall(name: string, input: JsonValue | undefined, sum
     case "search": {
       // `pattern` outranks `path` for the same reason it does in `summarizeToolInput`: a Grep carries
       // both, and the pattern is what you searched for. A test pins that order there; this follows it.
-      const call: ToolCall = { kind: "search", query: str(o, "pattern", "query", "q", "claim") ?? "" };
+      const call: ToolCall = { kind: "search", query: str(o, "pattern", "query", "q", "claim") ?? firstOf(o, "queries") ?? "" };
       const lower = name.toLowerCase();
       const where = str(o, "path", "glob", "include") ?? (lower.includes("web") || WEB_SEARCH.has(lower) ? "web" : undefined);
       if (where !== undefined) call.where = where;
       return call;
     }
     case "fetch":
-      return { kind: "fetch", url: str(o, "url", "uri") ?? "" };
+      return { kind: "fetch", url: str(o, "url", "uri") ?? firstOf(o, "urls") ?? "" };
     case "delete":
     case "move": {
       const call: ToolCall = { kind, path: str(o, "file_path", "path", "source", "from") ?? "" };

@@ -92,7 +92,7 @@ The config file groups every setting under a `[section]`. The environment name o
 
 | section | what it holds |
 | --- | --- |
-| `bridge` | poll cadence, how many lines are read, where state lives |
+| `bridge` | poll cadence, how many lines are read, where state lives, telemetry |
 | `network` | the port, the bind address, allowed hosts and origins |
 | `mux` | which multiplexer this collie mirrors, and where it lives |
 | `access` | the Tailscale identity gate, the device header, the audit trail, the secret mask |
@@ -108,6 +108,16 @@ The durable agents one Collie runs beside its multiplexer are not in `config.tom
 `sources.json`, in the same folder as `.env` ([Durable agents](durable-agents.md#attach-a-durable-agent)).
 | `stt` | speech-to-text, absent until `collie stt setup` runs |
 
+### Telemetry
+
+Two keys in `[bridge]` set the daily install ping that
+[What leaves your machine](security.md#what-leaves-your-machine) describes.
+
+| key | environment | default | what it does |
+| --- | --- | --- | --- |
+| `telemetry` | `COLLIE_TELEMETRY` | on | `false` or `0` turns the ping off and deletes the install ID. The file also takes the words `off`, `no`, `on` and `yes` as strings, and a word Collie does not know reads as off. `DO_NOT_TRACK=1` and the switch in Settings turn it off too, and any off setting wins over an on setting. Each switch changes one machine. For a service, set `COLLIE_TELEMETRY=0` in that instance's `.env`, not in your shell profile. |
+| `telemetry_url` | `COLLIE_TELEMETRY_URL` | Collie's own address | Where the ping goes, for a test server. An address that is not `https` (or `http` on `127.0.0.1` or `localhost`) turns the ping off. |
+
 To read history from multiple agent home directories, provide a comma-separated list in
 `COLLIE_TRANSCRIPT_ROOT`.
 
@@ -116,6 +126,13 @@ Pi-format journals default to `~/.omp/agent/sessions`, `~/.pi/agent/sessions` an
 homes; `COLLIE_PI_ROOT` can name a comma-separated list of session directories.
 Gentle Shell keeps the sessions of the pi it bundles in the last of these, so they open in
 Chat with no setting.
+
+For an Oh My Pi profile that stores sessions inside a project, add that profile's `sessions`
+directory to `COLLIE_PI_ROOT` in the bridge's `.env`, then restart that Collie instance. The bridge
+does not inherit a terminal's project-local profile configuration. This setting replaces the
+default list, so include the default session directories as well if other panes use them.
+Discovery recognises symlink spellings of the same home or working directory, but still refuses
+to guess between two unnamed pi or Oh My Pi sessions in the same folder.
 
 [`docs/deployment.md`](deployment.md) covers custom domains and reverse proxies. Collie enforces a
 same-origin policy, so any custom hostname or external TLS terminator must be explicitly
@@ -235,6 +252,18 @@ The agents mark left of the Files button counts the pane's running subagents. Fo
 Shell it counts their background jobs only while the pane's Chat is open on a phone; the Screen view
 does not count them.
 
+The Tasks mark shows the pane's task list with a done and total count. Claude Code, Codex, Grok and
+opencode fill it from their own logs. For pi, Oh My Pi and Gentle Shell it shows the plan of the
+newest `todo` call, only while the pane's Chat is open on a phone; the Screen view does not show it.
+
+The jobs mark, a timer, sits right of the agents mark while a command the agent started in the
+background still runs, or ended in the last ten minutes. Its badge counts the running jobs. A tap
+opens a sheet with each job's label, command and run time, and the exit code once it ended.
+
+Gentle Shell's `bash_background` and `monitor` fill the jobs mark, only while the pane's Chat is open
+on a phone; the Screen view and the dashboard do not show it. The pane's working light stays as the
+multiplexer reports it.
+
 While the text box holds text or an attachment, an X sits at the belt's right end too, left of the
 Switch button. One tap empties the box and its saved draft, and sends nothing to the pane. The X then
 becomes Undo, which puts the text and the attachments back. Undo stays until your next act: a
@@ -319,7 +348,7 @@ Collie refuses before it presses when pressing could do harm:
 If no answer comes back from a crew machine in time, Collie says so. The Stop may have gone in, so
 check the pane before you tap Stop again.
 
-A Stop is always your tap. A walky talky message, a hook, the command line and a queued action never
+A Stop is always your tap. A WalkyTalky message, a hook, the command line and a queued action never
 press one. Over a crew, the machine that runs the pane presses the key, reads the screen and sends
 the receipt back through the lead.
 
@@ -667,7 +696,7 @@ typed.
 ## Your own typefaces
 
 The interface font is a per-device setting. Under **Settings → Appearance → Typeface**, you can choose between
-System, Space Grotesk, Aldrich (the default), IBM Plex Sans, Geist and Atkinson Hyperlegible Next. A
+System, Space Grotesk, Aldrich, IBM Plex Sans, Geist and Atkinson Hyperlegible Next (the default). A
 [theme](themes.md) that names a face writes it here once, when you pick the theme. You can add custom fonts in
 `theme.toml`, the fourth configuration file:
 
@@ -1020,6 +1049,7 @@ Collie reads your Claude login file on this machine and asks Anthropic's usage e
 call Claude Code's /usage makes; nothing of the login is stored or sent elsewhere. Collie asks only
 while a pane of that harness is open, and it skips a login file that others may read (anything
 looser than `0600`) and a login that has expired. Codex sends no token: it reads its own files.
+Collie asks a vendor at most once in five minutes per agent, and after an HTTP 429 it waits as long as the `Retry-After` header says, and at least 15 minutes. The wait doubles on each 429 in a row, up to an hour, and the log says the real wait.
 
 | form | what it turns on |
 | --- | --- |
@@ -1266,6 +1296,11 @@ The phone keeps two things for each pane: the last terminal text it saw, and the
 Chat drew them. It never keeps the raw terminal screen as Chat. When you open Collie and the bridge
 does not answer within about a second and a half, the phone draws this saved copy at once, and
 replaces it with live data when the bridge answers.
+
+On a weak connection, one read that is late does not turn the screen red at once. The phone treats
+the bridge as lost only when no live answer has come for 8 seconds. A live answer, and every wake of
+the phone, clears that count. A pane or Chat read with no answer draws the saved copy only after the
+phone treats the bridge as lost.
 
 A saved copy looks different from a live screen:
 

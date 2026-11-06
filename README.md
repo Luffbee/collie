@@ -50,6 +50,8 @@ COLLIE_MUX=herdr collie start          # or: herdr-core, tmux, zellij
 **3. Pair your phone.** Run `collie qr` and scan it. Add Collie to your home screen and open it from
 the icon. Then run `collie pair` and type the code under **Settings → System → Paired devices**.
 
+![Put Collie on the home screen: iPhone and Android steps.](docs/images/install/pwa-install.svg)
+
 That's it: agents waiting on you show up first. Tap one to reply.
 
 > Collie is remote shell access to your machine. Keep it on your tailnet (`tailscale serve`, never
@@ -62,6 +64,7 @@ Prefer to have your agent do it? Ask it to run `collie skill` and follow the bri
 - **React Router + Vite** with TypeScript, Tailwind, shadcn, and a Bun bridge
 - **Status dashboard** led by what needs your input; every other pane sits under its own workspace, tab on the row
 - **Push notifications** when an agent blocks on user input
+- **Voice input**: speak a reply instead of typing it. Whistle, Collie's own speech engine, turns it into text on the phone or on your computer, so a phone whose browser cannot run it can still use voice. With Whistle the audio stays on your own devices. Off until you set it up
 - **Quick actions and slash commands** configured per agent
 - **Keys board you arrange**: `Esc`, `Ctrl+C`, arrows and modifier combinations, plus wider keys, your own chords and sequences, sticky `Ctrl`/`Alt`/`Shift`, presets (Claude Code, Prefix, Vim) and a layout code to share
 - **Start from the phone**: a **+ New** button opens one page where you pick the machine, an agent or a command, the folder and an optional new worktree; each machine shows which agents it has, a lost reply never opens a second pane, and your own launchers, the lead's and the ones you add from the phone, show on every machine of a crew
@@ -71,12 +74,12 @@ Prefer to have your agent do it? Ask it to run `collie skill` and follow the bri
 - **File attachments**: images from the camera roll, and markdown, text and code files
 - **Device pairing** always on: a device needs its token for every request, reads and writes, and an unpaired browser sees only the pair screen
 - **Crews**: several machines' Collies behind one URL, with operator-triggered failover
-- **Walky talky**: one agent session sends a short message to another, on any harness and across a crew, and you can message sessions from the phone; every message gets a receipt and a log entry, an address carries the pane's token so a message does not reach a new session in a reused pane id, and a crew machine signs it
+- **WalkyTalky**: one agent session sends a short message to another, on any harness and across a crew, and you can message sessions from the phone; every message gets a receipt and a log entry, an address carries the pane's token so a message does not reach a new session in a reused pane id, and a crew machine signs it
 - **Durable agents**: a long-running durable agent is a session on the phone, with approvals and history (experimental)
 - **Twelve UI languages** and a per-device typeface setting
 - **Herdr session switching** managed from the web interface
 - **PWA support** running locally on loopback with no external accounts or cloud dependencies
-- **No telemetry**: the app sends no analytics, usage statistics or crash reports. Its one unprompted call is the update check to GitHub ([details](./docs/security.md#what-leaves-your-machine))
+- **Telemetry**: new in 1.27.0 and on by default; before that Collie sent nothing. Once a day each bridge (one instance with its own state folder) sends a random ID, the version, the OS, the CPU, the install kind and the release line and, when a trouble card showed, the agent program's name and version and the multiplexer, as a count. No usage, no content. Turn it off on each machine in Settings, with `COLLIE_TELEMETRY=0` (in the instance's `.env` for a service), `telemetry = false` or `DO_NOT_TRACK=1` ([details](./docs/security.md#what-leaves-your-machine))
 
 ## Demo
 
@@ -171,7 +174,7 @@ and that is the only way to install it on a phone.
 | --- | --- |
 | [**Install in five minutes**](./docs/five-minute-install.md) | The recommended setup, step by step: Tailscale, Herdr and Collie on your computer, then a paired phone with Collie on its home screen |
 | [**Claude Code in tmux or Herdr, on your phone**](./docs/claude-code-on-your-phone.md) | Keep Claude Code running in tmux or Herdr when SSH drops. Manage sessions, start new agents and worktrees, approve prompts, and send Esc or Ctrl from your phone with push alerts. |
-| [**Walky talky**](./docs/walky-talky.md) | Messages between agent sessions: `collie walky who`, `send`, `reply`, `inbox` and `status`, pane tokens, receipts, how a message crosses a crew and how its outcome comes back, the phone's cards and composer, installing the skill into your agents, and the limits |
+| [**WalkyTalky**](./docs/walky-talky.md) | Messages between agent sessions: `collie walky who`, `send`, `reply`, `inbox` and `status`, pane tokens, receipts, how a message crosses a crew and how its outcome comes back, the phone's cards and composer, installing the skill into your agents, and the limits |
 
 ### Sessions
 
@@ -204,7 +207,7 @@ and that is the only way to install it on a phone.
 | [**Deployment**](./docs/deployment.md) | Front doors other than the default: an identity-aware proxy, a reverse proxy with no Tailscale, an off-host ingress, several Collies on one host (one per user, or several instances for one user), and a crew's standby door |
 | [**Commands**](./docs/commands.md) | Every `collie` verb, the census verbs that show what a Collie knows (`status`, `mux list`, `sessions`, `crew status`), putting `collie` on your PATH, and the Herdr actions that mirror the verbs on a Herdr-managed install |
 | [**Crews**](./docs/crew.md) | Several machines' Collies behind one URL: invite, join, deputy, failover, and a machine that runs several Collies |
-| [**Voice input and Web Push**](./docs/voice-and-push.md) | The microphone in the composer, and notifications when an agent is waiting on you |
+| [**Voice input and Web Push**](./docs/voice-and-push.md) | The microphone in the composer, Whistle speech to text on your phone or your computer, and notifications when an agent is waiting on you |
 | [**Manage & update**](./docs/upgrading.md) | Update from the phone or the terminal, roll back, update a crew, cross a major, stop, uninstall, and upgrading a 0.x install to 1.0 |
 | [**Troubleshooting**](./docs/troubleshooting.md) | Symptoms in the words you would actually search for |
 | [**Terminology**](./docs/terminology.md) | Collie's words in plain words, beside the names other tools use: session, space, tab, pane, terminal, durable agent, harness, crew, lead, and more |
@@ -275,7 +278,7 @@ has the install, the update, and what is not tested. In short:
 - **Run by Task Scheduler.** `collie start`, `stop`, `restart`, `status` and `uninstall` work as they
   do elsewhere. The task is named `herdr.collie` and starts at your logon.
 - **Not covered.** tmux and zellij (neither has a Windows build), Windows 10, Windows on ARM,
-  a Windows machine joining a crew, and a managed front door: Collie does not run `tailscale serve`
+  a Windows machine in a crew without the [experimental](./docs/windows.md#crews) consent flag, and a managed front door: Collie does not run `tailscale serve`
   on Windows, so bring your own,
   [Variant C](./docs/deployment.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale).
   Herdr's action buttons need `bash`, so the manifest lists only `linux` and `macos`.
@@ -374,6 +377,14 @@ The tabs, in order: Dashboard, Pane, Crew, Settings, Boot & connection, Idle & r
 Notices, Motion. Notices covers everything that ANNOUNCES (the notice primitive, the strip band,
 the status toast); Motion covers everything that MOVES without announcing anything (collapse and
 swap primitives, loading bars, sheets, menus, pending and pulsing controls).
+
+A card shows its label and nothing else. Its `reach` and `note`, and a section's `intent`, appear
+only while the page's Notes switch is on (off by default, remembered in `localStorage`).
+`cd web && bun run playground:build` builds the page alone into `web/dist-playground/` (minified,
+one chunk per section, no service worker) for any static server; it never touches `dist/`.
+
+A design round that compares numbered options uses `Round` (`src/playground/round.tsx`): one Case
+switch drives every option, with Zoom, Replay and Flip.
 
 Within a tab, cards are grouped under a `Group` — a small heading over its own `.pg-grid` — ordered
 from the everyday state to the rare one, so a tab with a dozen cards can be skimmed by its group

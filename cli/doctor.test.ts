@@ -24,6 +24,7 @@ import {
   type Finding,
   LONG_PATHS_KEY,
   secretsPrivate,
+  telemetryFindings,
   windowsLongPaths,
   windowsTask,
 } from "./doctor.ts";
@@ -39,10 +40,12 @@ import {
   fakeExec,
   fakeFiles,
   fakeLinkFs,
+  fakeOps,
   HOME,
   ROOT,
   type Scripted,
   type SeededFiles,
+  type SeededOps,
   STATE,
 } from "./fakes.ts";
 import { EXIT } from "./io.ts";
@@ -288,6 +291,8 @@ function harness(
     root?: string;
     /** The two `config.toml` files this run read. No file at all is the default. */
     configLayer?: ConfigFileLayer;
+    /** Wires the ops store, seeded with these records — which is what turns `crew-candidates` on. */
+    ops?: SeededOps;
   } = {},
 ): Harness {
   const contents = initial === null ? null : serializeTrustStore(initial);
@@ -314,9 +319,13 @@ function harness(
       files,
       link: fakeLinkFs(over.link),
       store: new TrustStore(STATE, io),
+      ops: over.ops === undefined ? undefined : fakeOps(over.ops),
       fetch: async (url, init) => {
         requests.push(url);
         sent.push({ url, headers: Object.fromEntries(new Headers(init?.headers)) });
+        // The telemetry row asks the bridge on its own route. A case that is not about it scripts no
+        // answer, and the row must not take a reply meant for a later read: the bridge is silent.
+        if (url.endsWith("/api/telemetry")) throw new Error("no bridge answered /api/telemetry");
         const reply = replies[n++];
         if (reply === undefined) return hello();
         if (reply instanceof Error) throw reply;
@@ -428,6 +437,7 @@ describe("collie doctor — the contract", () => {
       "beacons",
       "skill-walky-talky",
       "account-windows",
+    "telemetry",
       "herdr-version",
       "integration-agy",
       "integration-claude",
@@ -1272,6 +1282,92 @@ describe("collie doctor — the local checks", () => {
 
 // ── The clock ────────────────────────────────────────────────────────────────
 
+// `crew-candidates` (M84/04): where a multiplexer's machine list and the crew differ. The lists are
+// asked through the real providers over the fake `Exec`; the other checks' answers stay HEALTHY.
+describe("collie doctor — crew-candidates", () => {
+  const CORE_LIST = "hc machine ls --json";
+  // crew-delta returns the empty delta on win32 by design, so pin the host the way the front-door tests do.
+  const linuxHarness = (...args: Parameters<typeof harness>): ReturnType<typeof harness> => {
+    const h = harness(...args);
+    h.deps = { ...h.deps, host: hostFor("linux") };
+    return h;
+  };
+  const core = (...targets: readonly string[]): Scripted["answers"] => [
+    ...(HEALTHY_ANSWERS ?? []),
+    [CORE_LIST, { stdout: JSON.stringify({ machines: targets.map((target) => ({ target })) }) }],
+  ];
+  const LINE = "herdr-core knows 1 machine that is not in this crew: vps. Add it with `collie crew add`.";
+  const FORGOTTEN =
+    "laptop is in this crew, but herdr-core no longer lists it. Keep it, or drop it with `collie crew remove laptop`.";
+  const laptop = (source: string | null): SeededOps => ({
+    laptop: { sshHost: "laptop", path: "/opt/collie", port: 8787, recordedAt: T0, source },
+  });
+
+  test("is one ok finding whose detail joins the lines with `; `", async () => {
+    const h = linuxHarness(LEAD, [], { answers: core("vps"), ops: laptop("herdr-core") });
+    const { byCheck, code } = await findings(h);
+    const finding = byCheck.get("crew-candidates");
+    expect(finding?.status).toBe("ok");
+    expect(finding?.remedy).toBeNull();
+    expect(finding?.detail).toBe(`${LINE}; ${FORGOTTEN}`);
+    expect(code).toBe(EXIT.OK);
+  });
+
+  test("--json carries the delta as data", async () => {
+    const h = linuxHarness(LEAD, [], { answers: core("vps"), ops: laptop("herdr-core") });
+    const { byCheck } = await findings(h);
+    expect(byCheck.get("crew-candidates")?.data).toEqual({
+      missing: [{ source: "herdr-core", targets: ["vps"] }],
+      forgotten: [{ memberId: "laptop", source: "herdr-core" }],
+    });
+  });
+
+  test("the plain rendering prints the line", async () => {
+    const h = linuxHarness(LEAD, [], { answers: core("vps"), ops: laptop("herdr-core") });
+    expect(await cmdDoctor(h.deps, [])).toBe(EXIT.OK);
+    expect(h.io.stdout.join("\n")).toContain("crew-candidates");
+  });
+
+  test("is omitted, not skipped, when nothing differs", async () => {
+    const h = linuxHarness(LEAD, [], { answers: core("laptop"), ops: laptop("herdr-core") });
+    const { raw } = await findings(h);
+    expect(raw.some((f) => f.check === "crew-candidates")).toBe(false);
+  });
+
+  test("is omitted when there is no machine list at all", async () => {
+    const h = linuxHarness(LEAD, [], { ops: laptop(null), absent: ["hc", "herdr", "ssh"] });
+    const { raw } = await findings(h);
+    expect(raw.some((f) => f.check === "crew-candidates")).toBe(false);
+  });
+
+  test("a member with no source is not forgotten", async () => {
+    const h = linuxHarness(LEAD, [], { answers: core("vps"), ops: laptop(null) });
+    const { byCheck } = await findings(h);
+    expect(byCheck.get("crew-candidates")?.detail).toBe(LINE);
+  });
+
+  test("a peer gets no finding and no machine-list call", async () => {
+    const h = linuxHarness(peerStore(), [], { answers: core("vps"), ops: {} });
+    const { raw } = await findings(h);
+    expect(raw.some((f) => f.check === "crew-candidates")).toBe(false);
+    expect(h.calls).not.toContain(CORE_LIST);
+  });
+
+  test("a Windows host gets no finding and no machine-list call", async () => {
+    const h = linuxHarness(LEAD, [], { answers: core("vps"), ops: {} });
+    h.deps = { ...h.deps, host: hostFor("win32") };
+    await cmdDoctor(h.deps, ["--json"]);
+    expect(h.calls).not.toContain(CORE_LIST);
+  });
+
+  test("an install without the ops seam reads exactly as before", async () => {
+    const h = linuxHarness(LEAD, [], { answers: core("vps") });
+    const { raw } = await findings(h);
+    expect(raw.some((f) => f.check === "crew-candidates")).toBe(false);
+    expect(h.calls).not.toContain(CORE_LIST);
+  });
+});
+
 describe("collie doctor — the clock (§8.6's ±5m window)", () => {
   const withDate = (delta: number) =>
     harness(LEAD, [hello({ date: T0 + delta })], { files: { ...healthyFiles(), ...markerFile(LEAD) } });
@@ -1450,6 +1546,8 @@ describe("collie doctor — the crew checks", () => {
     expect(h.requests).toEqual([
       "https://laptop.example:8787/crew/v1/hello",
       "https://laptop.example:8787/crew/v1/snapshot",
+      // The telemetry row's one GET of THIS bridge's own answer (M86 spec 01).
+      "http://127.0.0.1:8787/api/telemetry",
       // The history section's one GET of THIS bridge's own snapshot (issue #137), on the same seam.
       "http://127.0.0.1:8787/api/snapshot",
     ]);
@@ -1866,6 +1964,7 @@ describe("the finding set is scoped by the chosen multiplexer", () => {
       "beacons",
       "skill-walky-talky",
       "account-windows",
+    "telemetry",
       "agent-sessions",
       "journal-roots",
       "cache-claims",
@@ -3259,5 +3358,119 @@ describe("doctor: the harnesses table (1.24.1)", () => {
     await cmdDoctor({ ...h.deps, harnesses: reader({ binary: CLAUDE, version: "2.1.200", outcome: outcome(0) }) }, []);
     expect(h.io.stdout.join("\n")).toMatch(/✓\s+harness-claude\s+\/home\/pat\/\.local\/bin\/claude · 2\.1\.200 · verified/u);
     expect((await findings(harness(null))).raw.filter((f) => f.check.startsWith("harness-"))).toEqual([]);
+  });
+});
+
+describe("the telemetry row (M86 spec 01)", () => {
+  const TELEMETRY_URL = "http://127.0.0.1:8787/api/telemetry";
+  const RUNNING = "(as the running bridge sees it)";
+  const SHELL = "(as this shell sees it; the service reads its own .env)";
+
+  /** `telemetryFindings` over a fake fetch: the answer to `/api/telemetry`, or silence when null. */
+  async function run(env: Record<string, string>, answer: Response | Error | null, files = fakeFiles({})) {
+    const seen: { url: string; headers: Record<string, string> }[] = [];
+    const found = await telemetryFindings({
+      ctx: context(env, {}),
+      files,
+      fetch: async (url, init) => {
+        seen.push({ url, headers: Object.fromEntries(new Headers(init?.headers)) });
+        if (answer === null || answer instanceof Error) throw answer ?? new Error("connection refused");
+        return answer;
+      },
+    });
+    return { found, seen };
+  }
+  const bridgeSays = (on: boolean, decidedBy: string): Response =>
+    new Response(JSON.stringify({ on, decidedBy, setting: null, next: null }), { status: 200 });
+
+  test("it asks the running bridge first, and says the answer is the bridge's", async () => {
+    const { found, seen } = await run({}, bridgeSays(true, "default"));
+    expect(found).toEqual([{ check: "telemetry", status: "ok", detail: `on, decided by default ${RUNNING}`, remedy: null }]);
+    expect(seen.map((r) => r.url)).toEqual([TELEMETRY_URL]);
+  });
+
+  test("the bridge's answer wins over this shell's environment, in both directions", async () => {
+    const off = await run({}, bridgeSays(false, "env"));
+    expect(off.found[0]?.detail).toBe(`off, decided by COLLIE_TELEMETRY ${RUNNING}`);
+    // This shell says off; the service, which reads its own .env, still sends.
+    const shellOff = await run({ COLLIE_TELEMETRY: "0", DO_NOT_TRACK: "1" }, bridgeSays(true, "default"));
+    expect(shellOff.found[0]?.detail).toBe(`on, decided by default ${RUNNING}`);
+    const phone = await run({}, bridgeSays(false, "settings"));
+    expect(phone.found[0]?.detail).toBe(`off, decided by the phone's switch ${RUNNING}`);
+  });
+
+  test("the request carries the local read credential and the configured login, and is a GET", async () => {
+    const secret = "A".repeat(43);
+    const ctx = context({ COLLIE_TRUSTED_USER: "pat@example.com" }, {});
+    const seen: { headers: Record<string, string>; method: string | undefined }[] = [];
+    await telemetryFindings({
+      ctx,
+      files: fakeFiles({ [`${ctx.stateDir}/local-secret`]: `${secret}\n` }),
+      fetch: async (_url, init) => {
+        seen.push({ headers: Object.fromEntries(new Headers(init?.headers)), method: init?.method });
+        return bridgeSays(true, "default");
+      },
+    });
+    expect(seen[0]?.headers.authorization).toBe(`Bearer ${secret}`);
+    expect(seen[0]?.headers["tailscale-user-login"]).toBe("pat@example.com");
+    expect(seen[0]?.method).toBeUndefined();
+  });
+
+  test("with no bridge answering it evaluates its own environment and says so", async () => {
+    const own = async (env: Record<string, string>): Promise<string | undefined> => (await run(env, null)).found[0]?.detail;
+    expect(await own({})).toBe(`on, decided by default ${SHELL}`);
+    expect(await own({ DO_NOT_TRACK: "1" })).toBe(`off, decided by DO_NOT_TRACK ${SHELL}`);
+    expect(await own({ COLLIE_TELEMETRY: "0" })).toBe(`off, decided by COLLIE_TELEMETRY ${SHELL}`);
+    expect(await own({ CI: "true" })).toBe(`off, decided by CI ${SHELL}`);
+  });
+
+  test("a refusal, a body that is not the answer, or an older bridge falls back to this shell", async () => {
+    const answers = [
+      new Response("nope", { status: 401 }),
+      new Response("telemetry unavailable", { status: 503 }),
+      new Response("<html>", { status: 200 }),
+      new Response(JSON.stringify({ on: "yes", decidedBy: "default" }), { status: 200 }),
+      new Response(JSON.stringify({ on: true, decidedBy: "somebody-else" }), { status: 200 }),
+      new Response(JSON.stringify({ protocol: 1, member: "laptop" }), { status: 200 }),
+    ];
+    for (const answer of answers) {
+      const { found } = await run({}, answer);
+      expect(found[0]?.detail).toBe(`on, decided by default ${SHELL}`);
+    }
+  });
+
+  test("the fallback reads the phone's switch from telemetry.json and writes nothing", async () => {
+    const ctx = context({}, {});
+    const written: string[] = [];
+    const base = fakeFiles({ [`${ctx.stateDir}/telemetry.json`]: JSON.stringify({ setting: "off" }) });
+    const files = { ...base, write: (path: string) => void written.push(path) };
+    const { found } = await run({}, null, files);
+    expect(found[0]?.detail).toBe(`off, decided by the phone's switch ${SHELL}`);
+    expect(written).toEqual([]);
+  });
+
+  test("an unknown COLLIE_TELEMETRY value is a warning row of its own, in both modes", async () => {
+    const want: Finding = {
+      check: "telemetry-switch",
+      status: "warn",
+      detail: "COLLIE_TELEMETRY=maybe is not a known value, read as off",
+      remedy: "set COLLIE_TELEMETRY to 0 or 1, in the service .env for a service, then run `collie restart`",
+    };
+    const shell = await run({ COLLIE_TELEMETRY: "maybe" }, null);
+    expect(shell.found.map((f) => f.check)).toEqual(["telemetry", "telemetry-switch"]);
+    expect(shell.found[0]?.detail).toBe(`off, decided by COLLIE_TELEMETRY ${SHELL}`);
+    expect(shell.found[1]).toEqual(want);
+    const bridge = await run({ COLLIE_TELEMETRY: "maybe" }, bridgeSays(false, "env"));
+    expect(bridge.found[0]?.detail).toBe(`off, decided by COLLIE_TELEMETRY ${RUNNING}`);
+    expect(bridge.found[1]).toEqual(want);
+    // An empty or known value warns nothing.
+    for (const value of ["", "off", "1", "Yes"]) expect((await run({ COLLIE_TELEMETRY: value }, null)).found).toHaveLength(1);
+  });
+
+  test("a whole doctor run prints the row once, as the shell's evaluation when the bridge is silent", async () => {
+    const h = harness(null);
+    const { byCheck } = await findings(h);
+    expect(byCheck.get("telemetry")?.detail).toContain("as this shell sees it");
+    expect(byCheck.has("telemetry-switch")).toBe(false);
   });
 });

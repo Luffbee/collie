@@ -137,6 +137,8 @@ export type AsMessage = { readonly menu: true; readonly tap: TapLog; readonly id
  */
 export async function sendAsMessage(page: Page, recorder: TapRecorder, body: string, log: TapLog[]): Promise<AsMessage> {
   await page.getByRole("textbox").last().fill(body);
+  // The box composer opens on the first character; the field one has no `data-box`, so this is no failure.
+  await page.locator('[data-box="open"]').first().waitFor({ state: "attached", timeout: 1000 }).catch(() => undefined);
   const send = page.getByRole("button", { name: message("composer.send.sendAria"), exact: true });
   log.push(await hold(page, send, "hold Send"));
   const row = page.getByRole("button", { name: message("walky.composer.sendAsMessage"), exact: true });
@@ -394,7 +396,7 @@ async function runCli(senderPane: string, args: readonly string[], machine: Mach
   const socket = machine === "lead" ? run?.socket : run?.member?.socket;
   if (socket === undefined || socket === "") throw new Error(`the rig has no ${machine} socket`);
   const dirs = machineDirs(machine);
-  const env = { PATH: process.env.PATH ?? "", HOME: dirs.bridgeHome, COLLIE_STATE_DIR: dirs.state, ...paneMarkers(senderPane, socket, machine) };
+  const env = { PATH: process.env.PATH ?? "", HOME: dirs.bridgeHome, COLLIE_STATE_DIR: dirs.state, COLLIE_TELEMETRY: "0", ...paneMarkers(senderPane, socket, machine) };
   return new Promise<{ code: number; out: string }>((done) => {
     const child = spawn("bun", [join(WORKTREE, "cli", "main.ts"), "walky", ...args], { env, timeout: 60_000, stdio: ["ignore", "pipe", "ignore"] });
     let out = "";

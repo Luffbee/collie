@@ -41,6 +41,7 @@ import {
   schemedAddressLines,
   selfAddress,
   WINDOWS_CREW_SENTENCE,
+  refuseCrewOnWindows,
 } from "./crew.ts";
 import {
   type AliasRow,
@@ -112,7 +113,9 @@ function harness(initial: TrustStoreData | null, replies: Reply[] = [], over: Pa
   const ops = fakeOps();
   const auditLines: AuditEntry[] = [];
   const out = capture();
-  const exec = fakeExec({ answers: [["tailscale status --json", { stdout: TAILSCALE_JSON }]] });
+  // `hc` and `herdr` are ABSENT by default, so `crew status` finds no machine list to compare with
+  // (M84/04) and prints what it always printed; the delta's own cases bring their own `Exec`.
+  const exec = fakeExec({ absent: ["hc", "herdr"], answers: [["tailscale status --json", { stdout: TAILSCALE_JSON }]] });
   const files = fakeFiles({ [HERDR_SOCKET]: "" });
   const requests: Harness["requests"] = [];
   const restarts: number[] = [];
@@ -494,6 +497,16 @@ describe("on a Windows host, the verbs that form a crew refuse and change nothin
     expect(WINDOWS_CREW_SENTENCE).toBe(
       "On Windows, Collie runs on one machine only: a Windows machine cannot join, lead or change a crew in this release, and nothing was changed. See docs/windows.md.",
     );
+  });
+
+  test("COLLIE_CREWS_ON_WINDOWS=1 consents past the refusal; without it the refusal stands", () => {
+    const h = harness(null, [], WIN);
+    const consented = { ...h.deps, ctx: { ...h.deps.ctx, env: { COLLIE_CREWS_ON_WINDOWS: "1" } } };
+    expect(refuseCrewOnWindows(consented)).toBe(false);
+    expect(text(h.io)).not.toContain(WINDOWS_CREW_SENTENCE);
+    // The flag is the whole consent: no flag, no change, and the sentence is still the one printed.
+    expect(refuseCrewOnWindows(h.deps)).toBe(true);
+    expect(text(h.io)).toContain(WINDOWS_CREW_SENTENCE);
   });
 
   test("the verbs that read or leave a crew are not refused", async () => {
@@ -2386,6 +2399,20 @@ describe("collie crew remove", () => {
     expect(text(h.io)).not.toContain("    ssh ");
   });
 
+  test("it ends with one line telling the operator the machine still runs Collie as a member", async () => {
+    const hint = (host: string): string =>
+      `  ${host} still runs Collie as a member; run \`collie leave\` there before you add it again.`;
+    const reached = harness(leadStore({ peers: [member({ memberId: "nas" })] }), [], {
+      ops: fakeOps({ nas: { sshHost: "op@192.168.77.2", path: null, port: 8787, recordedAt: T0 } }),
+    });
+    expect(await cmdCrewRemove(reached.deps, ["nas"])).toBe(EXIT.OK);
+    expect(reached.io.stdout).toContain(hint("op@192.168.77.2"));
+    // Without an ssh record the member id is the only name this lead has for it.
+    const unknown = harness(leadStore({ peers: [member({ memberId: "nas" })] }));
+    expect(await cmdCrewRemove(unknown.deps, ["nas"])).toBe(EXIT.OK);
+    expect(unknown.io.stdout).toContain(hint("nas"));
+  });
+
   test("an unknown member is a state error naming the verb that lists them", async () => {
     const h = harness(leadStore());
     expect(await cmdCrewRemove(h.deps, ["ghost"])).toBe(EXIT.STATE);
@@ -2785,5 +2812,94 @@ describe("collie crew", () => {
     expect(text(h.io)).toContain("mode   lead");
     expect(await cmdCrew(h.deps, ["approve-promote", "nas"])).toBe(EXIT.OK);
     expect(h.data()!.pendingHandover).toMatchObject({ memberId: "nas" });
+  });
+});
+
+// ── where a multiplexer's machine list and the crew differ (M84/04) ──────────
+
+describe("collie crew status — the machine list delta", () => {
+  const CORE_LIST = "hc machine ls --json";
+  const list = (...targets: readonly string[]) =>
+    fakeExec({
+      absent: ["herdr", "ssh"],
+      answers: [[CORE_LIST, { stdout: JSON.stringify({ machines: targets.map((target) => ({ target })) }) }]],
+    });
+  const LINE = "herdr-core knows 1 machine that is not in this crew: vps. Add it with `collie crew add`.";
+  const FORGOTTEN =
+    "nas is in this crew, but herdr-core no longer lists it. Keep it, or drop it with `collie crew remove nas`.";
+  const nasFrom = (source: string | null) =>
+    fakeOps({ nas: { sshHost: "nas", path: "/opt/collie", port: 8787, recordedAt: T0, source } });
+  const lead = () => leadStore({ peers: [member({ memberId: "nas" })] });
+
+  test("prints both lines after the members block", async () => {
+    const h = harness(lead(), [], { exec: list("vps"), ops: nasFrom("herdr-core") });
+    expect(await cmdCrewStatus(h.deps, [])).toBe(EXIT.OK);
+    const lines = h.io.stdout;
+    expect(lines).toContain(LINE);
+    expect(lines).toContain(FORGOTTEN);
+    expect(lines.indexOf(LINE)).toBeGreaterThan(lines.indexOf("members:"));
+  });
+
+  test("prints under --no-probe too, and dials nobody", async () => {
+    const h = harness(lead(), [], { exec: list("vps"), ops: nasFrom("herdr-core") });
+    expect(await cmdCrewStatus(h.deps, ["--no-probe"])).toBe(EXIT.OK);
+    expect(h.io.stdout).toContain(LINE);
+    expect(h.requests).toEqual([]);
+  });
+
+  test("is dim on a terminal", async () => {
+    const banked: { text: string; tone: string }[] = [];
+    const h = harness(lead(), [], {
+      exec: list("vps"),
+      ops: nasFrom(null),
+      ui: {
+        doctor: async () => {},
+        status: async () => {},
+        crewMembers: async (lines) => void banked.push(...lines),
+      },
+    });
+    await cmdCrewStatus(h.deps, ["--no-probe"]);
+    expect(banked.find((l) => l.text === LINE)?.tone).toBe("dim");
+  });
+
+  test("is not in --json", async () => {
+    const h = harness(lead(), [], { exec: list("vps"), ops: nasFrom("herdr-core") });
+    expect(await cmdCrewStatus(h.deps, ["--json", "--no-probe"])).toBe(EXIT.OK);
+    expect(h.io.stdout.join("\n")).not.toContain("herdr-core");
+    expect(h.exec.calls).not.toContain(CORE_LIST);
+  });
+
+  test("a lead with no members yet is still told", async () => {
+    const h = harness(leadStore(), [], { exec: list("vps") });
+    await cmdCrewStatus(h.deps, []);
+    expect(h.io.stdout).toContain(LINE);
+  });
+
+  test("a machine in no crew prints its block as before: no line, and nothing spawned", async () => {
+    const h = harness(null, [], { exec: list("vps") });
+    expect(await cmdCrewStatus(h.deps, [])).toBe(EXIT.OK);
+    expect(h.io.stdout.some((l) => l.startsWith("mode: solo"))).toBe(true);
+    expect(h.io.stdout).not.toContain(LINE);
+    expect(h.exec.calls).toEqual([]);
+  });
+
+  test("a peer prints no line and asks nothing", async () => {
+    const h = harness(peerStore(), [], { exec: list("vps") });
+    await cmdCrewStatus(h.deps, ["--no-probe"]);
+    expect(h.io.stdout).not.toContain(LINE);
+    expect(h.exec.calls).not.toContain(CORE_LIST);
+  });
+
+  test("a Windows host prints no line and asks nothing", async () => {
+    const h = harness(lead(), [], { exec: list("vps"), host: hostFor("win32") });
+    await cmdCrewStatus(h.deps, ["--no-probe"]);
+    expect(h.io.stdout).not.toContain(LINE);
+    expect(h.exec.calls).not.toContain(CORE_LIST);
+  });
+
+  test("no machine list means no extra line", async () => {
+    const h = harness(lead(), [], { exec: fakeExec({ absent: ["hc", "herdr", "ssh"] }), ops: nasFrom("herdr-core") });
+    await cmdCrewStatus(h.deps, ["--no-probe"]);
+    expect(h.io.stdout.some((l) => l.includes("no longer lists") || l.includes("not in this crew:"))).toBe(false);
   });
 });

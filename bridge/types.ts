@@ -13,6 +13,7 @@ import type { ChatBody } from "./journal/live.ts";
 import type { AgentSessionRef, TranscriptEntry } from "./journal/types.ts";
 import type { MuxCapability, MuxSpaceCapacity, MuxTopologyLatency } from "./mux/capabilities.ts";
 import type { SttWireIdentity } from "./stt/config.ts";
+import type { PaneJob } from "./jobs-journal.ts";
 import type { PaneSubagent } from "./subagents.ts";
 import type { PaneTodo } from "./todos.ts";
 import type { UpdateRun } from "./update-run.ts";
@@ -27,6 +28,7 @@ export type { Confidence } from "./cache/claims.ts";
 export type { GitHead } from "./git-head.ts";
 export type { PaneTodo, PaneTodoStatus } from "./todos.ts";
 export type { PaneSubagent } from "./subagents.ts";
+export type { PaneJob } from "./jobs-journal.ts";
 
 export type AgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
 
@@ -199,6 +201,13 @@ export interface AgentView {
    */
   subagents?: PaneSubagent[];
   /**
+   * The background jobs of this pane's session: the commands still running after the call that
+   * started them answered, and those that ended in the last ten minutes. Read from the session's live
+   * Chat window, from memory (bridge/jobs-journal.ts, ADR 0128). Attached at serialise time and
+   * ABSENT, NEVER A PLACEHOLDER: a pane with none carries no key at all, never `[]`.
+   */
+  jobs?: PaneJob[];
+  /**
    * The model this pane's agent is on, as its harness names it: a `/model` chosen since the last turn
    * first (Claude), else the model that turn ran on (`claude-opus-5-5`, `provider:model` for opencode
    * and pi). Read by the cache tracker's probe and attached at serialise time exactly as {@link cache}
@@ -261,6 +270,13 @@ export type PaneWire = Omit<AgentView, "agentSession" | "sessionAgent"> & {
    * Absent from a bridge built without walky talky, and from an older member (CREW_PROTOCOL §21).
    */
   instance?: string;
+  /**
+   * True when the session turned its walky talky off (M89, bridge/walky/off.ts). Present only then,
+   * never `false`, so an on pane and every solo body stay what they were. The machine that owns the
+   * pane enforces it; everyone else only shows it (CREW_PROTOCOL §21). An older member never sends it,
+   * and its panes read as on.
+   */
+  walkyOff?: true;
   /**
    * Which member of the crew this pane lives on — the `?h=` value completing the `(host, session,
    * paneId)` address (CREW_PROTOCOL.md §4). Present exactly when {@link SnapshotResponse.servers}
@@ -627,18 +643,20 @@ export function journalAgentOf(pane: AgentView): string {
  * agent's pane still offers no affordance and reads like every other shell pane.
  *
  * `instance` is the pane's walky talky instance token, from the bridge's instance registry; absent,
- * the wire carries no `instance` key.
+ * the wire carries no `instance` key. `walkyOff` true adds `walkyOff: true`; otherwise no such key.
  */
 export function toPaneWire(
   pane: AgentView,
   hasJournal: (agent: string) => boolean,
   discoversSessions: (agent: string) => boolean = () => false,
   instance?: string,
+  walkyOff = false,
 ): PaneWire {
   const { agentSession, sessionAgent: _sessionAgent, ...rest } = pane;
   const addressable = agentSession !== undefined || discoversSessions(pane.agent);
   const wire: PaneWire = addressable && hasJournal(pane.agent) ? { ...rest, hasSession: true } : rest;
-  return instance === undefined ? wire : { ...wire, instance };
+  const placed = instance === undefined ? wire : { ...wire, instance };
+  return walkyOff ? { ...placed, walkyOff: true } : placed;
 }
 
 /** A Herdr workspace ("space") — a project-scoped container of tabs. From `workspace.list`. */

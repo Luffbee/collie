@@ -59,6 +59,7 @@ export const WALK_PAIRS: readonly WalkPair[] = [
   ["omp", "omp--v18-4-ask-single.txt", "omp--v18-4-ask-single-moved.txt"],
   ["omp", "omp--v18-8-ask-single-described.txt", "omp--v18-8-ask-single-described-moved.txt"],
   ["omp", "omp--v18-10-ask-batch.txt", "omp--v18-10-ask-batch-moved.txt"],
+  ["omp", "omp--v18-16-0-ask-single-glyph-hide--w200.txt", "omp--v18-16-0-ask-single-glyph-hide-moved--w200.txt"],
   // omp `/resume` picker. The unboxed pair differs in the ages too (`1 minute ago` against
   // `2 minutes ago`); `coreSignature` blanks them, so the pair holds.
   ["omp", "omp--v18-4-resume.txt", "omp--v18-4-resume-moved.txt"],
@@ -93,6 +94,8 @@ export const WALK_PAIRS: readonly WalkPair[] = [
   ["omp", "omp--v18-4-switch-overcontext.txt", "omp--v18-4-switch-overcontext-moved.txt"],
   ["omp", "omp--v18-4-switch-search-short.txt", "omp--v18-4-switch-search-short-moved.txt"],
   ["omp", "omp--v18-4-switch-top-edge.txt", "omp--v18-4-switch-wrapped.txt"],
+  // The same picker in omp 18.17.0's `nerd` preset (private-use pointer, dot, icons and keycaps), one `Down` apart.
+  ["omp", "omp--v18-17-0-nerd-switch--w120.txt", "omp--v18-17-0-nerd-switch-moved--w120.txt"],
   // opencode permission dialog: horizontal chips, the pointer is a background colour and not a glyph,
   // so the TEXT of each pair is identical and only the option plans differ (Right × d, then Enter).
   // `promptsEqual` still tells them apart because it compares the exact plans (prompt-model.ts).

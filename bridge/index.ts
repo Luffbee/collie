@@ -31,7 +31,7 @@ import { repoFactsOf } from "./repo-facts.ts";
 import { withRepoFacts } from "./repo-facts-mux.ts";
 import { gitBinary } from "./changes.ts";
 import { withWorktreeCapability } from "./worktree-capability.ts";
-import { holdPrivateFile, loadConfig, loadConfigLayer, nonLoopbackBindRefusal, resolveConfigDir, type Config } from "./config.ts";
+import { holdPrivateFile, interfaceAddresses, listenFailureLine, loadConfig, loadConfigLayer, nonLoopbackBindRefusal, resolveConfigDir, type Config } from "./config.ts";
 import { applyConfigLayer } from "./config-source.ts";
 import {
   aclRepairAllowed,
@@ -243,6 +243,12 @@ import {
   writeUpdateLine,
 } from "./update-line.ts";
 import {
+  createTelemetry,
+  telemetryOrigin,
+  TELEMETRY_FIRST_DELAY_MS,
+  TELEMETRY_INTERVAL_MS,
+} from "./telemetry.ts";
+import {
   FreshPreflightGate,
   launchUpdateRunner,
   openRunnerLog,
@@ -277,15 +283,17 @@ import {
   CREW_WALKY_ROUTE,
   leadRouteRemote,
   memberRouteRemote,
+  olderThanWake,
   olderThanWalky,
   WalkyCrew,
   WalkyLeadSide,
   WalkyReport,
   type CrewDialAnswer,
 } from "./walky/crew.ts";
-import type { RouteRemote, SendResult, WalkyHost, WalkyPane } from "./walky/deliver.ts";
+import { isResting, type RouteRemote, type SendResult, type WalkyHost, type WalkyPane } from "./walky/deliver.ts";
 import { INSTANCE_TICK_MS, WalkyInstances } from "./walky/instances.ts";
 import { WalkyLog } from "./walky/log.ts";
+import { WalkyOff } from "./walky/off.ts";
 import { RefusalCounter } from "./walky/refusals.ts";
 import { WalkySeen } from "./walky/seen.ts";
 import { WalkyService } from "./walky/service.ts";
@@ -1248,6 +1256,32 @@ updateFirstCheck.unref();
 const updateTimer = setInterval(updateTick, UPDATE_INTERVAL_MS);
 updateTimer.unref();
 
+// The anonymous install ping (M86 spec 01, bridge/telemetry.ts): one tiny POST a day at most, to
+// Collie's own endpoint, and nothing at all when any off switch says so. The state file is settled
+// here at boot (an off ping keeps no ID), the first check comes ten minutes in and then every hour,
+// and each tick only asks `shouldSend`. Both timers are unref()ed and cleared on shutdown.
+const telemetry = createTelemetry({
+  stateDir: cfg.stateDir,
+  env: process.env,
+  origin: telemetryOrigin(process.env, configLayer),
+  version: crewVersion,
+  installKind: installKind,
+  line: () => readUpdateLineSync(cfg.stateDir).line,
+  // Read at ping time. A peer (a member, or a deputy that is not the lead) is a member in the ping.
+  crewMode: () => crew.mode,
+  now: Date.now,
+  fetch: (url, init) => fetch(url, init),
+  os: HOST.platform,
+  arch: process.arch,
+  warn: (line) => console.warn(`[telemetry] ${line}`),
+  log: (line) => console.log(`[telemetry] ${line}`),
+});
+telemetry.observe();
+const telemetryFirstTick = setTimeout(() => void telemetry.tick(), TELEMETRY_FIRST_DELAY_MS);
+telemetryFirstTick.unref();
+const telemetryTimer = setInterval(() => void telemetry.tick(), TELEMETRY_INTERVAL_MS);
+telemetryTimer.unref();
+
 /**
  * What this collie publishes beside its snapshot body when its lead polls it (§19).
  *
@@ -1321,6 +1355,9 @@ function followLeadLine(a: { readonly line?: ReleaseLine; readonly step?: LeadSt
   }
 }
 
+/** The release the lead last stated on a sweep, or null when it stated none yet (walky talky's `--wake` check). */
+let heardLeadRelease: string | null = null;
+
 /**
  * A durable peer names a lead too old to show its panes properly (M50 spec 14, bridge/durable/old-lead.ts).
  * Any peer that runs a durable program counts, as the primary or as a source beside its terminal mux
@@ -1330,9 +1367,11 @@ const oldLead = crew.mode === "peer" && runsPrograms ? new OldLeadNotice() : und
 
 /** The lead's two follow headers, handed to whichever of the follower and the old-lead notice exist. */
 const onFollow =
-  crewFollower === undefined && oldLead === undefined
+  crew.mode !== "peer" && crewFollower === undefined && oldLead === undefined
     ? undefined
     : (a: { readonly leadRelease: string | null; readonly turn: string | null; readonly leadLine?: string | null }): void => {
+        // Walky talky reads it too (`memberRouteRemote`): a lead below 1.26.1 cannot take `--wake`.
+        if (a.leadRelease !== null) heardLeadRelease = a.leadRelease;
         oldLead?.observe(a.leadRelease);
         crewFollower?.observe(a);
       };
@@ -1618,8 +1657,12 @@ const makeSession: SessionFactory = (name, endpoint, isPrimary) => {
   const sink = makeNotifySink(push, herdPushGate(crew.mode, snooze), herdTagFor(isPrimary, name), {
     session: isPrimary ? undefined : name,
   });
-  const notifications = new NotificationCoordinator(clock, sink, cfg.notifyDelayMs, (status) =>
-    notifyPrefs.isNotifiable(status),
+  const notifications = new NotificationCoordinator(
+    clock,
+    sink,
+    cfg.notifyDelayMs,
+    (status) => notifyPrefs.isNotifiable(status),
+    () => notifyPrefs.current().individual,
   );
   // A pane whose adapter raises asks as data (ADR 0100) does not push on its way into `blocked`: the
   // ask guard decides, once per ask, after each poll. Every other pane, and every other transition,
@@ -1922,14 +1965,18 @@ hookTarget =
 // a multiplexer reuses a pane id, and the token tells the pane a sender meant from a new session that
 // took its id. A pane out of sight for 30 seconds loses its token, and its inbox goes with it.
 const walkyInstances = new WalkyInstances(join(cfg.stateDir, "walky"));
+// A session that turned its walky talky off (M89, `<stateDir>/walky/off.json`). Read through the pane row.
+const walkyOff = new WalkyOff(join(cfg.stateDir, "walky"));
 /** Every pane of every session, without its token: what the instance registry observes. */
-const walkyRawPanes = (): Omit<WalkyPane, "instance">[] =>
+const walkyRawPanes = (): Omit<WalkyPane, "instance" | "off">[] =>
   registry.ordered().flatMap((rt) => {
     const { agents, shellPanes } = rt.engine.current();
-    const of = (view: AgentView, agent: boolean): Omit<WalkyPane, "instance"> => {
+    const of = (view: AgentView, agent: boolean): Omit<WalkyPane, "instance" | "off"> => {
       const head = gitHeads.get(view.cwd);
       const facts = { paneId: view.paneId, cwd: view.cwd, branch: head?.kind === "branch" ? head.name : null, paneLabel: view.paneLabel, terminalTitle: view.terminalTitle };
-      return { session: rt.name, paneId: view.paneId, agent, harness: agent ? view.agent : null, label: labelOf(facts, !cfg.redact), state: view.status, terminal: rt.send !== undefined };
+      // The last status change comes from the activity ledger: the engine's views carry no time (it rides the wire at serialise time).
+      const activeAt = activity.get(rt.name, view.paneId)?.activeAt ?? null;
+      return { session: rt.name, paneId: view.paneId, agent, harness: agent ? view.agent : null, label: labelOf(facts, !cfg.redact), state: view.status, activeAt, terminal: rt.send !== undefined };
     };
     const out = agents.map((view) => of(view, true));
     for (const view of shellPanes) out.push(of(view, false));
@@ -1941,7 +1988,8 @@ function walkyResult(sendId: string, outcome: string, reason: string | undefined
   return why === undefined ? { outcome } : { outcome, reason: why };
 }
 const walkyHost: WalkyHost = {
-  panes: () => walkyInstances.stamp(walkyRawPanes()),
+  // `stamp` builds fresh rows, so adding the flag to each one here touches nothing else.
+  panes: () => walkyInstances.stamp(walkyRawPanes()).map((pane) => Object.assign(pane, { off: walkyOff.isOff(pane) })),
   // A walky send is marked (M62 spec 02): a draft holds it, and its hold ends on walky's one clock.
   send: async (pane, sendId, text, hold): Promise<SendResult> => {
     const protocol = registry.get(pane.session)?.send;
@@ -1968,6 +2016,8 @@ const walkyMemberId = crew.mode === "solo" ? null : (trustStore.current()?.self.
 const walkyLog = new WalkyLog(join(cfg.stateDir, "walky"));
 // A pane instance that went takes its inbox with it: a new session that takes the id starts empty.
 walkyInstances.onDrop((session, paneId, token) => walkyLog.inboxDrop(session, paneId, token));
+// The same for the off flag (M89): it belongs to the session, and ends with it.
+walkyInstances.onDrop((session, paneId, token) => walkyOff.drop(session, paneId, token));
 // Look at the panes every 10 seconds even when no message asks, so a closed pane is dropped on time.
 const walkyInstanceTimer = setInterval(() => walkyInstances.observe(walkyRawPanes()), INSTANCE_TICK_MS);
 walkyInstanceTimer.unref();
@@ -1991,11 +2041,12 @@ const walkyRoute: RouteRemote | undefined =
     ? undefined
     : crew.mode === "lead"
       ? (message, members, panes) => (walkyLeadHalf === null ? Promise.reject(new Error("the crew is not wired yet")) : walkyLeadHalf.route(message, members, panes))
-      : memberRouteRemote({ self: walkyMemberId, post: (payload) => walkyToLead(payload) });
+      : memberRouteRemote({ self: walkyMemberId, post: (payload) => walkyToLead(payload), leadRelease: () => heardLeadRelease, own: crewVersion, compare: compareSemver });
 const walky = new WalkyService({
   log: walkyLog,
   seen: walkySeen,
   refusals: walkyRefusals,
+  off: walkyOff,
   host: walkyHost,
   memberId: walkyMemberId,
   enabled: () => cfg.walky,
@@ -2078,6 +2129,7 @@ const peerNotifier =
         mute: snooze,
         delayMs: cfg.notifyDelayMs,
         isNotifiable: (status) => notifyPrefs.isNotifiable(status),
+        individual: () => notifyPrefs.current().individual,
         asks: askPush,
       })
     : undefined;
@@ -2558,6 +2610,8 @@ if (crewLead !== undefined && walkyMemberId !== null) {
       self: walkyMemberId,
       // A member whose reported version predates walky talky is refused `older member` without a dial.
       older: (memberId) => olderThanWalky(lead.contributions().find((c) => c.state.memberId === memberId)?.state.version ?? null, crewVersion, compareSemver),
+      // A member below 1.26.1 never rests a pane: a `wake` message goes to it as a plain send.
+      olderThanWake: (memberId) => olderThanWake(lead.contributions().find((c) => c.state.memberId === memberId)?.state.version ?? null, crewVersion, compareSemver),
       members: () => (trustStore.current()?.peers ?? []).filter((member) => member.status === "enrolled").map((member) => member.memberId),
       // A message from another member travels with that member's pinned certificate and this lead's
       // voucher, so the receiving member checks the origin itself (§21, added 2026-10-18).
@@ -2597,6 +2651,7 @@ if (crewLead !== undefined && walkyMemberId !== null) {
       crewSkipped(
         lead.contributions().map((c) => ({ memberId: c.state.memberId, name: c.name, reachable: c.state.health === "reachable", body: c.body })),
         !cfg.redact,
+        (pane) => isResting(pane, Date.now()),
       ),
   };
 }
@@ -2999,10 +3054,34 @@ const standbyDoor = standbyStore === null ? null : createStandbyDoor({
  * one question — *should anything route here?* — and a lead answers it `200` on both of its ports.
  */
 const standbyPort = standbyPortOf(process.env);
+/**
+ * Run a listen, or end the process (issue 699). Bun throws when a door cannot listen, and this
+ * module starts at top level, so the throw would fail the import while the hold socket, the walky
+ * socket, the poll loop and the timers kept a bridge with no listener alive. launchd, systemd and
+ * the Windows task restart only an exit, so the line below is printed and the process exits 1.
+ */
+function listenOrExit<T>(door: "front door" | "standby door", host: string, port: number, listen: () => T): T {
+  try {
+    return listen();
+  } catch (err) {
+    console.error(
+      listenFailureLine({
+        door,
+        host,
+        port,
+        code: err instanceof Error && "code" in err ? String(err.code) : undefined,
+        message: err instanceof Error ? err.message : String(err),
+        interfaces: interfaceAddresses(),
+      }),
+    );
+    process.exit(1);
+  }
+}
+
 const standbyServer =
   standbyPort === null || bootTrust === null
     ? null
-    : Bun.serve({
+    : listenOrExit("standby door", standbyHostOf(process.env), standbyPort, () => Bun.serve({
         hostname: standbyHostOf(process.env),
         port: standbyPort,
         fetch: async (req) => {
@@ -3025,7 +3104,7 @@ const standbyServer =
           // machine mid-update is most likely to meet (M15/05).
           return withStandbyVersion(answered ?? new Response("not found", { status: 404 }), crewVersion);
         },
-      });
+      }));
 
 if (standbyServer !== null && standbyDoor !== null) {
   console.log(
@@ -3040,7 +3119,7 @@ if (standbyServer !== null && standbyDoor !== null) {
   );
 }
 
-const server = startServer({
+const server = listenOrExit("front door", cfg.host, cfg.port, () => startServer({
   cfg,
   registry,
   push,
@@ -3056,6 +3135,8 @@ const server = startServer({
     write: (record) => writeUpdateLine(diskWriter, cfg.stateDir, record),
     now: Date.now,
   },
+  // The anonymous install ping's state and the phone's switch (M86 spec 01).
+  telemetry,
   // The bare `<semver>+<sha>` this process answers `/api/health` and `/crew/v1/hello` with — one
   // string, resolved once, so the detached updater's health gate and a peer can never be told two
   // different things about this machine (M15/04).
@@ -3076,6 +3157,10 @@ const server = startServer({
   usage,
   gitHeads,
   walkyInstance: (session, paneId) => walkyInstances.tokenOf(session, paneId),
+  walkyPaneOff: (session, paneId) => {
+    const instance = walkyInstances.peek(session, paneId);
+    return instance !== null && walkyOff.isOff({ session, paneId, instance });
+  },
   walky,
   cacheWatch,
   folders,
@@ -3207,7 +3292,7 @@ const server = startServer({
     }
     return null;
   },
-});
+}));
 
 const shutdown = async () => {
   console.log("\n[bridge] shutting down");
@@ -3237,6 +3322,8 @@ const shutdown = async () => {
   clearInterval(sweepTimer);
   clearTimeout(updateFirstCheck);
   clearInterval(updateTimer);
+  clearTimeout(telemetryFirstTick);
+  clearInterval(telemetryTimer);
   process.exit(0);
 };
 process.on("SIGINT", shutdown);

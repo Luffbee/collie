@@ -6,6 +6,7 @@ import { Notice } from "@/components/ui/notice";
 import { useLocale } from "@/hooks/use-locale";
 import { t } from "@/lib/i18n";
 import { BeltSizeControl } from "@/components/belt-size-control";
+import { ZoomPillControl } from "@/components/zoom-pill-control";
 import { ChangesControl } from "@/components/changes-control";
 import { ConnectionInfo } from "@/components/connection-info";
 import { CrewSettingsCard } from "@/components/crew-settings-card";
@@ -32,7 +33,7 @@ import { CompactionsControl } from "@/components/compactions-control";
 import { ToolCallsControl } from "@/components/tool-calls-control";
 import { TourControl } from "@/components/tour-control";
 import { TypefaceControl } from "@/components/typeface-control";
-import { UpdatesSettingsCard } from "@/components/updates-settings-card";
+import { TelemetrySettingsCard, TelemetrySettingsRow } from "@/components/telemetry-settings-card";
 import { ZenControl } from "@/components/zen-control";
 import { useServerDiagnostics } from "@/hooks/use-server-diagnostics";
 import { EMPTY_DEVICES, type DevicesData } from "@/lib/loaders";
@@ -97,6 +98,9 @@ export function SettingsAppearanceRoute() {
           band, pills, icons and words (components/actions-row.tsx, `--belt-scale`). */}
       <HarnessBarControl />
       <BeltSizeControl />
+      {/* The belt's Zoom pill: in the Screen view or never (lib/zoom-pill.ts). Under the belt's size
+          because both decide what that one belt carries. */}
+      <ZoomPillControl />
       {/* Which thumb the belt and the reply box are laid out for. Under the belt's size because both
           decide how that one belt is drawn. */}
       <HandControl />
@@ -262,9 +266,6 @@ export function SettingsSystemRoute() {
   const devices = (useLoaderData() as DevicesData | undefined) ?? EMPTY_DEVICES;
   return (
     <SettingsPage title="settings.section.system.title">
-      {/* ONE row for the whole subject: updating is a flow with a lead, N peers, progress and a
-          rollback state, so it lives on `/settings/updates` and this is the row that opens it. */}
-      <UpdatesSettingsCard />
       {/* Access sits with the connection diagnostics — both answer "what is this device allowed to
           do, and why". Pairing is the gate you can change from here; ConnectionInfo below only
           reports the header-based one. */}
@@ -277,9 +278,23 @@ export function SettingsSystemRoute() {
         build={diagnostics.build}
         redact={diagnostics.redact}
       />
+      {/* The anonymous install count (M86 spec 02, ADR 0129): one row with its state, above the report
+          card because both are about what this machine says to Collie's host. The switch, the cause
+          and the next message are the page the row opens. */}
+      <TelemetrySettingsRow />
       {/* Report a problem (ADR 0123): the offer's switch and the sheet's third door, with the diagnostics
           because a report is the one way those leave this phone, and only by the person's taps. */}
       <ReportControl />
+    </SettingsPage>
+  );
+}
+
+/** Settings → System → Telemetry: the whole card, one level below System. */
+export function SettingsInstallCountRoute() {
+  const scope = useScope();
+  return (
+    <SettingsPage title="telemetry.card.title" parent={settingsSectionPath("system", scope)}>
+      <TelemetrySettingsCard />
     </SettingsPage>
   );
 }

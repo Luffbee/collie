@@ -26,8 +26,10 @@ import type { CacheProbe } from "../cache/engine.ts";
 import type { JsonObject, JsonValue } from "../json.ts";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { asRecord, asText, FileSum, probeTail, tokenCount, walkBack } from "./cache-probe.ts";
+import { harnessProcessOf } from "../launch-window.ts";
 import { processStartMs } from "./process-start.ts";
 import { type MeasuredContext, piAgentDirLookups, WindowCatalog } from "./model-window.ts";
+import { HOST, isInside } from "../host.ts";
 import {
   containedRealpath,
   containedRealpathIn,
@@ -35,6 +37,7 @@ import {
   head as fileHead,
   loadTail,
   readSinceFile,
+  realpathOf,
   rootList,
   statFile,
 } from "./files.ts";
@@ -54,7 +57,7 @@ import {
 } from "./reduce.ts";
 import { clamp, type Clamped, MAX_RESULT_CHARS, MAX_TEXT_CHARS, stripAnsi, summarizeToolInput } from "./text.ts";
 import { parseUnifiedDiff } from "./diff.ts";
-import { answerLabels, classifyToolCall, planTasks, questionKey, type ToolCall } from "./tool-call.ts";
+import { answerLabels, classifyToolCall, type PlanTask, planTasks, questionKey, type ToolCall } from "./tool-call.ts";
 import type {
   AgentSessionRef,
   JournalAdapter,
@@ -62,6 +65,7 @@ import type {
   TranscriptPart,
   TranscriptSource,
   DiscoverHints,
+  ForegroundProcess,
 } from "./types.ts";
 
 /** pi's session ids are uuids (v4 and v7 both observed) — validated before any path work. */
@@ -297,11 +301,10 @@ function enrichCall(
   }
   if (call.kind === "plan") {
     // Gentle Shell's `todo` result holds the WHOLE list whatever the action was (277 of 277 local
-    // results, 2026-10-16); the input of an `update` holds one task. An empty or absent list leaves
-    // what the input said.
-    const gentle = details?.gentleTodo;
-    const tasks = gentle !== null && typeof gentle === "object" && !Array.isArray(gentle) ? planTasks(gentle.tasks) : [];
-    if (tasks.length > 0) call.tasks = tasks;
+    // results, 2026-10-16); the input of an `update` holds one task. An absent list leaves what the
+    // input said; an explicit empty list (a `clear`) empties the card (#715).
+    const tasks = gentleTasks(details);
+    if (tasks !== undefined) call.tasks = tasks;
     return;
   }
   if (call.kind === "execute") {
@@ -318,8 +321,12 @@ function enrichCall(
     // `ask_user` as `details.answer`, both for a one-question call. A dismissal
     // (`details.cancelled`) carries neither and fills nothing.
     const selection = details?.selection;
-    const picked =
+    const chosen =
       selection !== null && typeof selection === "object" && !Array.isArray(selection) ? selection.label : details?.answer;
+    // The free-text "Other" of `ask_user_choice` is written to `details.customResponse` and carries
+    // no selection; the words typed are the answer (#714).
+    const custom = details?.customResponse;
+    const picked = typeof custom === "string" && custom.trim() !== "" ? custom : chosen;
     if (call.questions.length === 1 && typeof picked === "string" && picked.trim() !== "") {
       const labels = answerLabels(picked);
       if (labels.length > 0) {
@@ -339,6 +346,23 @@ function enrichCall(
     ) {
       // SAFETY: every element was just checked to be an array of strings.
       call.answers = answers as string[][];
+      return;
+    }
+    // gentle-pi's `ask_user_question` writes `details.answers` as a LIST OF OBJECTS, one per question:
+    // `[{ questionIndex, question, kind, answer }]` (gentle-pi 4.6.0, from the issue #714 report; not
+    // read off a local log). An entry lands on the question at its `questionIndex`, else the one
+    // whose text it names, else its own place in the list. `answer` is a label or a list of labels.
+    const entries = Array.isArray(answers) ? answers.map(asRecord) : [];
+    if (entries.length > 0 && entries.every((entry) => entry !== null)) {
+      const lists: string[][] = call.questions.map(() => []);
+      entries.forEach((entry, at) => {
+        const index = entry?.questionIndex;
+        const named = questionKey(entry?.question);
+        const byText = named === undefined ? -1 : call.questions.findIndex((q) => q.question === named);
+        const slot = typeof index === "number" && Number.isInteger(index) && index >= 0 ? index : byText >= 0 ? byText : at;
+        if (slot < lists.length) lists[slot] = answerLabels(entry?.answer);
+      });
+      if (lists.some((list) => list.length > 0)) call.answers = lists;
       return;
     }
     // OmO records `details.answers` beside `status: "answered"`, in two shapes (OmO 5.1.30, read off
@@ -389,6 +413,26 @@ function detailsOf(details: JsonValue | undefined, key: string): JsonObject | un
 function field(o: JsonObject | undefined, key: string): string | undefined {
   const v = o?.[key];
   return typeof v === "string" && v.trim() !== "" ? v : undefined;
+}
+
+/**
+ * The task list a Gentle Shell `todo` result holds in `details.gentleTodo.tasks`. UNDEFINED when the
+ * result carries no list at all (the input's list stays); an explicit empty list is `[]`, which is a
+ * `clear` and must empty the card (issue #715). A non-empty list whose rows all fail to read stays
+ * undefined rather than wiping the card on a shape this build cannot read.
+ */
+function gentleTasks(details: JsonValue | undefined): PlanTask[] | undefined {
+  const list = detailsOf(details, "gentleTodo")?.tasks;
+  if (!Array.isArray(list)) return undefined;
+  const tasks = planTasks(list);
+  return list.length === 0 || tasks.length > 0 ? tasks : undefined;
+}
+
+/** The info `endNotice` hands `settle`: a status, and an exit code only when it is a number. */
+function endInfo(status: string, exitCode: JsonValue | undefined): JsonObject {
+  const info: JsonObject = { status };
+  if (typeof exitCode === "number") info.exitCode = exitCode;
+  return info;
 }
 
 /** The `id` of each question a call's input names, keyed by the question's text. */
@@ -557,6 +601,9 @@ const PI_KNOWN: KnownTypes = {
 /** The statuses Gentle Shell and Oh My Pi write when a subagent or a background job has ended. */
 const FINAL_WORK_STATUS: ReadonlySet<string> = new Set(["completed", "failed", "cancelled", "exited", "stopped"]);
 
+/** A `job_list` line for a job that has ended: `job-2 · monitor stopped · label · …`, or `exited 1`. */
+const JOB_LIST_LINE = /^(job-[A-Za-z0-9_-]+) · (?:monitor )?(stopped|failed|exited(?: \S+)?) · /;
+
 /** The statuses an Oh My Pi `task` start writes for a subagent that has not ended yet. */
 const OMP_RUNNING_STATUS: ReadonlySet<string> = new Set(["pending", "running"]);
 
@@ -598,6 +645,10 @@ export function createPiReducer(): RowReducer {
   // An Oh My Pi job card → its progress names, the `label` an end row may name it by. Weak, so a card
   // the window and `workCards` both let go of costs nothing here.
   const jobLabels = new WeakMap<PendingTool, readonly string[]>();
+  // A Gentle Shell `subagent_run` that is not `mode: "background"` writes no start result: its next
+  // row is the final one. Its card is ongoing from the call until that result (#711), so these parts
+  // are remembered to be released when any result lands.
+  const foregroundRuns = new WeakSet<object>();
 
   /**
    * Oh My Pi's `task` start (OMP 18.6.1, read off a real session on 2026-10-25). The result answers at
@@ -656,7 +707,12 @@ export function createPiReducer(): RowReducer {
    * found by its id; an id no card holds falls back to its label only when exactly one ongoing card
    * carries that label. Only a final status ends the card, the same set Gentle Shell's notices use.
    */
-  function settleOmpJobs(rows: readonly JsonObject[], statusOf: (row: JsonObject, id: string) => string | undefined, changed: Set<string>): void {
+  function settleOmpJobs(
+    rows: readonly JsonObject[],
+    statusOf: (row: JsonObject, id: string) => string | undefined,
+    ts: string,
+    changed: Set<string>,
+  ): void {
     for (const row of rows) {
       const id = field(row, "jobId") ?? field(row, "id");
       const label = field(row, "label");
@@ -665,12 +721,16 @@ export function createPiReducer(): RowReducer {
       const card = held ?? (label === undefined ? undefined : onlyOngoingByLabel(label));
       if (card === undefined || key === undefined) continue;
       const status = statusOf(row, key);
-      if (status !== undefined) settle(card, { status }, changed);
+      if (status !== undefined) settle(card, { status }, ts, changed);
     }
   }
 
-  /** Mark a card ongoing and remember it by id, when its start result says the work is still running. */
-  function startWork(target: PendingTool, raw: JsonValue | undefined): void {
+  /**
+   * Mark a card ongoing and remember it by id, when its start result says the work is still running.
+   * A Gentle Shell job also keeps its job id and `ts`, the start result's time, as when it started
+   * (bridge/jobs-journal.ts reads both).
+   */
+  function startWork(target: PendingTool, raw: JsonValue | undefined, ts: string, changed: Set<string>): void {
     const call = target.part.call;
     if (call?.kind !== "task" && call?.kind !== "execute") return;
     if (detailsOf(raw, "gentleAgents") === undefined && startOmpJob(target, raw)) return;
@@ -684,36 +744,67 @@ export function createPiReducer(): RowReducer {
     if (target.part.name.toLowerCase() === "subagent_result") return;
     const id = field(info, agents ? "taskId" : "jobId");
     if (id !== undefined) rememberPending(workCards, id, target);
+    if (call.kind === "execute") {
+      if (id !== undefined) call.jobId = id;
+      const started = Date.parse(ts);
+      if (Number.isFinite(started)) call.startedAt = started;
+    }
     const status = field(info, "status");
     if (status === "queued" || status === "running") call.ongoing = true;
+    // A foreground run answers once, with its final status. The settle path of a later result skips
+    // the card the result belongs to (`other !== target`), so the card settles itself here, which is
+    // what marks a failed run failed (#716).
+    if (call.kind === "task" && agents !== undefined) settle(target, agents, ts, changed);
   }
 
   /** A `gentle-agents.result` / `gentle-jobs.notice` row: the work it names has ended. */
-  function endNotice(row: PiRow, changed: Set<string>): void {
+  function endNotice(row: PiRow, ts: string, changed: Set<string>): void {
     const type = row.customType;
     if (type === "async-result") {
       const content = customText(row.content);
-      settleOmpJobs(detailRows(row.details, "jobs"), (job, id) => field(job, "status") ?? asyncResultStatus(content, id), changed);
+      settleOmpJobs(detailRows(row.details, "jobs"), (job, id) => field(job, "status") ?? asyncResultStatus(content, id), ts, changed);
+      return;
+    }
+    // A stale notice or stale result is Gentle Shell saying a subagent's end reached the session late
+    // or without its result (issue #716; the row shape is a guess, see `staleInfo`).
+    if (type === "gentle-agents.stale-notice" || type === "gentle-agents.stale-result") {
+      const info = staleInfo(row.details);
+      if (info !== undefined) settle(workCards.get(field(info, "taskId") ?? ""), info, ts, changed);
       return;
     }
     if (type !== "gentle-agents.result" && type !== "gentle-jobs.notice") return;
     const agents = type === "gentle-agents.result";
     const info = detailsOf(row.details, agents ? "gentleAgents" : "gentleJobs");
-    if (info !== undefined) settle(workCards.get(field(info, agents ? "taskId" : "jobId") ?? ""), info, changed);
+    if (info !== undefined) settle(workCards.get(field(info, agents ? "taskId" : "jobId") ?? ""), info, ts, changed);
+  }
+
+  /**
+   * The record a stale notice names its subagent by: `details.gentleAgents`, else `details` itself
+   * when it carries a `taskId`. It always ends the card, so a status that is not a final one (or is
+   * missing) reads as `stopped`, which marks no failure: stale says the end is lost, not that it failed.
+   */
+  function staleInfo(details: JsonValue | undefined): JsonObject | undefined {
+    const inner = detailsOf(details, "gentleAgents") ?? asRecord(details) ?? undefined;
+    if (inner === undefined || field(inner, "taskId") === undefined) return undefined;
+    const status = field(inner, "status");
+    return { ...inner, status: status !== undefined && FINAL_WORK_STATUS.has(status) ? status : "stopped" };
   }
 
   /**
    * End a held card when `info` (a `gentleAgents` / `gentleJobs` record) reports a final status.
    * The end notice is the usual source; a cancelled subagent has none, and only the status a later
    * `subagent_status` or `subagent_cancel` result reports says it is over (a real session,
-   * 2026-10-15). A status still running or queued leaves the card as it is.
+   * 2026-10-15). A status still running or queued leaves the card as it is. An ended command keeps
+   * `ts`, the time of the row that ended it, as `endedAt`.
    */
-  function settle(card: PendingTool | undefined, info: JsonObject, changed: Set<string>): void {
+  function settle(card: PendingTool | undefined, info: JsonObject, ts: string, changed: Set<string>): void {
     const status = field(info, "status");
     if (status === undefined || !FINAL_WORK_STATUS.has(status)) return;
     const call = card?.part.call;
     if (card === undefined || (call?.kind !== "task" && call?.kind !== "execute")) return;
     delete call.ongoing;
+    const ended = Date.parse(ts);
+    if (call.kind === "execute" && Number.isFinite(ended)) call.endedAt = ended;
     const exitCode = info.exitCode;
     let failed = status === "failed";
     if (call.kind === "execute" && typeof exitCode === "number" && Number.isFinite(exitCode)) {
@@ -725,6 +816,44 @@ export function createPiReducer(): RowReducer {
       else card.part.result = toolResult("", true);
     }
     changed.add(card.uuid);
+  }
+
+  /**
+   * Gentle Shell sends no notice for a job the agent stopped with `job_stop`, so the stop result is
+   * the only record: its `details.gentleJobs` names the job and its final status. Any gentle tool
+   * result that carries a final `gentleJobs` status ends the card it names. A card that has already
+   * ended keeps its real end time: `settle` would overwrite `endedAt`, so only an ongoing card moves.
+   */
+  function settleGentleJob(details: JsonValue | undefined, ts: string, changed: Set<string>): void {
+    const info = detailsOf(details, "gentleJobs");
+    const status = field(info, "status");
+    const id = field(info, "jobId");
+    if (info === undefined || id === undefined || status === undefined || !FINAL_WORK_STATUS.has(status)) return;
+    settleOngoing(workCards.get(id), endInfo(status, info.exitCode), ts, changed);
+  }
+
+  /** `settle`, but only for a card still ongoing, so a later look never moves a real end time. */
+  function settleOngoing(card: PendingTool | undefined, info: JsonObject, ts: string, changed: Set<string>): void {
+    const call = card?.part.call;
+    if ((call?.kind !== "execute" && call?.kind !== "task") || call.ongoing !== true) return;
+    settle(card, info, ts, changed);
+  }
+
+  /**
+   * A `job_list` result has one line per job, `id · status · label · duration · path`, and its
+   * details hold only a count, so the lines are read as text. Each job it lists as ended settles its
+   * card, which covers a job whose exit notice was lost. The end time is the list's `ts`, later than
+   * the real end; that is acceptable for a job that has no other record.
+   */
+  function settleJobList(text: string, ts: string, changed: Set<string>): void {
+    for (const line of text.split("\n")) {
+      const m = JOB_LIST_LINE.exec(line);
+      if (m === null) continue;
+      const [, id = "", word = ""] = m;
+      const [status = "", code] = word.split(" ");
+      const exitCode = code !== undefined && /^-?\d+$/.test(code) ? Number(code) : undefined;
+      settleOngoing(workCards.get(id), endInfo(status, exitCode), ts, changed);
+    }
   }
 
   // ── THE BRANCH CHAIN ────────────────────────────────────────────────────────
@@ -808,7 +937,7 @@ export function createPiReducer(): RowReducer {
     if (type === "custom_message") {
       if (row.display !== true) return;
       // The notice is still drawn below; it also ends the card that started the work.
-      endNotice(row, changed);
+      endNotice(row, ts, changed);
       const text = customText(row.content);
       if (text.trim() !== "")
         entries.push({ uuid, ts, role: "note", parts: [{ kind: "text", ...clamp(text, MAX_TEXT_CHARS) }] });
@@ -830,25 +959,28 @@ export function createPiReducer(): RowReducer {
     if (m.role === "toolResult") {
       // Oh My Pi's `wait` (and any result that lists jobs with a status) settles the jobs it names,
       // whether or not its own call is still held.
-      settleOmpJobs(detailRows(m.details, "jobs"), (job) => field(job, "status"), changed);
+      settleOmpJobs(detailRows(m.details, "jobs"), (job) => field(job, "status"), ts, changed);
       const id = typeof m.toolCallId === "string" ? m.toolCallId : "";
       const target = pendingTools.get(id);
       const resultText = stripAnsi(textBlocks(m.content));
       const isError = m.isError === true;
+      // Gentle Shell's `job_stop` (and any gentle result with a final job status) ends the job it names.
+      settleGentleJob(m.details, ts, changed);
+      if (m.toolName === "job_list" && detailsOf(m.details, "gentleJobs")?.jobId === undefined) settleJobList(resultText, ts, changed);
       const image = extractImage(m.content);
       if (target?.foldInto) {
         // A call that drew no part of its own: its result lands on the card it folds into.
         const card = target.foldInto;
         pendingTools.delete(id);
         if (card.part.call?.kind === "plan") {
-          const tasks = planTasks(detailsOf(m.details, "gentleTodo")?.tasks);
-          if (tasks.length > 0) card.part.call.tasks = tasks;
+          const tasks = gentleTasks(m.details);
+          if (tasks !== undefined) card.part.call.tasks = tasks;
         } else {
           // `subagent_result`: the answer replaces the start notice's text. The work is over only
           // when the status it reports says so: one asked for too early answers "running".
           card.part.result = toolResult(resultText, isError, image);
           const info = detailsOf(m.details, "gentleAgents");
-          if (info !== undefined) settle(card, info, changed);
+          if (info !== undefined) settle(card, info, ts, changed);
         }
         changed.add(card.uuid);
       } else if (target) {
@@ -859,13 +991,16 @@ export function createPiReducer(): RowReducer {
         // `details` rides on the RESULT ROW, not on a content block — it is pi's own record of what
         // the call did, and the only place a patch or an answer ever appears.
         if (target.part.call) enrichCall(target.part.call, m.details, resultText, isError, target.questionIds);
-        if (!isError) startWork(target, m.details);
+        // A foreground run was ongoing from its call (see `toolCall` below); any result ends that,
+        // a failed or interrupted one too. A start result that says the work runs on sets it again.
+        if (foregroundRuns.has(target.part) && target.part.call?.kind === "task") delete target.part.call.ongoing;
+        if (!isError) startWork(target, m.details, ts, changed);
         // Both mutations above landed in a turn that went out rows ago. Name it.
         changed.add(target.uuid);
         // A status call about ANOTHER card's task (`subagent_status`, `subagent_cancel`).
         const info = detailsOf(m.details, "gentleAgents");
         const other = workCards.get(field(info, "taskId") ?? "");
-        if (info !== undefined && other !== undefined && other !== target) settle(other, info, changed);
+        if (info !== undefined && other !== undefined && other !== target) settle(other, info, ts, changed);
       } else if (resultText.trim() !== "" || image.url !== undefined || image.notes.length > 0) {
         // Orphan result (its call fell outside a tail-read window) — kept unattached so the window
         // never silently drops output.
@@ -954,6 +1089,11 @@ export function createPiReducer(): RowReducer {
           continue;
         }
         if (lower === "todo") heldPlan = { part, uuid };
+        // A foreground subagent counts as running from its call until its result (#711).
+        if (lower === "subagent_run" && part.call?.kind === "task" && input.mode !== "background") {
+          part.call.ongoing = true;
+          foregroundRuns.add(part);
+        }
         if (typeof b.id === "string") {
           part.id = b.id;
           // The turn is named here, before it exists, because `uuid` is read off the row above and
@@ -1019,6 +1159,45 @@ export function createPiReducer(): RowReducer {
   return { push, unknowns: unknown.tally, queued: noQueue };
 }
 
+/** The resume flags of each harness, by the harness's binary (`omp --help`, `pi --help`). */
+const RESUME_FLAGS: ReadonlyMap<string, readonly string[]> = new Map([
+  // Oh My Pi: `-r, --resume=<value>`, "by ID prefix, path, or picker if omitted".
+  ["omp", ["--resume", "-r"]],
+  // pi: `--resume` only opens a picker and takes no value; `--session <path|id>` names the session.
+  ["pi", ["--session"]],
+]);
+
+const PI_BINARIES: ReadonlyMap<string, string> = new Map([["pi", "pi"], ["omp", "omp"]]);
+
+/**
+ * The value of the pane's resume flag (`omp --resume <v>`, `omp -r <v>`, `--resume=<v>`, `pi --session
+ * <v>`), or null: no pi or omp process, no such flag, or the flag with no value (the picker; a next
+ * word that is itself a flag is no value). The first process that runs the harness answers.
+ */
+export function resumeValueOf(processes: readonly ForegroundProcess[] | undefined): string | null {
+  if (processes === undefined) return null;
+  const found = harnessProcessOf(processes, PI_BINARIES);
+  if (found === null) return null;
+  const flags = RESUME_FLAGS.get(found.harness) ?? [];
+  const argv = found.process.argv;
+  const from = found.script === undefined ? 1 : argv.indexOf(found.script) + 1;
+  for (let i = from; i < argv.length; i++) {
+    const word = argv[i]!;
+    if (word === "--") return null;
+    for (const flag of flags) {
+      if (word === flag) {
+        const next = argv[i + 1];
+        return next === undefined || next === "" || next.startsWith("-") ? null : next;
+      }
+      if (word.startsWith(`${flag}=`)) {
+        const inline = word.slice(flag.length + 1);
+        return inline === "" ? null : inline;
+      }
+    }
+  }
+  return null;
+}
+
 /**
  * Real filesystem source rooted at pi's `sessions` directory.
  *
@@ -1060,8 +1239,10 @@ export class PiTranscriptSource implements TranscriptSource {
    *
    * pi and Oh My Pi file a session under a folder named from the cwd, and write the cwd into the
    * session row near the top of the log. The folder name is lossy (`/` and `-` both become `-`), so
-   * it only narrows the search: a log counts only when its session row names exactly this cwd. The
-   * newest such log (by mtime, so a resumed session that is being written wins) is the pane's.
+   * it only narrows the search: the session row must match the cwd lexically, or resolve to this pane's
+   * cwd. An exact lexical match still works when that path no longer exists; a lossy folder name alone
+   * never identifies a session. The newest matching log (by mtime, so a resumed session being written
+   * wins) is the pane's.
    * Bounded: a few folders read, {@link MAX_DISCOVER_CANDIDATES} files stat'd, and at most
    * {@link MAX_DISCOVER_READS} heads read, newest first.
    *
@@ -1071,20 +1252,32 @@ export class PiTranscriptSource implements TranscriptSource {
    * logs that started more than {@link START_SLACK_MS} before it are skipped; with no pid or no
    * readable start the folder walk stands as it was.
    *
-   * With a pi or omp neighbour in the same folder (`hints.shared`) the answer is no session, because
-   * the newest log could be the neighbour's (#508). The answer is an `id` ref, so it goes through the
-   * same `resolve` and containment as a reported one.
+   * The pane's terminal label comes first (#675): `<harness>.session_file=<absolute path>`, set from
+   * inside the terminal by the harness itself, names the live log, which `/new` or `/resume` can move
+   * past the command line ({@link PiTranscriptSource.labelledSession}). Then the command line, as it does for Muse: `omp --resume <log or id>`
+   * and `pi --session <log or id>` name the session exactly, so two panes in one folder each read
+   * their own ({@link PiTranscriptSource.namedSession}). A log named that way is the pane's whatever its
+   * age, so the start-time floor below does not apply to it.
+   *
+   * With a pi or omp neighbour in the same folder (`hints.shared`) and a command line that names no
+   * session, the answer is no session, because the newest log could be the neighbour's (#508). The
+   * answer is an `id` ref, so it goes through the same `resolve` and containment as a reported one.
    */
   async discoverSession(cwd: string, hints?: DiscoverHints): Promise<AgentSessionRef | null> {
-    if (hints?.shared === true) return null;
     if (!isAbsolute(cwd)) return null;
-    const folders = piSessionFolderNames(cwd, this.places);
+    const discovery = await piDiscoveryContext(cwd, this.roots, this.places);
+    const labelled = await this.labelledSession(discovery, hints);
+    if (labelled !== null) return labelled;
+    const named = await this.namedSession(discovery, hints?.processes);
+    if (named !== null) return named;
+    if (hints?.shared === true) return null;
     const candidates: { id: string; path: string; root: string; mtimeMs: number }[] = [];
-    for (const root of this.roots) {
-      for (const folder of folders) {
+    for (const root of discovery.roots) {
+      if (root.realPath === null) continue;
+      for (const folder of discovery.folders) {
         let names: string[];
         try {
-          names = await readdir(join(root, folder));
+          names = await readdir(join(root.path, folder));
         } catch {
           continue;
         }
@@ -1094,10 +1287,10 @@ export class PiTranscriptSource implements TranscriptSource {
           if (candidates.length >= MAX_DISCOVER_CANDIDATES) break;
           const id = /_([^_/]+)\.jsonl$/u.exec(name)?.[1];
           if (id === undefined || !isPiSessionId(id)) continue;
-          const path = join(root, folder, name);
+          const path = join(root.path, folder, name);
           const meta = await statFile(path);
           if (meta === null) continue;
-          candidates.push({ id: id.toLowerCase(), path, root, mtimeMs: meta.mtimeMs });
+          candidates.push({ id: id.toLowerCase(), path, root: root.path, mtimeMs: meta.mtimeMs });
         }
       }
     }
@@ -1112,9 +1305,94 @@ export class PiTranscriptSource implements TranscriptSource {
     for (const candidate of eligible) {
       const contained = await containedRealpath(candidate.path, candidate.root);
       if (contained === null) continue;
-      if ((await sessionCwdOf(contained)) !== cwd) continue;
+      if (!(await sessionCwdMatches(await sessionCwdOf(contained), discovery))) continue;
       this.pathCache.set(candidate.id, contained);
       return { kind: "id", value: candidate.id };
+    }
+    return null;
+  }
+
+  /**
+   * The session the pane's terminal label names (#675), or null. The key is `<harness>.session_file`,
+   * built from the harness the pane's foreground process runs, so an omp pane never reads the pi label
+   * and the reverse. The value is a hint under ADR 0024 and passes {@link namedByPath}, the check the
+   * command line's path passes: inside a root after symlink resolution, directly in a folder this cwd
+   * is filed under, a session id for a name. A relative path, or any failure, is null and falls to the
+   * next step. Never throws.
+   */
+  private async labelledSession(discovery: PiDiscoveryContext, hints: DiscoverHints | undefined): Promise<AgentSessionRef | null> {
+    if (hints?.labels === undefined || hints.processes === undefined) return null;
+    const harness = harnessProcessOf(hints.processes, PI_BINARIES)?.harness;
+    if (harness === undefined) return null;
+    const value = hints.labels[`${harness}.session_file`];
+    if (value === undefined || !isAbsolute(value)) return null;
+    try {
+      return await this.namedByPath(value, discovery);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The session the pane's foreground command line names (#675), or null when it names none that this
+   * pane may read. The value is attacker-shaped, so it is only ever a lookup key:
+   *  - a path must be a `<ISO-ts>_<uuid>.jsonl` file that really lies (symlinks resolved) inside one of
+   *    the sessions roots, in a folder this cwd is filed under ({@link piSessionFolderNames});
+   *  - an id must be a uuid that is the exact suffix of a log in one of those folders.
+   * Anything else is null, which reads as "the command line names nothing" and falls to the folder walk
+   * (or the shared-folder refusal). Never throws.
+   */
+  private async namedSession(discovery: PiDiscoveryContext, processes: readonly ForegroundProcess[] | undefined): Promise<AgentSessionRef | null> {
+    const value = resumeValueOf(processes);
+    if (value === null) return null;
+    try {
+      if (isPiSessionId(value)) return await this.namedById(value.toLowerCase(), discovery);
+      return await this.namedByPath(isAbsolute(value) ? value : join(discovery.cwd, value), discovery);
+    } catch {
+      return null;
+    }
+  }
+
+  private async namedById(id: string, discovery: PiDiscoveryContext): Promise<AgentSessionRef | null> {
+    const suffix = `_${id}.jsonl`;
+    for (const root of discovery.roots) {
+      if (root.realPath === null) continue;
+      for (const folder of discovery.folders) {
+        let names: string[];
+        try {
+          names = await readdir(join(root.path, folder));
+        } catch {
+          continue;
+        }
+        const hit = names.find((name) => name.toLowerCase().endsWith(suffix));
+        if (hit === undefined) continue;
+        const contained = await containedRealpath(join(root.path, folder, hit), root.path);
+        if (contained === null) continue;
+        this.pathCache.set(id, contained);
+        return { kind: "id", value: id };
+      }
+    }
+    return null;
+  }
+
+  private async namedByPath(path: string, discovery: PiDiscoveryContext): Promise<AgentSessionRef | null> {
+    const id = /_([^_/\\]+)\.jsonl$/u.exec(basename(path))?.[1];
+    if (id === undefined || !isPiSessionId(id)) return null;
+    for (const root of discovery.roots) {
+      if (root.realPath === null) continue;
+      const contained = await containedRealpath(path, root.path);
+      if (contained === null) continue;
+      // Directly under a folder this cwd is filed under, not merely somewhere in the root.
+      let matchesFolder = false;
+      for (const folder of discovery.folders) {
+        if (await discovery.samePath(dirname(contained), join(root.realPath, folder))) {
+          matchesFolder = true;
+          break;
+        }
+      }
+      if (!matchesFolder) continue;
+      this.pathCache.set(id.toLowerCase(), contained);
+      return { kind: "id", value: id.toLowerCase() };
     }
     return null;
   }
@@ -1317,6 +1595,58 @@ export function piSessionFolderNames(cwd: string, places: PiPlaces): string[] {
   const underHome = inside(places.home, cwd);
   if (underHome !== null) names.push(`-${encodePath(underHome)}`);
   return [...new Set(names)];
+}
+
+interface PiDiscoveryRoot {
+  readonly path: string;
+  readonly realPath: string | null;
+}
+
+interface PiDiscoveryContext {
+  readonly cwd: string;
+  readonly realCwd: string | null;
+  readonly folders: readonly string[];
+  readonly roots: readonly PiDiscoveryRoot[];
+  realpath(path: string): Promise<string | null>;
+  samePath(left: string, right: string): Promise<boolean>;
+}
+
+/** Canonical filesystem identities and folder aliases valid for one bounded discovery. */
+async function piDiscoveryContext(cwd: string, roots: readonly string[], places: PiPlaces): Promise<PiDiscoveryContext> {
+  const paths = new Map<string, Promise<string | null>>();
+  const realpath = (path: string): Promise<string | null> => {
+    let found = paths.get(path);
+    if (found === undefined) {
+      found = realpathOf(path).catch(() => null);
+      paths.set(path, found);
+    }
+    return found;
+  };
+  const samePath = async (left: string, right: string): Promise<boolean> => {
+    if (left === right) return true;
+    const [realLeft, realRight] = await Promise.all([realpath(left), realpath(right)]);
+    return realLeft !== null && realRight !== null && isInside(HOST, realLeft, realRight) && isInside(HOST, realRight, realLeft);
+  };
+  const [realCwd, realHome, realTmp, rootPaths] = await Promise.all([
+    realpath(cwd),
+    isAbsolute(places.home) ? realpath(places.home) : null,
+    isAbsolute(places.tmp) ? realpath(places.tmp) : null,
+    Promise.all(roots.map(async (path) => ({ path, realPath: await realpath(path) }))),
+  ]);
+  const folders = new Set(piSessionFolderNames(cwd, places));
+  if (realCwd !== null) {
+    for (const name of piSessionFolderNames(realCwd, { home: realHome ?? "", tmp: realTmp ?? "" })) folders.add(name);
+  }
+  return { cwd, realCwd, folders: [...folders], roots: rootPaths, realpath, samePath };
+}
+
+/** A session row must name this cwd lexically, or resolve to its known filesystem identity. */
+async function sessionCwdMatches(sessionCwd: string | null, discovery: PiDiscoveryContext): Promise<boolean> {
+  if (sessionCwd === null) return false;
+  if (sessionCwd === discovery.cwd || sessionCwd === discovery.realCwd) return true;
+  if (!isAbsolute(sessionCwd) || discovery.realCwd === null) return false;
+  const realSessionCwd = await discovery.realpath(sessionCwd);
+  return realSessionCwd !== null && isInside(HOST, realSessionCwd, discovery.realCwd) && isInside(HOST, discovery.realCwd, realSessionCwd);
 }
 
 /** The cwd a log's session row names, or null when its head has none. */

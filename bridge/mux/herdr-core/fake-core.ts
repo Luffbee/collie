@@ -63,6 +63,7 @@ import {
   type SubscribeOptions,
   type WireHello,
   type WireLayout,
+  type WireForeground,
   type WireLayoutSpace,
   type WireRead,
   type WireStatus,
@@ -124,12 +125,14 @@ export class ManualClock implements FakeClock {
 /** The measured gap between a raw write and the answer to the next key press (HC_API.md § Typing, "The key hold"). */
 export const KEY_HOLD_MS = 3030;
 
-/** The raw bytes a program cannot tell from a named key, and that key's name. */
-const RAW_KEY_BYTES = new Map<string, string>([
-  ["\r", "enter"],
-  ["\x7f", "backspace"],
-  ["\t", "tab"],
-]);
+/** Raw bytes whose effects are indistinguishable from these named keys in the supported harnesses. */
+const RAW_KEY_BYTES = {
+  "\r": "enter",
+  "\x7f": "backspace",
+  "\t": "tab",
+  "\n": "ctrl+j",
+  "\x11": "ctrl+q",
+} satisfies Record<string, string>;
 
 /** What the program in a terminal receives, for a test that draws a screen from its input. */
 export type FakeInput = { readonly kind: "text"; readonly text: string } | { readonly kind: "keys"; readonly keys: readonly string[] };
@@ -142,7 +145,7 @@ interface FakeTerminal {
   cwd: string;
   title: string;
   status: WireStatus | null;
-  foreground: { name: string; cwd: string } | null;
+  foreground: WireForeground | null;
   screen: string[];
   history: string[];
   cols: number;
@@ -241,7 +244,7 @@ export class FakeHcCore implements HcRpc {
       cwd: partial.cwd ?? "/home/dev",
       title: partial.title ?? "",
       status: partial.status ?? null,
-      foreground: partial.foreground ?? { name: "bash", cwd: partial.cwd ?? "/home/dev" },
+      foreground: partial.foreground === undefined ? { name: "bash", cwd: partial.cwd ?? "/home/dev" } : partial.foreground,
       screen: partial.screen ?? [`${address}$ `],
       history: partial.history ?? [],
       cols: partial.cols ?? COLS,
@@ -339,7 +342,7 @@ export class FakeHcCore implements HcRpc {
   }
 
   /** The terminal as the fake holds it, for a test that derives a generation from it. */
-  peek(address: string): { readonly foreground: { name: string; cwd: string } | null; readonly status: WireStatus | null; readonly state: string } | undefined {
+  peek(address: string): { readonly foreground: WireForeground | null; readonly status: WireStatus | null; readonly state: string } | undefined {
     return this.find(address);
   }
 
@@ -426,6 +429,23 @@ export class FakeHcCore implements HcRpc {
       this.emit("labels", paneId);
     }
     await Promise.resolve();
+  }
+
+  /** A program in a terminal sets a label, as `hc label <terminal> key=value` does. */
+  setLabel(address: string, key: string, value: string): void {
+    const terminal = this.find(address);
+    if (terminal === undefined) return;
+    terminal.labels = { ...terminal.labels, [key]: value };
+    this.emit("labels", address);
+  }
+
+  /** A program in a terminal removes a label, as `hc label <terminal> key=` does. */
+  removeLabel(address: string, key: string): void {
+    const terminal = this.find(address);
+    if (terminal === undefined) return;
+    const { [key]: _gone, ...rest } = terminal.labels;
+    terminal.labels = rest;
+    this.emit("labels", address);
   }
 
   async setProgramTitle(paneId: string, title: string): Promise<void> {
@@ -558,11 +578,11 @@ export class FakeHcCore implements HcRpc {
     this.assertTakesInput(terminal, "terminal.attach");
     if (this.hold !== null) this.hold.lastWriteAt = this.hold.clock.now();
     this.recorded.push({ paneId: address, kind: "text", payload: [text] });
-    // A program receives bytes: a raw \r, \x7f or \t is the same input as the key the core encodes
-    // to those bytes (herdr-core keys.rs), so the program is handed that key.
+    // Raw LF and DC1 are the Ctrl+J/Ctrl+Q inputs whose real OMP and Claude encodings were verified.
     let plain = "";
     for (const char of text) {
-      const key = RAW_KEY_BYTES.get(char);
+      // SAFETY: hasOwn checks the received byte against the closed raw-key table.
+      const key = Object.hasOwn(RAW_KEY_BYTES, char) ? RAW_KEY_BYTES[char as keyof typeof RAW_KEY_BYTES] : undefined;
       if (key === undefined) {
         plain += char;
         continue;
